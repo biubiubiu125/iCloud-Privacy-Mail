@@ -546,12 +546,15 @@
     .mailbox-filter-field { width: 100%; color: var(--muted); font-size: 12px; font-weight: 700; }
     .mailbox-control-stack { grid-column: 2; display: grid; gap: 8px; justify-items: end; align-items: start; }
     .mailbox-action-row { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; justify-content: flex-end; }
+    .mailbox-action-row #mailboxSelectionInfo { margin-left: 4px; white-space: nowrap; }
     .pager { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; justify-content: flex-end; color: var(--muted); font-size: 13px; }
     .pager button { padding: 8px 11px; border-radius: 8px; }
     #mailboxPageInfo { white-space: nowrap; }
     .mailbox-filter-field select { width: 100%; min-width: 180px; padding: 8px 10px; }
     .page-size-control { display: inline-flex; flex-direction: row; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
     .page-size-control input { width: 76px; padding: 8px 10px; }
+    .mailbox-select-cell { width: 42px; text-align: center; }
+    .mailbox-select-cell input { width: 16px; height: 16px; vertical-align: middle; }
     .mailbox-code-cell {
       min-width: 150px;
       max-width: 220px;
@@ -1195,7 +1198,13 @@
           <div class="notice" id="icloudSessionInfo">未完成创建登录。建议先点“新接口登录”或“旧接口登录”；收到 2FA 后提交对应验证码。取码登录会单独保存。</div>
           <div class="field-grid">
             <label>Apple ID<input id="protocolAppleId" autocomplete="username" placeholder="name@icloud.com"></label>
+            <label>登录目标账号
+              <select id="loginAccountID" title="明确选择要更新登录态的 Apple 账号">
+                <option value="">自动匹配或新建账号</option>
+              </select>
+            </label>
             <label>密码<input id="protocolPassword" type="password" autocomplete="current-password" placeholder="Apple ID 密码"></label>
+            <label class="full">账号代理<input id="icloudProxyURL" placeholder="http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080"></label>
             <label class="full">2FA 验证码<input id="protocol2FA" inputmode="numeric" maxlength="6" placeholder="收到后输入 6 位验证码"></label>
             <label>新接口验证码方式
               <select id="appleAccount2FAMethod">
@@ -1211,9 +1220,9 @@
             </label>
           </div>
           <div class="toolbar">
-            <button class="primary" onclick="startAppleAccountLogin()">新接口登录</button>
+            <button id="appleAccountLoginButton" class="primary" onclick="startAppleAccountLogin()">新接口登录</button>
             <button id="appleAccount2FAButton" onclick="submitAppleAccount2FA()">提交新接口验证码</button>
-            <button onclick="startProtocolLogin()">旧接口登录</button>
+            <button id="protocolLoginButton" onclick="startProtocolLogin()">旧接口登录</button>
             <button id="protocol2FAButton" onclick="submitProtocol2FA()">提交旧接口验证码</button>
             <button type="button" onclick="saveCreateSettings()">保存配置</button>
             <button id="sessionCheckButton" onclick="checkICloudSession()">检测登录态</button>
@@ -1296,9 +1305,16 @@
               <input id="mailboxSearch" placeholder="输入完整或部分邮箱，跨全部页搜索" oninput="setMailboxSearch()">
             </label>
             <div class="mailbox-filter-row">
+              <label class="mailbox-filter-field">导出状态
+                <select id="mailboxExportFilter" title="导出状态筛选" onchange="setMailboxExportFilter()">
+                  <option value="all">全部</option>
+                  <option value="exported">已导出</option>
+                  <option value="unexported">未导出</option>
+                </select>
+              </label>
               <label class="mailbox-filter-field">同步范围
-                <select id="mailboxSyncAccount" title="同步登录态">
-                  <option value="">全部登录态</option>
+                <select id="mailboxSyncAccount" title="同步登录态；全部模式同步所有可用的新旧接口登录态">
+                  <option value="">全部可同步登录态</option>
                 </select>
               </label>
             </div>
@@ -1306,6 +1322,14 @@
               <div class="mailbox-action-row">
                 <button id="syncICloudMailboxesButton" onclick="syncICloudMailboxes()">同步已有邮箱</button>
                 <button onclick="clearMailboxSearch()">清空搜索</button>
+                <button onclick="selectVisibleMailboxes(true)">全选本页</button>
+                <button onclick="selectAllFilteredMailboxes()">全选筛选结果</button>
+                <button onclick="clearMailboxSelection()">清空选择</button>
+                <button onclick="exportSelectedMailboxes('api')">导出选中API</button>
+                <button onclick="exportSelectedMailboxes('email')">导出选中邮箱</button>
+                <button class="danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
+                <button class="danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
+                <span id="mailboxSelectionInfo" class="muted">已选 0 个</span>
               </div>
               <div class="pager">
                 <label class="page-size-control">每页
@@ -1321,7 +1345,7 @@
           <div id="mailboxAccountTabs" class="account-tabs"></div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>标签</th><th>邮箱</th><th>状态</th><th>收件</th><th>验证码</th><th>操作</th></tr></thead>
+              <thead><tr><th><input id="mailboxPageSelectAll" type="checkbox" onchange="selectVisibleMailboxes(this.checked)" title="全选本页"></th><th>标签</th><th>邮箱</th><th>状态</th><th>收件</th><th>验证码</th><th>操作</th></tr></thead>
               <tbody id="mailboxes"></tbody>
             </table>
           </div>
@@ -1356,9 +1380,9 @@
         <h2>运行配置</h2>
         <p>服务器按配置文件里的默认数据目录保存状态；这里集中处理导出和远端验证码清理。</p>
       </div>
-      <div class="notice" id="runConfigInfo">点击“导出数据”后选择保存位置。导出文件只包含当前登录账号有权访问的数据，并包含登录态 Cookie 和邮箱 API token，请妥善保管。</div>
+      <div class="notice" id="runConfigInfo">完整运行时状态导出仅管理员可用，文件包含登录态 Cookie、代理凭据和邮箱 API token，请妥善保管。</div>
       <div class="toolbar">
-        <button class="primary" onclick="exportRuntimeData()">导出数据</button>
+        <button id="runtimeExportButton" class="primary" hidden onclick="exportRuntimeData()">导出完整状态</button>
         <select id="mailboxExportFormatModal" class="export-format" title="导出格式">
           <option value="txt">TXT</option>
           <option value="csv">CSV</option>
@@ -1374,7 +1398,7 @@
         <button class="danger" onclick="cleanAllRemoteCodes()">一键删除码</button>
         <button class="ghost" onclick="closeRunConfig()">关闭</button>
       </div>
-      <div class="hint">导出数据：当前账号的登录账号/登录态 + 隐私邮箱池；邮箱API 每行 邮箱----API / CSV 两列；只导出邮箱为一行一个邮箱。导出邮箱支持选择指定 Apple 登录态。管理员导出全量数据，普通用户只导出自己的数据。</div>
+      <div class="hint">导出数据：当前登录账号的登录账号/登录态 + 隐私邮箱池；邮箱API 每行 邮箱----API URL----API Token / CSV 三列；只导出邮箱为一行一个邮箱。导出邮箱支持选择指定 Apple 登录态。管理员首页默认只导出自己的数据；如需导出其他用户或全量数据，请到管理页选择对应范围。</div>
     </section>
   </div>
   <script>
@@ -1385,10 +1409,17 @@
     let lastMailboxGroups = [];
     let lastMailboxPagination = {page: 1, page_size: 10, total: 0, total_all: 0, total_pages: 1};
     let lastICloudSessions = [];
+    let lastAccounts = [];
     let mailboxPage = 1;
     let mailboxPageSize = 10;
     let activeMailboxAccountKey = 'all';
+    let activeMailboxExportFilter = 'all';
     let mailboxSearchTimer = null;
+    let selectedMailboxIDs = new Set();
+    const mailboxRemoteDeleteStatus = new Map();
+    let mailboxLoadRequestSeq = 0;
+    let mailboxSelectionGeneration = 0;
+    let mailboxSelectionAbortController = null;
     const mailboxCodeResults = new Map();
     const mailboxSyncResults = new Map();
     let activeMailboxCopyMenuID = '';
@@ -1494,8 +1525,25 @@
       set('navMailboxCount', mailboxTotal);
     }
 
-    async function api(path, options = {}) {
+    function cookieValue(name) {
+      const prefix = `${name}=`;
+      for (const part of document.cookie.split(';')) {
+        const value = part.trim();
+        if (value.startsWith(prefix)) return decodeURIComponent(value.slice(prefix.length));
+      }
+      return '';
+    }
+    function requestHeaders(options = {}) {
       const headers = {'content-type': 'application/json', ...(options.headers || {})};
+      const method = String(options.method || 'GET').toUpperCase();
+      if (!['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
+        const token = cookieValue('ipm_csrf');
+        if (token) headers['X-CSRF-Token'] = token;
+      }
+      return headers;
+    }
+    async function api(path, options = {}) {
+      const headers = requestHeaders(options);
       const res = await fetch(path, {
         ...options,
         headers,
@@ -1511,10 +1559,11 @@
         location.href = '/login';
         throw new Error('请先登录');
       }
-      if (!data.success) {
+      if (!data.success && !data.partial) {
         const err = new Error(data.message || data.code || `HTTP ${res.status}`);
         err.code = data.code || '';
         err.retryable = !!data.retryable;
+        err.data = data;
         throw err;
       }
       return data;
@@ -1529,6 +1578,9 @@
       currentUser = data.user;
       if ($('currentUserBadge')) {
         $('currentUserBadge').textContent = `${currentUser.username}${currentUser.is_admin ? ' / 管理员' : ''}`;
+      }
+      if ($('runtimeExportButton')) {
+        $('runtimeExportButton').hidden = !currentUser.is_admin;
       }
       return currentUser;
     }
@@ -1631,8 +1683,12 @@
     }
 
     async function logout() {
-      await api('/api/auth/logout', {method:'POST', body:'{}'});
-      location.href = '/login';
+      try {
+        await api('/api/auth/logout', {method:'POST', body:'{}'});
+        location.href = '/login';
+      } catch (err) {
+        log('退出登录失败：' + err.message);
+      }
     }
 
     function setLogCategory(category) {
@@ -1814,8 +1870,26 @@
       return session.apple_id || session.account_label || session.dsid_mask || '未命名 Apple 账号';
     }
 
+    function mailboxSyncSourceLabel(session) {
+      const hasWeb = iCloudWebLoginSaved(session);
+      const hasAppleAccount = appleAccountLoginSaved(session);
+      if (hasWeb && hasAppleAccount) return '新旧接口';
+      if (hasAppleAccount) return '新接口';
+      return '旧接口';
+    }
+
+    function mailboxSyncResultSourceLabel(source) {
+      const values = String(source || '').split(',').map(value => value.trim()).filter(Boolean);
+      const hasAppleAccount = values.includes('apple_account');
+      const hasWeb = values.includes('icloud_web');
+      if (hasAppleAccount && hasWeb) return '新旧接口';
+      if (hasAppleAccount) return '新接口';
+      if (hasWeb) return '旧接口';
+      return '未知接口';
+    }
+
     function iCloudWebLoginSaved(session) {
-      return !!(session && (session.icloud_web_login_saved || Number(session.cookie_count || 0) > 0));
+      return !!(session && session.icloud_web_login_saved);
     }
 
     function appleAccountLoginSaved(session) {
@@ -1947,8 +2021,11 @@
 
     function selectedCreateAccounts() {
       const sessions = selectableCreateSessions();
+      if (sessions.length === 0) {
+        throw new Error('未保存可用于创建的 Apple 登录，请先完成旧接口或新接口登录');
+      }
       const selected = sessions.filter(session => selectedCreateAccountIDs.has(session.account_id));
-      if (sessions.length > 0 && selected.length === 0) {
+      if (selected.length === 0) {
         throw new Error('请至少勾选一个参与创建的 Apple 账号');
       }
       return selected;
@@ -1980,7 +2057,7 @@
         const checked = selectedCreateAccountIDs.has(id) ? 'checked' : '';
         const title = createAccountDisplayName(session);
         return `<label class="create-account-option">
-          <span class="create-account-primary"><input type="checkbox" ${checked} onchange="toggleCreateAccount(${esc(JSON.stringify(id))}, this.checked)"> <span class="create-account-title">${esc(title)}</span>${sessionManageRefreshBadge(session)}</span>
+          <span class="create-account-primary"><input type="checkbox" ${checked} onchange="toggleCreateAccount(${jsArg(id)}, this.checked)"> <span class="create-account-title">${esc(title)}</span>${sessionManageRefreshBadge(session)}</span>
           <small class="login-status-wrap">${sessionLoginBadges(session)}<span>${esc(sessionCheckText(session) || `账号 ${index + 1}`)}</span></small>
         </label>`;
       }).join('');
@@ -2021,52 +2098,19 @@
     }
 
     async function exportRuntimeData() {
-      const res = await fetch('/api/runtime/export', {credentials: 'same-origin'});
-      if (!res.ok) {
-        if (res.status === 401) {
-          location.href = '/login';
-          return;
+      await downloadExportFile(
+        '/api/runtime/export',
+        `icloud-privacy-mail-state-${Date.now()}.json`,
+        'json',
+        '已取消导出数据',
+        '已导出数据到选择的位置：登录账号/登录态 + 隐私邮箱池',
+        '导出失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({})
         }
-        let message = `HTTP ${res.status}`;
-        try {
-          const data = await res.json();
-          message = data.message || data.code || message;
-        } catch (_) {}
-        log('导出失败：' + message);
-        return;
-      }
-      const blob = await res.blob();
-      const disposition = res.headers.get('content-disposition') || '';
-      const match = disposition.match(/filename="([^"]+)"/i);
-      const filename = match ? match[1] : `icloud-privacy-mail-state-${Date.now()}.json`;
-      if (window.showSaveFilePicker) {
-        try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: filename,
-            types: [{description: 'JSON 文件', accept: {'application/json': ['.json']}}],
-          });
-          const writable = await handle.createWritable();
-          await writable.write(blob);
-          await writable.close();
-          log('已导出数据到选择的位置：登录账号/登录态 + 隐私邮箱池');
-          return;
-        } catch (err) {
-          if (err && err.name === 'AbortError') {
-            log('已取消导出数据');
-            return;
-          }
-          log('系统保存对话框不可用，改用浏览器默认下载：' + err.message);
-        }
-      }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      log('已导出数据：登录账号/登录态 + 隐私邮箱池');
+      );
     }
 
     function selectedMailboxExportFormat(selectID) {
@@ -2082,7 +2126,7 @@
       const el = $(mailboxExportAccountSelectID(formatSelectID));
       const value = el ? el.value : '__current';
       if (value === '__current') {
-        if (activeMailboxAccountKey !== 'all' && activeMailboxAccountKey !== 'unbound') {
+        if (activeMailboxAccountKey !== 'all') {
           return activeMailboxAccountKey;
         }
         return '';
@@ -2090,14 +2134,46 @@
       return value || '';
     }
 
-    function mailboxExportURL(path, format, formatSelectID) {
+    function mailboxExportURL(path, format, formatSelectID, includeAccount = true) {
       const params = new URLSearchParams({format});
       const accountID = selectedMailboxExportAccountID(formatSelectID);
-      if (accountID) params.set('account_id', accountID);
+      if (includeAccount && accountID) params.set('account_id', accountID);
+      const keyword = ($('mailboxSearch') ? $('mailboxSearch').value : '').trim();
+      if (keyword) params.set('search', keyword);
+      if (activeMailboxExportFilter === 'exported' || activeMailboxExportFilter === 'unexported') {
+        params.set('api_exported', activeMailboxExportFilter === 'exported' ? '1' : '0');
+      }
       return `${path}?${params.toString()}`;
     }
 
+    function selectedMailboxIDsList() {
+      return Array.from(selectedMailboxIDs);
+    }
+
+    function rememberMailboxRemoteDeleteStatus(rows) {
+      (rows || []).forEach(row => {
+        if (!row || !row.id) return;
+        mailboxRemoteDeleteStatus.set(String(row.id), String(row.remote_delete_status || ''));
+      });
+    }
+
+    function mailboxRemoteDeleteStatusOf(id) {
+      id = String(id || '');
+      if (mailboxRemoteDeleteStatus.has(id)) {
+        return mailboxRemoteDeleteStatus.get(id);
+      }
+      const row = (lastMailboxes || []).find(item => item && String(item.id) === id);
+      return row ? String(row.remote_delete_status || '') : '';
+    }
+
+    function selectedMailboxHasRemoteDeleteStatus(status) {
+      return selectedMailboxIDsList().some(id => mailboxRemoteDeleteStatusOf(id) === status);
+    }
+
     function exportFileTypes(format) {
+      if (format === 'json') {
+        return [{description: 'JSON 文件', accept: {'application/json': ['.json']}}];
+      }
       if (format === 'csv') {
         return [{description: 'CSV 文件', accept: {'text/csv': ['.csv']}}];
       }
@@ -2110,12 +2186,51 @@
       return [{description: 'TXT 文件', accept: {'text/plain': ['.txt']}}];
     }
 
-    async function downloadExportFile(path, fallbackName, format, cancelText, successText, failText) {
-      const res = await fetch(path, {credentials: 'same-origin'});
+    function newExportRollbackToken() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
+      }
+      return 'export-' + Date.now() + '-' + Math.random().toString(16).slice(2).padEnd(8, '0');
+    }
+
+    async function downloadExportFile(path, fallbackName, format, cancelText, successText, failText, options = {}) {
+      let saveHandle = null;
+      if (window.showSaveFilePicker) {
+        try {
+          saveHandle = await window.showSaveFilePicker({
+            suggestedName: fallbackName,
+            types: exportFileTypes(format),
+          });
+        } catch (err) {
+          if (err && err.name === 'AbortError') {
+            log(cancelText);
+            return false;
+          }
+          log('系统保存对话框不可用，改用浏览器默认下载：' + err.message);
+        }
+      }
+      const requestOptions = Object.assign({credentials: 'same-origin'}, options);
+      if (String(path || '').indexOf('export-mailbox-apis') >= 0) {
+        let payload = {};
+        try {
+          if (requestOptions.body) payload = JSON.parse(requestOptions.body);
+        } catch (_) {}
+        if (!payload.rollback_token) payload.rollback_token = newExportRollbackToken();
+        requestOptions.body = JSON.stringify(payload);
+      }
+      requestOptions.headers = requestHeaders(requestOptions);
+      let res;
+      try {
+        res = await fetch(path, requestOptions);
+      } catch (err) {
+        await rollbackMailboxAPIExport(null, requestOptions, path);
+        log(failText + '：' + err.message);
+        return false;
+      }
       if (!res.ok) {
         if (res.status === 401) {
           location.href = '/login';
-          return;
+          return false;
         }
         let message = `HTTP ${res.status}`;
         try {
@@ -2123,29 +2238,28 @@
           message = data.message || data.code || message;
         } catch (_) {}
         log(failText + '：' + message);
-        return;
+        return false;
       }
-      const blob = await res.blob();
+      let blob;
+      try {
+        blob = await res.blob();
+      } catch (err) {
+        await rollbackMailboxAPIExport(res, options, path);
+        log(failText + '：' + err.message);
+        return false;
+      }
       const disposition = res.headers.get('content-disposition') || '';
       const match = disposition.match(/filename="([^"]+)"/i);
       const filename = match ? match[1] : fallbackName;
-      if (window.showSaveFilePicker) {
+      if (saveHandle) {
         try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: filename,
-            types: exportFileTypes(format),
-          });
-          const writable = await handle.createWritable();
+          const writable = await saveHandle.createWritable();
           await writable.write(blob);
           await writable.close();
           log(successText);
-          return;
+          return true;
         } catch (err) {
-          if (err && err.name === 'AbortError') {
-            log(cancelText);
-            return;
-          }
-          log('系统保存对话框不可用，改用浏览器默认下载：' + err.message);
+          log('保存文件失败，改用浏览器默认下载：' + err.message);
         }
       }
       const url = URL.createObjectURL(blob);
@@ -2157,19 +2271,56 @@
       a.remove();
       URL.revokeObjectURL(url);
       log(successText);
+      return true;
+    }
+
+    async function rollbackMailboxAPIExport(res, options, path) {
+      if (String(path || '').indexOf('export-mailbox-apis') < 0) return;
+      let payload = {};
+      try {
+        if (options && options.body) payload = JSON.parse(options.body);
+      } catch (_) {}
+      const exportedAt = res && res.headers ? (res.headers.get('X-IPM-API-Exported-At') || '') : '';
+      if (exportedAt) payload.exported_at = exportedAt;
+      if (!payload.exported_at && !payload.rollback_token) return;
+      let unmarkPath = '/api/runtime/unmark-mailbox-apis';
+      try {
+        const exportURL = new URL(path, window.location.origin);
+        const params = new URLSearchParams();
+        ['owner_id', 'account_id', 'account_key', 'search', 'q', 'api_exported', 'exported'].forEach(key => {
+          const value = exportURL.searchParams.get(key);
+          if (value) params.set(key, value);
+        });
+        const ownerID = exportURL.searchParams.get('owner_id');
+        if (ownerID && payload.owner_id == null) payload.owner_id = ownerID;
+        const query = params.toString();
+        if (query) unmarkPath += '?' + query;
+      } catch (_) {}
+      try {
+        await api(unmarkPath, {method: 'POST', body: JSON.stringify(payload)});
+      } catch (_) {}
     }
 
     async function exportMailboxAPIs(selectID) {
       const format = selectedMailboxExportFormat(selectID);
       const accountID = selectedMailboxExportAccountID(selectID);
-      await downloadExportFile(
+      const exported = await downloadExportFile(
         mailboxExportURL('/api/runtime/export-mailbox-apis', format, selectID),
         `icloud-mailbox-apis-${Date.now()}.${format}`,
         format,
         '已取消导出邮箱API',
         `已导出邮箱API ${format.toUpperCase()}：${accountID ? '指定登录态' : '全部登录态'}，每行一个邮箱API`,
-        '导出邮箱API失败'
+        '导出邮箱API失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format})
+        }
       );
+      if (exported) {
+        selectedMailboxIDs.clear();
+        await loadMailboxPage({silent: true});
+      }
     }
 
     async function exportMailboxEmails(selectID) {
@@ -2181,8 +2332,47 @@
         format,
         '已取消导出邮箱',
         `已导出邮箱 ${format.toUpperCase()}：${accountID ? '指定登录态' : '全部登录态'}，一行一个邮箱`,
-        '导出邮箱失败'
+        '导出邮箱失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format})
+        }
       );
+    }
+
+    async function exportSelectedMailboxes(mode) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要导出的邮箱');
+        return;
+      }
+      const selectID = 'mailboxExportFormatModal';
+      const format = selectedMailboxExportFormat(selectID);
+      const accountID = selectedMailboxExportAccountID(selectID);
+      const path = mailboxExportURL(
+        `/api/runtime/export-mailbox-${mode === 'email' ? 'emails' : 'apis'}`,
+        format,
+        selectID,
+        false
+      );
+      const exported = await downloadExportFile(
+        path,
+        `icloud-mailbox-${mode === 'email' ? 'emails' : 'apis'}-selected-${Date.now()}.${format}`,
+        format,
+        mode === 'email' ? '已取消导出邮箱' : '已取消导出邮箱API',
+        `${mode === 'email' ? '已导出邮箱' : '已导出邮箱API'} ${format.toUpperCase()}：${ids.length} 个选中邮箱`,
+        mode === 'email' ? '导出邮箱失败' : '导出邮箱API失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format, ids})
+        }
+      );
+      if (exported && mode !== 'email') {
+        selectedMailboxIDs.clear();
+        await loadMailboxPage({silent: true});
+      }
     }
 
     function initSessionCheckSettings() {
@@ -2256,6 +2446,12 @@
 
     async function refresh() {
       const status = await api('/api/status');
+      try {
+        const accountData = await api('/api/accounts');
+        lastAccounts = accountData.accounts || [];
+      } catch (_) {
+        lastAccounts = [];
+      }
       if (!lastUpdateStatus && status.version) {
         renderUpdateStatus({current: status.version, enabled: true});
       }
@@ -2265,6 +2461,9 @@
       $('mailboxCount').textContent = status.mailboxes;
       $('messageCount').textContent = status.messages;
       $('apiStatus').textContent = status.current_user && status.current_user.is_admin ? '管理员' : '普通账号';
+      if ($('runtimeExportButton')) {
+        $('runtimeExportButton').hidden = !(status.current_user && status.current_user.is_admin);
+      }
       if ($('serviceInfo')) {
         $('serviceInfo').textContent =
           `对外取码：${status.api_key_configured ? '支持全局 key + 单邮箱 key' : '仅单邮箱 key'}；` +
@@ -2273,6 +2472,7 @@
           `Base URL：${status.base_url || '-'}`;
       }
       renderICloudSessions(lastICloudSessions);
+      renderLoginAccountOptions();
       updateNavCounts(status);
       await loadMailboxPage({silent: true});
     }
@@ -2383,6 +2583,8 @@
 
     function setMailboxSearch() {
       mailboxPage = 1;
+      invalidateMailboxSelection();
+      renderMailboxes();
       if (mailboxSearchTimer) clearTimeout(mailboxSearchTimer);
       mailboxSearchTimer = setTimeout(() => {
         loadMailboxPage().catch(err => log('邮箱搜索失败：' + err.message));
@@ -2392,6 +2594,8 @@
     function clearMailboxSearch() {
       if ($('mailboxSearch')) $('mailboxSearch').value = '';
       mailboxPage = 1;
+      invalidateMailboxSelection();
+      renderMailboxes();
       loadMailboxPage().catch(err => log('清空邮箱搜索失败：' + err.message));
     }
 
@@ -2412,14 +2616,18 @@
         count: Number(group.count || 0)
       })).filter(group => group.key);
       if (activeMailboxAccountKey !== 'all' && !groups.some(group => group.key === activeMailboxAccountKey)) {
-        activeMailboxAccountKey = 'all';
+        groups.push({
+          key: activeMailboxAccountKey,
+          title: activeMailboxAccountKey === 'unbound' ? '未绑定 Apple 账号' : activeMailboxAccountKey,
+          count: 0
+        });
       }
       const ordered = groups.sort((a, b) => a.title.localeCompare(b.title));
       const buttons = [
-        `<button class="${activeMailboxAccountKey === 'all' ? 'active' : ''}" onclick="setMailboxAccountTab('all')">全部 ${lastMailboxPagination.total_all || 0}</button>`
+        `<button class="${activeMailboxAccountKey === 'all' ? 'active' : ''}" onclick="setMailboxAccountTab('all')">全部 ${lastMailboxPagination.total || 0}</button>`
       ];
       for (const group of ordered) {
-        buttons.push(`<button class="${activeMailboxAccountKey === group.key ? 'active' : ''}" onclick="setMailboxAccountTab(${esc(JSON.stringify(group.key))})">${esc(group.title)} ${group.count}</button>`);
+        buttons.push(`<button class="${activeMailboxAccountKey === group.key ? 'active' : ''}" onclick="setMailboxAccountTab(${jsArg(group.key)})">${esc(group.title)} ${group.count}</button>`);
       }
       tabs.innerHTML = buttons.join('');
       renderMailboxExportAccountOptions();
@@ -2429,11 +2637,14 @@
       const groupCountByAccount = new Map((lastMailboxGroups || [])
         .filter(group => group.account_id)
         .map(group => [group.account_id, Number(group.count || 0)]));
+      const unboundCount = (lastMailboxGroups || [])
+        .filter(group => !group.account_id)
+        .reduce((total, group) => total + Number(group.count || 0), 0);
       const syncChoices = (lastICloudSessions || [])
-        .filter(session => session && session.saved && session.account_id && createLoginSaved(session))
+        .filter(session => session && session.saved && session.account_id && (iCloudWebLoginSaved(session) || appleAccountLoginSaved(session)))
         .map(session => ({
           id: session.account_id,
-          title: createAccountDisplayName(session),
+          title: `${createAccountDisplayName(session)} · ${mailboxSyncSourceLabel(session)}`,
           count: groupCountByAccount.get(session.account_id) || 0
         }))
         .sort((a, b) => a.title.localeCompare(b.title));
@@ -2441,7 +2652,7 @@
       if (syncSelect) {
         const current = syncSelect.value || '';
         syncSelect.innerHTML = [
-          '<option value="">全部登录态</option>',
+          '<option value="">全部可同步登录态</option>',
           ...syncChoices.map(group => `<option value="${esc(group.id)}">${esc(group.title)} · ${group.count}</option>`)
         ].join('');
         const values = new Set(['', ...syncChoices.map(group => group.id)]);
@@ -2451,10 +2662,20 @@
         .filter(group => group.account_id)
         .map(group => ({id: group.account_id, title: group.title || group.account_id, count: Number(group.count || 0)}))
         .sort((a, b) => a.title.localeCompare(b.title));
+      if (unboundCount > 0) {
+        ordered.unshift({id: 'unbound', title: '未绑定 Apple 账号', count: unboundCount});
+      }
       for (const id of ['mailboxExportAccount', 'mailboxExportAccountModal']) {
         const select = $(id);
         if (!select) continue;
         const current = select.value || '__current';
+        if (current && current !== '__current' && current !== '' && !ordered.some(group => group.id === current)) {
+          ordered.push({
+            id: current,
+            title: current === 'unbound' ? '未绑定 Apple 账号' : current,
+            count: 0
+          });
+        }
         select.innerHTML = [
           '<option value="__current">当前TAB账号</option>',
           '<option value="">全部登录态</option>',
@@ -2468,7 +2689,65 @@
     function setMailboxAccountTab(key) {
       activeMailboxAccountKey = key || 'all';
       mailboxPage = 1;
+      invalidateMailboxSelection();
       loadMailboxPage().catch(err => log('切换邮箱分类失败：' + err.message));
+    }
+
+    function mailboxBindAccounts() {
+      const seen = new Set();
+      return (lastAccounts || [])
+        .filter(account => {
+          const id = String(account && account.id || '').trim();
+          if (!id || seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })
+        .map(account => ({
+          id: String(account.id),
+          ownerID: String(account.owner_id || '').trim(),
+          title: [account.label, account.apple_id].filter(Boolean).join(' / ') || account.id
+        }))
+        .sort((a, b) => a.title.localeCompare(b.title));
+    }
+
+    function mailboxBindControl(row) {
+      if (!row || String(row.account_id || '').trim()) return '';
+      const ownerID = String(row.owner_id || '').trim();
+      const accounts = mailboxBindAccounts().filter(account => !ownerID || account.ownerID === ownerID);
+      if (accounts.length === 0) return '';
+      return `<select title="绑定 Apple 账号" onchange="bindMailboxToAccount(${jsArg(row.id)}, this.value)">
+        <option value="">绑定 Apple 账号</option>
+        ${accounts.map(account => `<option value="${esc(account.id)}">${esc(account.title)}</option>`).join('')}
+      </select>`;
+    }
+
+    async function bindMailboxToAccount(id, accountID) {
+      accountID = String(accountID || '').trim();
+      if (!accountID) return;
+      const row = (lastMailboxes || []).find(item => String(item.id) === String(id));
+      if (!row) return;
+      if (!confirm(`确认将邮箱「${row.email || id}」绑定到选定 Apple 账号？`)) {
+        renderMailboxes();
+        return;
+      }
+      try {
+        await api(`/api/mailboxes/${encodeURIComponent(id)}/bind`, {
+          method: 'POST',
+          body: JSON.stringify({account_id: accountID})
+        });
+        log(`邮箱已绑定 Apple 账号：${row.email || id}`);
+        await refresh();
+      } catch (err) {
+        log('绑定邮箱归属失败：' + err.message);
+        renderMailboxes();
+      }
+    }
+
+    function setMailboxExportFilter() {
+      activeMailboxExportFilter = $('mailboxExportFilter') ? $('mailboxExportFilter').value : 'all';
+      mailboxPage = 1;
+      invalidateMailboxSelection();
+      loadMailboxPage().catch(err => log('切换导出状态筛选失败：' + err.message));
     }
 
     function changeMailboxPage(delta) {
@@ -2490,15 +2769,134 @@
       });
       const keyword = ($('mailboxSearch') ? $('mailboxSearch').value : '').trim();
       if (keyword) params.set('search', keyword);
-      if (!keyword && activeMailboxAccountKey && activeMailboxAccountKey !== 'all') {
+      if (activeMailboxAccountKey && activeMailboxAccountKey !== 'all') {
         params.set('account_key', activeMailboxAccountKey);
+      }
+      if (activeMailboxExportFilter && activeMailboxExportFilter !== 'all') {
+        params.set('exported', activeMailboxExportFilter);
       }
       return params;
     }
 
+    function mailboxSelectionScope() {
+      const scope = {};
+      const search = ($('mailboxSearch') ? $('mailboxSearch').value : '').trim();
+      if (search) scope.search = search;
+      if (activeMailboxAccountKey && activeMailboxAccountKey !== 'all') {
+        scope.account_key = activeMailboxAccountKey;
+      }
+      if (activeMailboxExportFilter && activeMailboxExportFilter !== 'all') {
+        scope.exported = activeMailboxExportFilter;
+      }
+      return scope;
+    }
+
+    function invalidateMailboxSelection() {
+      mailboxSelectionGeneration++;
+      if (mailboxSelectionAbortController) {
+        mailboxSelectionAbortController.abort();
+        mailboxSelectionAbortController = null;
+      }
+      selectedMailboxIDs.clear();
+    }
+
+    function mailboxSelectedCount() {
+      return selectedMailboxIDs.size;
+    }
+
+    function mailboxIsSelected(id) {
+      return selectedMailboxIDs.has(String(id || ''));
+    }
+
+    function toggleMailboxSelection(id, checked) {
+      id = String(id || '').trim();
+      if (!id) return;
+      if (checked) {
+        selectedMailboxIDs.add(id);
+      } else {
+        selectedMailboxIDs.delete(id);
+      }
+      renderMailboxes();
+    }
+
+    function selectVisibleMailboxes(checked) {
+      const rows = lastMailboxes || [];
+      rows.forEach(row => {
+        if (!row || !row.id) return;
+        const id = String(row.id);
+        if (checked) selectedMailboxIDs.add(id);
+        else selectedMailboxIDs.delete(id);
+      });
+      renderMailboxes();
+    }
+
+    async function selectAllFilteredMailboxes() {
+      const selectionGeneration = ++mailboxSelectionGeneration;
+      if (mailboxSelectionAbortController) {
+        mailboxSelectionAbortController.abort();
+      }
+      const controller = new AbortController();
+      mailboxSelectionAbortController = controller;
+      try {
+        const params = mailboxListQuery();
+        params.set('page', '1');
+        params.set('page_size', '500');
+        let page = 1;
+        let totalPages = 1;
+        const ids = [];
+        do {
+          params.set('page', String(page));
+          const data = await api('/api/mailboxes?' + params.toString(), {signal: controller.signal});
+          if (selectionGeneration !== mailboxSelectionGeneration) {
+            return;
+          }
+          const rows = data.mailboxes || [];
+          rememberMailboxRemoteDeleteStatus(rows);
+          rows.forEach(row => {
+            if (row && row.id) ids.push(String(row.id));
+          });
+          totalPages = Number((data.pagination && data.pagination.total_pages) || 1);
+          page++;
+        } while (page <= totalPages);
+        if (selectionGeneration !== mailboxSelectionGeneration) {
+          return;
+        }
+        ids.forEach(id => selectedMailboxIDs.add(id));
+        renderMailboxes();
+        log(`已全选筛选结果：${ids.length} 个邮箱`);
+      } catch (err) {
+        if (selectionGeneration !== mailboxSelectionGeneration || err.name === 'AbortError') {
+          return;
+        }
+        log('全选筛选结果失败：' + err.message);
+      } finally {
+        if (mailboxSelectionAbortController === controller) {
+          mailboxSelectionAbortController = null;
+        }
+      }
+    }
+
+    function clearMailboxSelection() {
+      invalidateMailboxSelection();
+      renderMailboxes();
+    }
+
     async function loadMailboxPage(options = {}) {
-      const data = await api('/api/mailboxes?' + mailboxListQuery().toString());
+      const requestSeq = ++mailboxLoadRequestSeq;
+      let data;
+      try {
+        data = await api('/api/mailboxes?' + mailboxListQuery().toString());
+      } catch (err) {
+        if (requestSeq !== mailboxLoadRequestSeq) {
+          return;
+        }
+        throw err;
+      }
+      if (requestSeq !== mailboxLoadRequestSeq) {
+        return;
+      }
       lastMailboxes = data.mailboxes || [];
+      rememberMailboxRemoteDeleteStatus(lastMailboxes);
       lastMailboxGroups = data.groups || [];
       lastMailboxPagination = data.pagination || {
         page: mailboxPage,
@@ -2510,6 +2908,7 @@
       mailboxPage = Number(lastMailboxPagination.page || mailboxPage || 1);
       mailboxPageSize = Number(lastMailboxPagination.page_size || mailboxPageSize || 10);
       if ($('mailboxPageSize')) $('mailboxPageSize').value = String(mailboxPageSize);
+      if ($('mailboxExportFilter')) $('mailboxExportFilter').value = activeMailboxExportFilter || 'all';
       renderMailboxes();
       updateNavCounts();
       if (!options.silent) {
@@ -2532,45 +2931,65 @@
       }
       if ($('mailboxPrevPage')) $('mailboxPrevPage').disabled = page <= 1;
       if ($('mailboxNextPage')) $('mailboxNextPage').disabled = page >= totalPages;
+      if ($('mailboxExportFilter')) $('mailboxExportFilter').value = activeMailboxExportFilter || 'all';
+      const visibleSelectedCount = rows.filter(row => row && row.id && selectedMailboxIDs.has(String(row.id))).length;
+      const visibleAllSelected = rows.length > 0 && visibleSelectedCount === rows.length;
+      const visibleSomeSelected = visibleSelectedCount > 0 && visibleSelectedCount < rows.length;
+      const pageSelectEl = $('mailboxPageSelectAll');
+      if (pageSelectEl) {
+        pageSelectEl.checked = visibleAllSelected;
+        pageSelectEl.indeterminate = visibleSomeSelected;
+      }
+      const selectedInfo = $('mailboxSelectionInfo');
+      if (selectedInfo) selectedInfo.textContent = `已选 ${mailboxSelectedCount()} 个`;
       if (rows.length === 0) {
-        $('mailboxes').innerHTML = '<tr><td colspan="6" class="muted">没有匹配的邮箱</td></tr>';
+        $('mailboxes').innerHTML = '<tr><td colspan="7" class="muted">没有匹配的邮箱</td></tr>';
         return;
       }
       let lastGroup = '';
       $('mailboxes').innerHTML = rows.map(row => {
         const group = mailboxAccountTitle(row);
         const groupRow = group !== lastGroup
-          ? `<tr class="account-group"><td colspan="6">Apple 账号：${esc(group)}</td></tr>`
+          ? `<tr class="account-group"><td colspan="7">Apple 账号：${esc(group)}</td></tr>`
           : '';
         lastGroup = group;
+        const exportedText = row.api_exported ? `已导出${row.api_exported_at ? ' · ' + esc(row.api_exported_at) : ''}` : '未导出';
+        const exportedClass = row.api_exported ? 'success' : 'off';
         return `${groupRow}
           <tr>
+            <td class="mailbox-select-cell"><input type="checkbox" ${mailboxIsSelected(row.id) ? 'checked' : ''} onchange="toggleMailboxSelection(${jsArg(row.id)}, this.checked)" title="选择邮箱"></td>
             <td><div class="mail-title">${esc(row.label || '-')}</div><span class="muted">${esc(row.id)}</span></td>
             <td><span class="email">${esc(row.email)}</span></td>
             <td>
               <span class="pill ${row.api_active ? '' : 'off'}">API ${row.api_active ? 'active' : 'off'}</span>
               <span class="pill ${row.icloud_active ? '' : 'off'}">iCloud ${row.icloud_active ? 'active' : 'off'}</span>
+              <span class="pill ${exportedClass}">${exportedText}</span>
               <br><span class="pill ${statusClass(row.status)}">${statusText(row.status)}</span>
+              ${row.remote_missing_at ? '<span class="pill off">远端不存在</span>' : ''}
+              ${row.remote_delete_status === 'pending' ? '<span class="pill off" title="远端删除正在进行中，请稍后刷新">远端删除中</span>' : ''}
+              ${row.remote_delete_status === 'unknown' ? `<span class="pill off" title="上次远端删除结果未知；再次勾选远端删除会重试">远端待核对</span>` : ''}
+              ${row.remote_delete_status === 'failed' ? `<span class="pill off" title="${esc(row.remote_delete_error || '')}">远端删除失败</span>` : ''}
             </td>
             <td>${row.receive_count || 0}</td>
             <td class="mailbox-code-cell">${renderMailboxCodeCell(row.id)}</td>
             <td><div class="row-actions">
               <span class="copy-menu-wrap">
-                <button onclick="toggleCopyMenu('${row.id}')">API 地址</button>
+                <button onclick="toggleCopyMenu(${jsArg(row.id)})">API 地址</button>
                 ${renderMailboxCopyMenu(row.id)}
               </span>
-              <button id="verifyButton-${esc(row.id)}" onclick="verifyMailbox('${row.id}')">${verifyButtonText(row.id)}</button>
-              <button class="${syncButtonClass(row.id)}" onclick="syncMailbox('${row.id}')" ${syncButtonDisabled(row.id)}>${syncButtonText(row.id)}</button>
-              <button onclick="cleanRemoteMailbox('${row.id}')" title="把本地已同步过的远端邮件移到废纸篓，并清空当前 iCloud 废纸篓">删除邮件</button>
-              <select onchange="setMailboxStatus('${row.id}', this.value)">
+              <button id="verifyButton-${esc(row.id)}" onclick="verifyMailbox(${jsArg(row.id)})">${verifyButtonText(row.id)}</button>
+              <button class="${syncButtonClass(row.id)}" onclick="syncMailbox(${jsArg(row.id)})" ${syncButtonDisabled(row.id)}>${syncButtonText(row.id)}</button>
+              <button onclick="cleanRemoteMailbox(${jsArg(row.id)})" title="把本地已同步过的远端邮件移到废纸篓，并清空当前 iCloud 废纸篓">删除邮件</button>
+              <select onchange="setMailboxStatus(${jsArg(row.id)}, this.value)">
                 <option value="">改状态</option>
                 <option value="available">可用</option>
                 <option value="used">已使用</option>
                 <option value="failed">失败</option>
                 <option value="disabled">停用</option>
               </select>
-              <button onclick="disableMailbox('${row.id}')">停用 API</button>
-              <button class="danger" onclick="deleteMailbox('${row.id}')">删除 API</button>
+              ${mailboxBindControl(row)}
+              <button onclick="disableMailbox(${jsArg(row.id)})">停用 API</button>
+              <button class="danger" onclick="deleteMailbox(${jsArg(row.id)})">删除 API</button>
             </div>
             </td>
           </tr>`;
@@ -2626,7 +3045,7 @@
         return '<span class="code-inline-result loading"><span><span class="spinner"></span>读取中</span></span>';
       }
       if (item.code) {
-        return `<button type="button" class="code-inline-result" onclick="copyMailboxCode('${esc(id)}')" title="点击复制验证码">
+        return `<button type="button" class="code-inline-result" onclick="copyMailboxCode(${jsArg(id)})" title="点击复制验证码">
           <span class="code-value">${esc(item.code)}</span>
           <span class="muted">点击复制${time}</span>
         </button>`;
@@ -2653,9 +3072,9 @@
     function renderMailboxCopyMenu(id) {
       if (activeMailboxCopyMenuID !== id) return '';
       return `<span class="copy-choice-menu" role="group" aria-label="复制选项">
-        <button type="button" onclick="copyMailboxValue('${id}', 'email')">复制邮箱</button>
-        <button type="button" onclick="copyMailboxValue('${id}', 'api')">复制API</button>
-        <button type="button" onclick="copyMailboxValue('${id}', 'both')">邮箱+API</button>
+        <button type="button" onclick="copyMailboxValue(${jsArg(id)}, 'email')">复制邮箱</button>
+        <button type="button" onclick="copyMailboxValue(${jsArg(id)}, 'api')">复制API</button>
+        <button type="button" onclick="copyMailboxValue(${jsArg(id)}, 'both')">邮箱+API</button>
       </span>`;
     }
 
@@ -2678,6 +3097,7 @@
       if (displaySessions.length === 0) {
         $('icloudSessionInfo').textContent = '未完成创建登录。请输入 Apple ID/密码后选择新接口或旧接口登录；取码请单独保存取码登录。';
         renderCreateAccountSelector();
+        renderLoginAccountOptions();
         return;
       }
       if (!activeICloudSessionKey || !displaySessions.some(session => sessionKey(session) === activeICloudSessionKey)) {
@@ -2687,19 +3107,23 @@
       const tabs = displaySessions.map((session, index) => {
         const key = sessionKey(session);
         const title = session.apple_id || session.account_id || `账号 ${index + 1}`;
-        return `<button class="${key === activeICloudSessionKey ? 'active' : ''}" onclick="setICloudSessionTab(${esc(JSON.stringify(key))})">${esc(title)}</button>`;
+        return `<button class="${key === activeICloudSessionKey ? 'active' : ''}" onclick="setICloudSessionTab(${jsArg(key)})">${esc(title)}</button>`;
       }).join('');
       const imapInfo = active.icloud_imap_login_saved
         ? `<br>取码邮箱：${esc(active.icloud_imap_email || active.apple_id || '-')} ${active.icloud_imap_host ? `<span class="muted">/ ${esc(active.icloud_imap_host)}</span>` : ''}`
         : '';
+      const proxyInfo = active.proxy_configured
+        ? `<br>账号代理：${esc(active.proxy_url || '已配置')}`
+        : '<br>账号代理：未配置';
       $('icloudSessionInfo').innerHTML =
         `<div>已保存 ${displaySessions.length} 个 Apple 登录态，Apple 登录态只用于创建邮箱；取码走取码登录。</div>` +
         `<div class="session-tabs">${tabs}</div>` +
         `<div class="session-card"><div class="session-card-line"><span>Apple ID：${esc(active.apple_id || '-')}</span>${sessionManageRefreshBadge(active)}</div>` +
-        `账号ID：${esc(active.account_id || '-')}${imapInfo}<br>` +
+        `账号ID：${esc(active.account_id || '-')}${proxyInfo}${imapInfo}<br>` +
         `<div class="login-chips">${sessionLoginBadges(active)}</div>` +
         `${esc(overallLoginStateText(active))}</div>`;
       renderCreateAccountSelector();
+      renderLoginAccountOptions();
       updateManageRefreshClocks();
     }
 
@@ -2723,6 +3147,30 @@
       return session.account_id || '';
     }
 
+    function selectedLoginAccountID() {
+      const select = $('loginAccountID');
+      return select ? String(select.value || '').trim() : '';
+    }
+
+    function renderLoginAccountOptions() {
+      const select = $('loginAccountID');
+      if (!select) return;
+      const current = selectedLoginAccountID();
+      const active = activeICloudSessionAccountID();
+      const validIDs = new Set((lastAccounts || []).map(account => String(account && account.id || '').trim()).filter(Boolean));
+      const selected = validIDs.has(current) ? current : (validIDs.has(active) ? active : '');
+      const options = ['<option value="">自动匹配或新建账号</option>'];
+      (lastAccounts || []).forEach(account => {
+        if (!account || !account.id) return;
+        const title = [account.label, account.apple_id].filter(Boolean).join(' / ') || account.id;
+        const owner = account.owner ? ` · 归属 ${account.owner}` : '';
+        const reconciliation = account.mailbox_create_reconciliation_required ? ' · 待同步核对' : '';
+        options.push(`<option value="${esc(account.id)}">${esc(title + owner + reconciliation)}</option>`);
+      });
+      select.innerHTML = options.join('');
+      select.value = selected;
+    }
+
     async function syncICloudMailboxes() {
       const button = $('syncICloudMailboxesButton');
       button.disabled = true;
@@ -2733,12 +3181,13 @@
           account_id: selectedAccountID
         })});
         if (data.message) log(data.message);
-        log(`同步完成：远端 ${data.total || 0} 个，新增 ${data.created || 0} 个，更新 ${data.updated || 0} 个，跳过 ${data.skipped || 0} 个`);
+        log(`同步完成：远端 ${data.remote_total ?? data.total ?? 0} 个，本地处理 ${data.local_processed || 0} 个，新增 ${data.created || 0} 个，更新 ${data.updated || 0} 个，跳过 ${data.skipped || 0} 个`);
         (data.results || []).forEach(item => {
           const name = item.apple_id || item.account_id || '-';
-          const source = item.source === 'icloud_web' ? '旧接口' : '未同步';
-          const suffix = item.error ? `，失败：${item.error}` : '';
-          log(`同步账号：${name}，接口 ${source}，远端 ${item.total || 0}，新增 ${item.created || 0}，更新 ${item.updated || 0}，跳过 ${item.skipped || 0}${suffix}`);
+          const source = mailboxSyncResultSourceLabel(item.source);
+          let suffix = item.error ? `，失败：${item.error}` : '';
+          if (item.warning) suffix += `，${item.warning}`;
+          log(`同步账号：${name}，接口 ${source}，远端 ${item.remote_total ?? item.total ?? 0}，本地处理 ${item.local_processed || 0}，新增 ${item.created || 0}，更新 ${item.updated || 0}，跳过 ${item.skipped || 0}${suffix}`);
         });
         await refresh();
       } catch (err) {
@@ -2805,22 +3254,34 @@
 
     async function startProtocolLogin() {
       const appleId = $('protocolAppleId').value.trim();
-      const data = await api('/api/icloud/protocol-login/start', {method:'POST', body: JSON.stringify({
-        apple_id: appleId,
-        password: $('protocolPassword').value,
-        two_factor_method: twoFactorMethodPayloadValue('iCloudWeb2FAMethod')
-      })});
-      $('protocolPassword').value = '';
-      if (data.needs_2fa) {
-        protocolPendingID = data.pending_id || '';
-        log(`${data.message || '需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
-        $('icloudSessionInfo').textContent = `${data.message || '需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
-        return;
+      const button = $('protocolLoginButton');
+      button.disabled = true;
+      try {
+        const data = await api('/api/icloud/protocol-login/start', {method:'POST', body: JSON.stringify({
+          apple_id: appleId,
+          account_id: selectedLoginAccountID(),
+          password: $('protocolPassword').value,
+          two_factor_method: twoFactorMethodPayloadValue('iCloudWeb2FAMethod'),
+          proxy_url: $('icloudProxyURL').value.trim()
+        })});
+        $('protocolPassword').value = '';
+        $('icloudProxyURL').value = '';
+        if (data.needs_2fa) {
+          protocolPendingID = data.pending_id || '';
+          log(`${data.message || '需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
+          $('icloudSessionInfo').textContent = `${data.message || '需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
+          return;
+        }
+        renderICloudSession(data.session);
+        if (data.sessions) renderICloudSessions(data.sessions);
+        log('旧接口登录态已保存：' + (data.session.apple_id || appleId));
+        await refresh();
+      } catch (err) {
+        log('旧接口登录失败：' + err.message);
+        $('icloudSessionInfo').textContent = '旧接口登录失败：' + err.message;
+      } finally {
+        button.disabled = false;
       }
-      renderICloudSession(data.session);
-      if (data.sessions) renderICloudSessions(data.sessions);
-      log('旧接口登录态已保存：' + (data.session.apple_id || appleId));
-      await refresh();
     }
 
     async function submitProtocol2FA() {
@@ -2861,22 +3322,34 @@
 
     async function startAppleAccountLogin() {
       const appleId = $('protocolAppleId').value.trim();
-      const data = await api('/api/apple-account/login/start', {method:'POST', body: JSON.stringify({
-        apple_id: appleId,
-        password: $('protocolPassword').value,
-        two_factor_method: twoFactorMethodPayloadValue('appleAccount2FAMethod')
-      })});
-      $('protocolPassword').value = '';
-      if (data.needs_2fa) {
-        appleAccountPendingID = data.pending_id || '';
-        log(`${data.message || '新接口需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
-        $('icloudSessionInfo').textContent = `${data.message || '新接口需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
-        return;
+      const button = $('appleAccountLoginButton');
+      button.disabled = true;
+      try {
+        const data = await api('/api/apple-account/login/start', {method:'POST', body: JSON.stringify({
+          apple_id: appleId,
+          account_id: selectedLoginAccountID(),
+          password: $('protocolPassword').value,
+          two_factor_method: twoFactorMethodPayloadValue('appleAccount2FAMethod'),
+          proxy_url: $('icloudProxyURL').value.trim()
+        })});
+        $('protocolPassword').value = '';
+        $('icloudProxyURL').value = '';
+        if (data.needs_2fa) {
+          appleAccountPendingID = data.pending_id || '';
+          log(`${data.message || '新接口需要 2FA'}：${data.apple_id || appleId}，有效期 ${data.expires_at || '-'}`);
+          $('icloudSessionInfo').textContent = `${data.message || '新接口需要 2FA'}\n账号：${data.apple_id || appleId}\n有效期：${data.expires_at || '-'}`;
+          return;
+        }
+        renderICloudSession(data.session);
+        if (data.sessions) renderICloudSessions(data.sessions);
+        log('新接口登录态已保存：' + (data.session.apple_id || appleId));
+        await refresh();
+      } catch (err) {
+        log('新接口登录失败：' + err.message);
+        $('icloudSessionInfo').textContent = '新接口登录失败：' + err.message;
+      } finally {
+        button.disabled = false;
       }
-      renderICloudSession(data.session);
-      if (data.sessions) renderICloudSessions(data.sessions);
-      log('新接口登录态已保存：' + (data.session.apple_id || appleId));
-      await refresh();
     }
 
     async function submitAppleAccount2FA() {
@@ -2957,9 +3430,29 @@
         renderCreateDetails(mailboxes, failures, remotes);
         log(`本次创建完成：成功 ${mailboxes.length}，失败 ${failures.length}`);
       } catch (err) {
-        progress.textContent = `本次创建失败：${err.message}`;
-        setCreateLog(`本次创建失败：${err.message}`);
-        log('本次创建失败：' + err.message);
+        const data = err.data || {};
+        const hasStructuredResult = Array.isArray(data.failures)
+          || Array.isArray(data.mailboxes)
+          || !!(data.mailbox && data.mailbox.id);
+        if (hasStructuredResult) {
+          const mailboxes = data.mailboxes && data.mailboxes.length
+            ? data.mailboxes
+            : (data.mailbox && data.mailbox.id ? [data.mailbox] : []);
+          const remotes = data.remotes || [];
+          const failures = data.failures || [];
+          mailboxes.forEach((mailbox, index) => {
+            const channel = createChannelLabel(mailbox.create_channel || (remotes[index] && remotes[index].channel));
+            log(`创建成功：${mailbox.email}（${mailbox.account_label || mailbox.account_apple_id || mailbox.account_id || '未绑定账号'}，使用${channel}）`);
+          });
+          failures.forEach(failure => log(`账号创建失败：${failure.apple_id || failure.account_id || '-'}，${failure.channel ? '使用' + createChannelLabel(failure.channel) + '，' : ''}${failure.error || '未知错误'}`));
+          progress.textContent = `${data.message || '本次创建失败'}：成功 ${mailboxes.length}，失败 ${failures.length}`;
+          renderCreateDetails(mailboxes, failures, remotes);
+          log(`${data.message || '本次创建失败'}：成功 ${mailboxes.length}，失败 ${failures.length}`);
+        } else {
+          progress.textContent = `本次创建失败：${err.message}`;
+          setCreateLog(`本次创建失败：${err.message}`);
+          log('本次创建失败：' + err.message);
+        }
       } finally {
         button.disabled = false;
         await refresh();
@@ -3022,7 +3515,7 @@
     }
 
     function mailboxCodeURL(row, options = {}) {
-      const url = new URL(row.api_url || '', location.origin);
+      const url = new URL(`/api/mailboxes/${encodeURIComponent(row.id)}/code`, location.origin);
       url.searchParams.set('keyword', options.keyword || 'ChatGPT');
       if (options.waitMs) url.searchParams.set('wait_ms', String(options.waitMs));
       if (options.after) url.searchParams.set('after', options.after);
@@ -3066,11 +3559,61 @@
       }
     }
 
+    async function deleteSelectedMailboxes(deleteRemote) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要删除的邮箱');
+        return;
+      }
+      const confirmText = deleteRemote
+        ? `确认删除 ${ids.length} 个选中邮箱，并同步删除 iCloud 远端隐私邮箱？远端待核对的记录需要单独确认后重试。`
+        : `确认删除 ${ids.length} 个选中邮箱的本地记录？`;
+      if (!confirm(confirmText)) return;
+      log(`开始批量删除邮箱：${ids.length} 个${deleteRemote ? '（含远端）' : ''}`);
+      const hasUnknown = selectedMailboxHasRemoteDeleteStatus('unknown');
+      const hasFailed = selectedMailboxHasRemoteDeleteStatus('failed');
+      if (!deleteRemote && (hasFailed || hasUnknown) && !confirm('选中邮箱包含远端删除失败或待核对的记录，确认已核对 iCloud 后再清理这些本地记录？')) {
+        return;
+      }
+      try {
+        const data = await api('/api/mailboxes/bulk-delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            ids,
+            delete_remote: !!deleteRemote,
+            confirm_unknown: hasUnknown,
+            confirm_failed: !deleteRemote && hasFailed,
+            scope: mailboxSelectionScope()
+          })
+        });
+        log(`批量删除完成：本地删除 ${data.deleted || 0}，远端删除 ${data.remote_deleted || 0}，失败 ${data.failed || 0}`);
+        (data.failures || []).forEach(item => {
+          log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+        invalidateMailboxSelection();
+        await refresh();
+      } catch (err) {
+        log('批量删除失败：' + err.message);
+        const data = err.data || {};
+        invalidateMailboxSelection();
+        await refresh().catch(refreshErr => log('批量删除后刷新列表失败：' + refreshErr.message));
+        if (Number(data.deleted || 0) > 0) {
+          log(`批量删除部分完成：本地删除 ${data.deleted || 0}，远端删除 ${data.remote_deleted || 0}，仍失败 ${data.failed || 0}`);
+        }
+        (data.failures || []).forEach(item => {
+          log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+      }
+    }
+
     async function cleanAllRemoteCodes() {
-      const accountID = (activeMailboxAccountKey && activeMailboxAccountKey !== 'all' && activeMailboxAccountKey !== 'unbound')
+      const isUnbound = activeMailboxAccountKey === 'unbound';
+      const accountID = (activeMailboxAccountKey && activeMailboxAccountKey !== 'all')
         ? activeMailboxAccountKey
         : '';
-      const scopeText = accountID ? `当前 Apple 账号 TAB` : '当前可见全部登录态';
+      const scopeText = accountID
+        ? (isUnbound ? '未绑定 Apple 账号 TAB' : '当前 Apple 账号 TAB')
+        : '当前可见全部登录态';
       if (!confirm(`确认一键删除${scopeText}下已同步过的验证码邮件，并清空对应 iCloud 废纸篓？`)) return;
       log('开始一键删除验证码邮件：' + scopeText);
       try {
@@ -3079,41 +3622,76 @@
           body: JSON.stringify({account_id: accountID, move_synced: true, empty_trash: true})
         });
         const cleanup = data.cleanup || {};
-        log(`一键删除码完成：处理邮箱 ${data.mailboxes || 0}，失败邮箱 ${data.failed_mailboxes || 0}，移入废纸篓 ${cleanup.moved_to_trash || 0}，清空废纸篓 ${cleanup.destroyed || 0}，跳过 ${cleanup.skipped || 0}`);
+        const title = data.failed_mailboxes ? '一键删除码部分失败' : '一键删除码完成';
+        log(`${title}：处理邮箱 ${data.mailboxes || 0}，失败邮箱 ${data.failed_mailboxes || 0}，移入废纸篓 ${cleanup.moved_to_trash || 0}，清空废纸篓 ${cleanup.destroyed || 0}，跳过 ${cleanup.skipped || 0}`);
+        if (data.message) log(data.message);
+        (data.failures || []).forEach(item => {
+          log(`清理失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
       } catch (err) {
-        log('一键删除码失败：' + err.message);
+        const data = err.data || {};
+        const cleanup = data.cleanup || {};
+        if (data.cleanup || data.failed_mailboxes) {
+          log(`一键删除码失败：处理邮箱 ${data.mailboxes || 0}，失败邮箱 ${data.failed_mailboxes || 0}，移入废纸篓 ${cleanup.moved_to_trash || 0}，清空废纸篓 ${cleanup.destroyed || 0}，跳过 ${cleanup.skipped || 0}`);
+        }
+        (data.failures || []).forEach(item => {
+          log(`清理失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+        log('一键删除码失败：' + (data.message || err.message));
       }
     }
 
     async function setMailboxStatus(id, status) {
       if (!status) return;
-      const apiActive = status === 'disabled' ? false : undefined;
-      const payload = {status, note: '面板手动改状态'};
-      if (apiActive !== undefined) payload.api_active = apiActive;
-      await api(`/api/mailboxes/${encodeURIComponent(id)}/status`, {method:'POST', body: JSON.stringify(payload)});
-      log(`状态已更新：${id} -> ${status}`);
-      await refresh();
+      try {
+        const apiActive = status === 'disabled' ? false : undefined;
+        const payload = {status, note: '面板手动改状态'};
+        if (apiActive !== undefined) payload.api_active = apiActive;
+        await api(`/api/mailboxes/${encodeURIComponent(id)}/status`, {method:'POST', body: JSON.stringify(payload)});
+        log(`状态已更新：${id} -> ${status}`);
+        await refresh();
+      } catch (err) {
+        log('状态更新失败：' + err.message);
+      }
     }
 
     async function disableMailbox(id) {
-      await api(`/api/mailboxes/${encodeURIComponent(id)}/disable`, {method:'POST', body:'{}'});
-      log('已停用：' + id);
-      await refresh();
+      try {
+        await api(`/api/mailboxes/${encodeURIComponent(id)}/disable`, {method:'POST', body:'{}'});
+        log('已停用：' + id);
+        await refresh();
+      } catch (err) {
+        log('停用失败：' + err.message);
+      }
     }
 
     async function deleteMailbox(id) {
-      if (!confirm('确认删除这个 API 绑定？')) return;
-      await api(`/api/mailboxes/${encodeURIComponent(id)}`, {method:'DELETE'});
-      log('已删除：' + id);
-      await refresh();
+      const row = lastMailboxes.find(x => x.id === id);
+      const deleteRemote = confirm('是否同时删除 iCloud 创建的远端隐私邮箱？点击“取消”只删除本地记录。');
+      if (!confirm(`确认删除这个 API 绑定？${deleteRemote ? '（同时删除远端）' : ''}`)) return;
+      try {
+        const remoteStatus = mailboxRemoteDeleteStatusOf(id) || (row && row.remote_delete_status) || '';
+        const confirmUnknown = remoteStatus === 'unknown';
+        const confirmFailed = !deleteRemote && remoteStatus === 'failed';
+        if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
+        await api(`/api/mailboxes/${encodeURIComponent(id)}?delete_remote=${deleteRemote ? '1' : '0'}&confirm_unknown=${confirmUnknown ? '1' : '0'}&confirm_failed=${confirmFailed ? '1' : '0'}`, {method:'DELETE'});
+        log('已删除：' + (row ? row.email : id));
+        selectedMailboxIDs.delete(id);
+        await refresh();
+      } catch (err) {
+        log('删除邮箱失败：' + err.message);
+        await refresh().catch(refreshErr => log('删除失败后刷新列表失败：' + refreshErr.message));
+      }
     }
 
     async function copyMailboxValue(id, mode) {
       const row = lastMailboxes.find(x => x.id === id);
       if (!row) return;
       const email = row.email || '';
-      const apiURL = mailboxCodeURL(row, {waitMs: 12000}).toString();
-      const value = mode === 'email' ? email : (mode === 'api' ? apiURL : `${email}----${apiURL}`);
+      const apiURL = row.api_url || '';
+      const apiToken = row.api_token || '';
+      const apiValue = `${apiURL}----${apiToken}`;
+      const value = mode === 'email' ? email : (mode === 'api' ? apiValue : `${email}----${apiValue}`);
       await writeClipboard(value);
       activeMailboxCopyMenuID = '';
       renderMailboxes();
@@ -3173,6 +3751,10 @@
 
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function jsArg(value) {
+      return esc(JSON.stringify(String(value ?? '')).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'));
     }
 
     initAppearanceControls();

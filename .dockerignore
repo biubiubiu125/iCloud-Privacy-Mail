@@ -1,0 +1,15 @@
+.git
+.github
+data
+logs
+captures
+config.json
+config.local.json
+*.secret.json
+*.key
+*.pem
+build
+bin
+dist
+panel
+coverage.out

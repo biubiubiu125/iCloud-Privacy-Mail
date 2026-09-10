@@ -33,6 +33,10 @@ func NewICloudSessionValidator() *ICloudSessionValidator {
 }
 
 func (c *ICloudSessionValidator) Validate(ctx context.Context, cookies []SessionCookie, defaultHost string) (validateResult, error) {
+	return c.ValidateWithProxy(ctx, cookies, defaultHost, "")
+}
+
+func (c *ICloudSessionValidator) ValidateWithProxy(ctx context.Context, cookies []SessionCookie, defaultHost, proxyURL string) (validateResult, error) {
 	host := strings.TrimSpace(defaultHost)
 	if host == "" {
 		host = "www.icloud.com.cn"
@@ -74,7 +78,11 @@ func (c *ICloudSessionValidator) Validate(ctx context.Context, cookies []Session
 	if cookie := cookieHeader(cookies, u.String()); cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
-	resp, err := c.httpClient.Do(req)
+	httpClient, err := httpClientWithProxy(c.httpClient, proxyURL)
+	if err != nil {
+		return validateResult{}, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return validateResult{}, err
 	}
@@ -84,7 +92,7 @@ func (c *ICloudSessionValidator) Validate(ctx context.Context, cookies []Session
 		return validateResult{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return validateResult{}, errCode("icloud_validate_failed", fmt.Sprintf("iCloud 登录态校验失败，HTTP %d: %s", resp.StatusCode, trimForError(data)), true)
+		return validateResult{}, errCode("icloud_validate_failed", fmt.Sprintf("iCloud 登录态校验失败，HTTP %d", resp.StatusCode), true)
 	}
 	var account struct {
 		DSInfo struct {

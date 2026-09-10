@@ -39,6 +39,11 @@ const (
 	LoginStateICloudIMAP   = "icloud_imap"
 )
 
+const (
+	mailboxRemoteOriginICloudWeb    = "ICLOUD_WEB"
+	mailboxRemoteOriginAppleAccount = "APPLE_ACCOUNT"
+)
+
 type User struct {
 	ID           string    `json:"id"`
 	Username     string    `json:"username"`
@@ -60,35 +65,47 @@ type WebSession struct {
 }
 
 type Account struct {
-	ID           string    `json:"id"`
-	OwnerID      string    `json:"owner_id,omitempty"`
-	Label        string    `json:"label"`
-	AppleID      string    `json:"apple_id"`
-	Status       string    `json:"status"`
-	ICloudStatus string    `json:"icloud_status"`
-	Note         string    `json:"note"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID                                  string    `json:"id"`
+	OwnerID                             string    `json:"owner_id,omitempty"`
+	Label                               string    `json:"label"`
+	AppleID                             string    `json:"apple_id"`
+	ProxyURL                            string    `json:"proxy_url,omitempty"`
+	MailboxCreateReconciliationRequired bool      `json:"mailbox_create_reconciliation_required,omitempty"`
+	MailboxCreateReconciliationAt       time.Time `json:"mailbox_create_reconciliation_at,omitempty"`
+	MailboxCreateReconciliationError    string    `json:"mailbox_create_reconciliation_error,omitempty"`
+	MailboxCreateReconciliationOrigin   string    `json:"mailbox_create_reconciliation_origin,omitempty"`
+	Status                              string    `json:"status"`
+	ICloudStatus                        string    `json:"icloud_status"`
+	Note                                string    `json:"note"`
+	CreatedAt                           time.Time `json:"created_at"`
+	UpdatedAt                           time.Time `json:"updated_at"`
 }
 
 type Mailbox struct {
-	ID                string    `json:"id"`
-	OwnerID           string    `json:"owner_id,omitempty"`
-	AccountID         string    `json:"account_id"`
-	Label             string    `json:"label"`
-	Email             string    `json:"email"`
-	APIToken          string    `json:"api_token"`
-	APIActive         bool      `json:"api_active"`
-	ICloudActive      bool      `json:"icloud_active"`
-	ReceiveCount      int       `json:"receive_count"`
-	Status            string    `json:"status"`
-	Note              string    `json:"note"`
-	LastSyncAt        time.Time `json:"last_sync_at,omitempty"`
-	LastSyncUID       string    `json:"last_sync_uid,omitempty"`
-	LastCodeMessageID string    `json:"last_code_message_id,omitempty"`
-	LastCodeAt        time.Time `json:"last_code_at,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                 string    `json:"id"`
+	OwnerID            string    `json:"owner_id,omitempty"`
+	AccountID          string    `json:"account_id"`
+	RemoteAnonymousID  string    `json:"remote_anonymous_id,omitempty"`
+	RemoteOrigin       string    `json:"remote_origin,omitempty"`
+	RemoteMissingAt    time.Time `json:"remote_missing_at,omitempty"`
+	RemoteDeleteStatus string    `json:"remote_delete_status,omitempty"`
+	RemoteDeleteError  string    `json:"remote_delete_error,omitempty"`
+	RemoteDeleteAt     time.Time `json:"remote_delete_at,omitempty"`
+	Label              string    `json:"label"`
+	Email              string    `json:"email"`
+	APIToken           string    `json:"api_token"`
+	APIActive          bool      `json:"api_active"`
+	ICloudActive       bool      `json:"icloud_active"`
+	APIExportedAt      time.Time `json:"api_exported_at,omitempty"`
+	ReceiveCount       int       `json:"receive_count"`
+	Status             string    `json:"status"`
+	Note               string    `json:"note"`
+	LastSyncAt         time.Time `json:"last_sync_at,omitempty"`
+	LastSyncUID        string    `json:"last_sync_uid,omitempty"`
+	LastCodeMessageID  string    `json:"last_code_message_id,omitempty"`
+	LastCodeAt         time.Time `json:"last_code_at,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type Message struct {
@@ -105,32 +122,35 @@ type Message struct {
 }
 
 type ICloudSession struct {
-	OwnerID            string          `json:"owner_id,omitempty"`
-	AccountID          string          `json:"account_id,omitempty"`
-	SavedAt            time.Time       `json:"saved_at"`
-	AppleID            string          `json:"apple_id,omitempty"`
-	DSID               string          `json:"dsid"`
-	ClientID           string          `json:"client_id"`
-	ClientBuildNumber  string          `json:"client_build_number"`
-	MasteringNumber    string          `json:"client_mastering_number"`
-	PremiumMailBaseURL string          `json:"premium_mail_base_url"`
-	MailGatewayBaseURL string          `json:"mail_gateway_base_url,omitempty"`
-	MailBaseURL        string          `json:"mail_base_url,omitempty"`
-	Host               string          `json:"host"`
-	IsICloudPlus       bool            `json:"is_icloud_plus"`
-	CanCreateHME       bool            `json:"can_create_hme"`
-	Cookies            []SessionCookie `json:"cookies"`
-	LoginStates        []LoginState    `json:"login_states,omitempty"`
-	Note               string          `json:"note,omitempty"`
-	LastCheckedAt      time.Time       `json:"last_checked_at,omitempty"`
-	LastCheckOK        bool            `json:"last_check_ok,omitempty"`
-	LastStatusMessage  string          `json:"last_status_message,omitempty"`
+	OwnerID                   string          `json:"owner_id,omitempty"`
+	AccountID                 string          `json:"account_id,omitempty"`
+	ProxyURL                  string          `json:"proxy_url,omitempty"`
+	SavedAt                   time.Time       `json:"saved_at"`
+	AppleID                   string          `json:"apple_id,omitempty"`
+	DSID                      string          `json:"dsid"`
+	ClientID                  string          `json:"client_id"`
+	ClientBuildNumber         string          `json:"client_build_number"`
+	MasteringNumber           string          `json:"client_mastering_number"`
+	PremiumMailBaseURL        string          `json:"premium_mail_base_url"`
+	MailGatewayBaseURL        string          `json:"mail_gateway_base_url,omitempty"`
+	MailBaseURL               string          `json:"mail_base_url,omitempty"`
+	Host                      string          `json:"host"`
+	IsICloudPlus              bool            `json:"is_icloud_plus"`
+	CanCreateHME              bool            `json:"can_create_hme"`
+	CapabilitiesAuthoritative bool            `json:"capabilities_authoritative,omitempty"`
+	Cookies                   []SessionCookie `json:"cookies"`
+	LoginStates               []LoginState    `json:"login_states,omitempty"`
+	Note                      string          `json:"note,omitempty"`
+	LastCheckedAt             time.Time       `json:"last_checked_at,omitempty"`
+	LastCheckOK               bool            `json:"last_check_ok,omitempty"`
+	LastStatusMessage         string          `json:"last_status_message,omitempty"`
 }
 
 type LoginState struct {
 	Kind              string          `json:"kind"`
 	Host              string          `json:"host,omitempty"`
 	Origin            string          `json:"origin,omitempty"`
+	ProxyURL          string          `json:"proxy_url,omitempty"`
 	SavedAt           time.Time       `json:"saved_at,omitempty"`
 	Cookies           []SessionCookie `json:"cookies,omitempty"`
 	Scnt              string          `json:"scnt,omitempty"`
@@ -226,7 +246,7 @@ func (s *ICloudSession) UnmarshalJSON(data []byte) error {
 	if s.OwnerID == "" {
 		s.OwnerID = aux.LegacyOwnerID
 	}
-	if len(s.Cookies) > 0 && !hasLoginStateKind(s.LoginStates, LoginStateICloudWeb) {
+	if len(s.Cookies) > 0 && len(s.LoginStates) == 0 {
 		s.LoginStates = append(s.LoginStates, LoginState{
 			Kind:    LoginStateICloudWeb,
 			Host:    s.Host,
@@ -260,6 +280,15 @@ func hasLoginStateKind(states []LoginState, kind string) bool {
 	return false
 }
 
+func hasAnyNonAppleAccountLoginState(states []LoginState) bool {
+	for _, state := range states {
+		if state.Kind != LoginStateAppleAccount {
+			return true
+		}
+	}
+	return false
+}
+
 type SessionCookie struct {
 	Name     string  `json:"name"`
 	Value    string  `json:"value"`
@@ -272,16 +301,21 @@ type SessionCookie struct {
 }
 
 type publicAccount struct {
-	ID           string `json:"id"`
-	OwnerID      string `json:"owner_id,omitempty"`
-	Owner        string `json:"owner,omitempty"`
-	Label        string `json:"label"`
-	AppleID      string `json:"apple_id"`
-	Status       string `json:"status"`
-	ICloudStatus string `json:"icloud_status"`
-	Note         string `json:"note"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	ID                                  string `json:"id"`
+	OwnerID                             string `json:"owner_id,omitempty"`
+	Owner                               string `json:"owner,omitempty"`
+	Label                               string `json:"label"`
+	AppleID                             string `json:"apple_id"`
+	ProxyConfigured                     bool   `json:"proxy_configured"`
+	ProxyURL                            string `json:"proxy_url,omitempty"`
+	MailboxCreateReconciliationRequired bool   `json:"mailbox_create_reconciliation_required"`
+	MailboxCreateReconciliationAt       string `json:"mailbox_create_reconciliation_at,omitempty"`
+	MailboxCreateReconciliationError    string `json:"mailbox_create_reconciliation_error,omitempty"`
+	Status                              string `json:"status"`
+	ICloudStatus                        string `json:"icloud_status"`
+	Note                                string `json:"note"`
+	CreatedAt                           string `json:"created_at"`
+	UpdatedAt                           string `json:"updated_at"`
 }
 
 type publicMailbox struct {
@@ -291,14 +325,23 @@ type publicMailbox struct {
 	AccountID          string `json:"account_id"`
 	AccountLabel       string `json:"account_label,omitempty"`
 	AccountAppleID     string `json:"account_apple_id,omitempty"`
+	RemoteAnonymousID  string `json:"remote_anonymous_id,omitempty"`
+	RemoteOrigin       string `json:"remote_origin,omitempty"`
+	RemoteMissingAt    string `json:"remote_missing_at,omitempty"`
+	RemoteDeleteStatus string `json:"remote_delete_status,omitempty"`
+	RemoteDeleteError  string `json:"remote_delete_error,omitempty"`
+	RemoteDeleteAt     string `json:"remote_delete_at,omitempty"`
 	CreateChannel      string `json:"create_channel,omitempty"`
 	CreateChannelLabel string `json:"create_channel_label,omitempty"`
 	Label              string `json:"label"`
 	Email              string `json:"email"`
 	APITokenMask       string `json:"api_token_mask"`
+	APIToken           string `json:"api_token,omitempty"`
 	APIURL             string `json:"api_url"`
 	APIActive          bool   `json:"api_active"`
 	ICloudActive       bool   `json:"icloud_active"`
+	APIExported        bool   `json:"api_exported"`
+	APIExportedAt      string `json:"api_exported_at,omitempty"`
 	ReceiveCount       int    `json:"receive_count"`
 	Status             string `json:"status"`
 	Note               string `json:"note"`
@@ -362,6 +405,8 @@ type publicUserSummary struct {
 type publicICloudSession struct {
 	Saved                       bool   `json:"saved"`
 	AccountID                   string `json:"account_id,omitempty"`
+	ProxyConfigured             bool   `json:"proxy_configured"`
+	ProxyURL                    string `json:"proxy_url,omitempty"`
 	SavedAt                     string `json:"saved_at,omitempty"`
 	AppleID                     string `json:"apple_id,omitempty"`
 	DSIDMask                    string `json:"dsid_mask,omitempty"`

@@ -137,12 +137,20 @@ func (s *Server) handleStartMailboxScheduler(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusUnauthorized, errCode("auth_required", "请先登录账号", false))
 		return
 	}
+	if err := s.ensureOwnerNotDeleting(ownerID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	accountIDs := normalizeAccountIDSelection(payload.AccountID, payload.AccountIDs)
 	for _, accountID := range accountIDs {
-		if !s.canAccessAccountIDForOwner(ownerID, accountID) {
+		if !s.canAccessAccountID(r, accountID) || !s.accountInRequestScope(r, accountID) {
 			writeError(w, http.StatusNotFound, errCode("account_not_found", "账号不存在", false))
 			return
 		}
+	}
+	if err := s.ensureOwnerNotDeleting(ownerID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
 	}
 	if len(s.sessionsForOwnerAccounts(ownerID, accountIDs)) == 0 {
 		writeError(w, http.StatusBadRequest, errCode("icloud_session_missing", "未找到可用于创建的 iCloud 登录态，请检查参与账号 ID 或先保存登录态", true))
@@ -371,6 +379,16 @@ func (s *Server) runMailboxSchedulerBatch(ctx context.Context, ownerID string, j
 				if channel == mailboxCreateChannelAuto {
 					channel = activeRequestChannel(activeRequests, accountID)
 				}
+				if schedulerRequiresMailboxCreateReconciliation(failure) {
+					if accountID != "" {
+						delete(oneShotNextChannels, accountID)
+						skippedThisBatch[accountID] = true
+					}
+					job.state.Failed++
+					job.state.LastError = failure.Error
+					job.addEventLocked("failed", schedulerReconciliationRequiredMessage(index, accountLabel, channel, failure.Error), batch, Mailbox{}, errors.New(failure.Error))
+					continue
+				}
 				oneShotChannel := oneShotNextChannels[accountID]
 				wasOneShot := normalizeMailboxCreateChannel(oneShotChannel) == channel && channel != mailboxCreateChannelAuto
 				delete(oneShotNextChannels, accountID)
@@ -470,6 +488,17 @@ func schedulerAccountFailedMessage(index int, account string, channel mailboxCre
 		account = "未知账号"
 	}
 	return fmt.Sprintf("第 %d 轮%s使用%s创建失败：%s；该账号本轮已无可用接口，本次定时创建临时跳过该账号，下一次定时创建再试", index, account, mailboxCreateChannelLabel(channel), message)
+}
+
+func schedulerReconciliationRequiredMessage(index int, account string, channel mailboxCreateChannel, message string) string {
+	if index <= 0 {
+		return fmt.Sprintf("账号使用%s创建后远端结果不确定：%s；已停止自动切换接口，请先同步 iCloud 远端邮箱列表确认后再重试", mailboxCreateChannelLabel(channel), message)
+	}
+	account = strings.TrimSpace(account)
+	if account == "" {
+		account = "未知账号"
+	}
+	return fmt.Sprintf("第 %d 轮%s使用%s创建后远端结果不确定：%s；已停止自动切换接口，请先同步 iCloud 远端邮箱列表确认后再重试", index, account, mailboxCreateChannelLabel(channel), message)
 }
 
 func schedulerChannelFailedMessage(index int, account string, channel mailboxCreateChannel, message string, nextChannel mailboxCreateChannel) string {
@@ -624,6 +653,10 @@ func schedulerTransientCreateFailure(failure createMailboxFailure) bool {
 	default:
 		return false
 	}
+}
+
+func schedulerRequiresMailboxCreateReconciliation(failure createMailboxFailure) bool {
+	return mailboxCreateRequiresReconciliation(errCode(failure.Code, failure.Error, true))
 }
 
 func schedulerTransientCreateRetried(retried map[string]map[mailboxCreateChannel]bool, accountID string, channel mailboxCreateChannel) bool {

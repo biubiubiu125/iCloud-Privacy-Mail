@@ -240,6 +240,30 @@
       border-color: rgba(19,184,166,.62);
       box-shadow: 0 0 0 4px rgba(19,184,166,.12);
     }
+    .mailbox-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(248,251,255,.68);
+    }
+    .mailbox-actions select {
+      min-width: 110px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: rgba(255,255,255,.92);
+      color: var(--text);
+      padding: 8px 10px;
+      font-weight: 850;
+    }
+    .mailbox-selection-info {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 850;
+      margin-left: auto;
+    }
     .table-wrap { overflow: auto; }
     table { width: 100%; min-width: 900px; border-collapse: collapse; }
     th, td { border-top: 1px solid rgba(118,143,174,.16); padding: 13px 14px; text-align: left; vertical-align: middle; }
@@ -330,7 +354,7 @@
           <div class="actions">
             <button class="btn" onclick="location.href='/'">生成隐私邮箱</button>
             <button class="btn primary" onclick="refresh()">刷新</button>
-            <button class="btn" onclick="exportData()">导出数据</button>
+            <button id="runtimeExportButton" class="btn" hidden onclick="exportData()">导出完整状态</button>
             <select id="mailboxExportFormat" class="export-format" title="导出格式">
               <option value="txt">TXT</option>
               <option value="csv">CSV</option>
@@ -382,8 +406,15 @@
 
         <section class="panel view-section" id="mailboxesPanel" data-view="mailboxes">
           <div class="panel-head">
-            <div><h2>隐私邮箱数据</h2><p>当前账号有权限查看的隐私邮箱。</p></div>
+            <div><h2>隐私邮箱数据</h2><p>当前账号有权限查看的隐私邮箱，可按 API 导出状态筛选并批量操作。</p></div>
             <div class="panel-tools">
+              <label class="page-size">导出状态
+                <select id="mailboxExportFilter" onchange="setMailboxExportFilter()">
+                  <option value="all">全部</option>
+                  <option value="exported">已导出</option>
+                  <option value="unexported">未导出</option>
+                </select>
+              </label>
               <label class="page-size">每页
                 <input id="mailboxPageSize" type="number" min="1" max="500" value="10" onchange="setMailboxPageSize(this.value)" onkeydown="if(event.key === 'Enter') setMailboxPageSize(this.value)">
                 条
@@ -395,9 +426,19 @@
               </div>
             </div>
           </div>
+          <div class="mailbox-actions">
+            <button class="btn small" onclick="selectVisibleMailboxes(true)">全选本页</button>
+            <button class="btn small" onclick="selectAllFilteredMailboxes()">全选筛选结果</button>
+            <button class="btn small" onclick="clearMailboxSelection()">清空选择</button>
+            <button class="btn small" onclick="exportSelectedMailboxes('api')">导出选中API</button>
+            <button class="btn small" onclick="exportSelectedMailboxes('email')">导出选中邮箱</button>
+            <button class="btn small danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
+            <button class="btn small danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
+            <span id="mailboxSelectionInfo" class="mailbox-selection-info">已选 0 个</span>
+          </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>ID</th><th>归属</th><th>标签</th><th>邮箱</th><th>状态</th><th>收件</th><th>创建时间</th></tr></thead>
+              <thead><tr><th><input id="mailboxPageSelectAll" type="checkbox" onchange="selectVisibleMailboxes(this.checked)" title="全选本页"></th><th>ID</th><th>归属</th><th>标签</th><th>邮箱</th><th>状态</th><th>导出状态</th><th>收件</th><th>创建时间</th><th>操作</th></tr></thead>
               <tbody id="mailboxes"></tbody>
             </table>
           </div>
@@ -410,7 +451,7 @@
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>ID</th><th>归属</th><th>标签</th><th>Apple ID</th><th>状态</th><th>备注</th><th>创建时间</th></tr></thead>
+              <thead><tr><th>ID</th><th>归属</th><th>标签</th><th>Apple ID</th><th>代理</th><th>状态</th><th>备注</th><th>创建时间</th><th>操作</th></tr></thead>
               <tbody id="accounts"></tbody>
             </table>
           </div>
@@ -441,6 +482,9 @@
     const defaultMailboxPageSize = 10;
     let mailboxPage = 1;
     let mailboxPageSize = defaultMailboxPageSize;
+    let mailboxExportFilter = 'all';
+    let selectedMailboxIDs = new Set();
+    let visibleMailboxPageRows = [];
     const viewMeta = {
       overview: '仪表盘',
       accountManage: '账号管理',
@@ -452,6 +496,10 @@
 
     function esc(value) {
       return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function jsArg(value) {
+      return esc(JSON.stringify(String(value ?? '')).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029'));
     }
     function log(text) {
       const el = $('log');
@@ -539,6 +587,7 @@
     function selectOwner(owner) {
       selectedOwner = owner;
       mailboxPage = 1;
+      selectedMailboxIDs.clear();
       renderData();
       const label = selectedOwner === 'all' ? '全部账号' : ($('currentScope').textContent || selectedOwner);
       log('已切换查看：' + label);
@@ -570,12 +619,36 @@
       mailboxPage += delta;
       renderData();
     }
+    function cookieValue(name) {
+      const prefix = `${name}=`;
+      for (const part of document.cookie.split(';')) {
+        const value = part.trim();
+        if (value.startsWith(prefix)) return decodeURIComponent(value.slice(prefix.length));
+      }
+      return '';
+    }
+    function requestHeaders(options = {}) {
+      const headers = {'content-type': 'application/json', ...(options.headers || {})};
+      const method = String(options.method || 'GET').toUpperCase();
+      if (!['GET', 'HEAD', 'OPTIONS', 'TRACE'].includes(method)) {
+        const token = cookieValue('ipm_csrf');
+        if (token) headers['X-CSRF-Token'] = token;
+      }
+      return headers;
+    }
     async function api(path, options={}) {
-      const res = await fetch(path, {credentials:'same-origin', headers:{'content-type':'application/json', ...(options.headers || {})}, ...options});
+      const requestOptions = {...options, credentials:'same-origin', headers: requestHeaders(options)};
+      const res = await fetch(path, requestOptions);
       let data;
       try { data = await res.json(); } catch (_) { throw new Error(`HTTP ${res.status}`); }
       if (res.status === 401) { location.href = '/login'; throw new Error('请先登录'); }
-      if (!data.success) throw new Error(data.message || data.code || `HTTP ${res.status}`);
+      if (!data.success && !data.partial) {
+        const err = new Error(data.message || data.code || `HTTP ${res.status}`);
+        err.code = data.code || '';
+        err.retryable = !!data.retryable;
+        err.data = data;
+        throw err;
+      }
       return data;
     }
     async function ensureAuth() {
@@ -583,6 +656,9 @@
       if (!data.authenticated) { location.href = '/login'; throw new Error('未登录'); }
       currentUser = data.user;
       $('whoami').textContent = `当前账号：${currentUser.username}${currentUser.is_admin ? ' / 管理员，可查看全部数据' : ' / 普通用户，仅查看自己数据'}`;
+      if ($('runtimeExportButton')) {
+        $('runtimeExportButton').hidden = !currentUser.is_admin;
+      }
     }
     function renderEmpty(id, rows) {
       const empty = $(id + 'Empty');
@@ -599,11 +675,15 @@
       const user = (manageData && manageData.users || []).find(u => u.id === id) || {};
       const name = user.username || id;
       if (!confirm(`确定删除账号「${name}」吗？该账号的登录态、隐私邮箱和验证码邮件也会一并删除。`)) return;
-      const data = await api('/api/admin/users/' + encodeURIComponent(id), {method:'DELETE'});
-      if (selectedOwner === id) selectedOwner = 'all';
-      await refresh();
-      const deleted = data.deleted || {};
-      log(`已删除账号：${name}；清理邮箱 ${deleted.mailboxes || 0} 个，验证码 ${deleted.messages || 0} 封`);
+      try {
+        const data = await api('/api/admin/users/' + encodeURIComponent(id), {method:'DELETE'});
+        if (selectedOwner === id) selectedOwner = 'all';
+        await refresh();
+        const deleted = data.deleted || {};
+        log(`已删除账号：${name}；清理邮箱 ${deleted.mailboxes || 0} 个，验证码 ${deleted.messages || 0} 封`);
+      } catch (err) {
+        log('删除账号失败：' + err.message);
+      }
     }
     function renderData() {
       const data = manageData || {};
@@ -614,14 +694,15 @@
       const selectedSummary = summaries.find(s => ownerID(s) === selectedOwner);
       const usersInScope = selectedOwner === 'all' ? users : users.filter(u => u.id === selectedOwner);
       const accounts = accountsAll.filter(inScope);
-      const mailboxes = mailboxesAll.filter(inScope);
+      const mailboxesInScope = mailboxesAll.filter(inScope);
+      const mailboxes = filterMailboxesForManage(mailboxesInScope);
       const messageCount = selectedOwner === 'all' ? (data.messages || 0) : (selectedSummary ? selectedSummary.message_count || 0 : 0);
       const scopeName = selectedOwner === 'all' ? '全部账号' : (selectedSummary ? selectedSummary.username : selectedOwner || '管理员/全局');
 
       $('currentScope').textContent = scopeName;
       $('userCount').textContent = selectedOwner === 'all' ? users.length : (selectedSummary ? 1 : usersInScope.length);
       $('accountCount').textContent = accounts.length;
-      $('mailboxCount').textContent = mailboxes.length;
+      $('mailboxCount').textContent = mailboxesInScope.length;
       $('messageCount').textContent = messageCount;
 
       const totalAccounts = summaries.reduce((n, s) => n + (s.account_count || 0), 0);
@@ -673,7 +754,7 @@
           <td>${statusPill(u.status)}</td>
           <td>${esc(u.created_at || '-')}</td>
           <td>${esc(u.last_login_at || '-')}</td>
-          <td>${currentUser && currentUser.is_admin && !u.is_admin && u.id !== currentUser.id ? `<button class="btn small danger" onclick="deleteUser('${esc(u.id)}')">删除</button>` : '-'}</td>
+          <td>${currentUser && currentUser.is_admin && !u.is_admin && u.id !== currentUser.id ? `<button class="btn small danger" onclick="deleteUser(${jsArg(u.id)})">删除</button>` : '-'}</td>
         </tr>`).join('');
       renderEmpty('users', usersInScope);
 
@@ -685,19 +766,101 @@
           <td>${esc(a.owner || '-')}</td>
           <td>${esc(a.label || '-')}</td>
           <td>${esc(a.apple_id || '-')}</td>
-          <td>${statusPill(a.status)} ${statusPill(a.icloud_status)}</td>
+          <td>${a.proxy_configured ? esc(a.proxy_url || '已配置') : '<span class="muted">未配置</span>'}</td>
+          <td>${statusPill(a.status)} ${statusPill(a.icloud_status)} ${a.mailbox_create_reconciliation_required ? `<span class="pill red" title="${esc(a.mailbox_create_reconciliation_error || '请先同步 iCloud 远端邮箱列表确认创建结果')}">待同步核对</span>` : ''}</td>
           <td>${esc(a.note || '-')}</td>
           <td>${esc(a.created_at || '-')}</td>
+          <td><button class="btn small" onclick="updateAccountProxy(${jsArg(a.id)})">设置代理</button></td>
         </tr>`).join('');
       renderEmpty('accounts', accounts);
-      renderMailboxExportAccountOptions(accounts, mailboxes);
+      renderMailboxExportAccountOptions(accounts, mailboxesInScope);
     }
+    async function updateAccountProxy(id) {
+      const account = (manageData && manageData.accounts || []).find(item => item.id === id);
+      if (!account) return;
+      const promptText = account.proxy_configured
+        ? '该账号已配置代理，出于安全原因不会回显。请输入完整 HTTP/HTTPS 或 SOCKS5 代理地址；留空表示清除代理。示例：http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080'
+        : '输入 HTTP/HTTPS 或 SOCKS5 代理地址；留空表示清除代理。示例：http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080';
+      const value = window.prompt(promptText, '');
+      if (value === null) return;
+      try {
+        const params = new URLSearchParams();
+        if (selectedOwner === '') {
+          params.set('owner_id', '__global');
+        } else if (selectedOwner === 'all') {
+          params.set('owner_id', 'all');
+        } else if (selectedOwner) {
+          params.set('owner_id', selectedOwner);
+        }
+        const query = params.toString();
+        await api('/api/accounts/' + encodeURIComponent(id) + (query ? '?' + query : ''), {
+          method: 'PATCH',
+          body: JSON.stringify({proxy_url: value.trim()})
+        });
+        await refresh();
+        log('账号代理已更新：' + (account.apple_id || account.label || id));
+      } catch (err) {
+        log('更新账号代理失败：' + err.message);
+      }
+    }
+
+    function mailboxBindAccounts() {
+      const seen = new Set();
+      return (manageData && manageData.accounts || [])
+        .filter(account => {
+          const id = String(account && account.id || '').trim();
+          if (!id || seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })
+        .map(account => ({
+          id: String(account.id),
+          ownerID: String(account.owner_id || '').trim(),
+          title: [account.label, account.apple_id].filter(Boolean).join(' / ') || account.id
+        }))
+        .sort((a, b) => a.title.localeCompare(b.title));
+    }
+
+    function mailboxBindControl(mailbox) {
+      if (!mailbox || String(mailbox.account_id || '').trim()) return '';
+      const ownerID = String(mailbox.owner_id || '').trim();
+      const accounts = mailboxBindAccounts().filter(account => !ownerID || account.ownerID === ownerID);
+      if (accounts.length === 0) return '';
+      return `<select title="绑定 Apple 账号" onchange="bindMailboxToAccount(${jsArg(mailbox.id)}, this.value)">
+        <option value="">绑定 Apple 账号</option>
+        ${accounts.map(account => `<option value="${esc(account.id)}">${esc(account.title)}</option>`).join('')}
+      </select>`;
+    }
+
+    async function bindMailboxToAccount(id, accountID) {
+      accountID = String(accountID || '').trim();
+      if (!accountID) return;
+      const row = (manageData && manageData.mailboxes || []).find(item => String(item.id) === String(id));
+      if (!row) return;
+      if (!confirm(`确认将邮箱「${row.email || id}」绑定到选定 Apple 账号？`)) {
+        renderData();
+        return;
+      }
+      try {
+        await api(`/api/mailboxes/${encodeURIComponent(id)}/bind`, {
+          method: 'POST',
+          body: JSON.stringify({account_id: accountID})
+        });
+        log(`邮箱已绑定 Apple 账号：${row.email || id}`);
+        await refresh();
+      } catch (err) {
+        log('绑定邮箱归属失败：' + err.message);
+        renderData();
+      }
+    }
+
     function renderMailboxRows(mailboxes) {
       const totalRows = mailboxes.length;
       const totalPages = Math.max(1, Math.ceil(totalRows / mailboxPageSize));
       mailboxPage = Math.max(1, Math.min(mailboxPage, totalPages));
       const start = (mailboxPage - 1) * mailboxPageSize;
       const pageRows = mailboxes.slice(start, start + mailboxPageSize);
+      visibleMailboxPageRows = pageRows;
       const rangeStart = totalRows === 0 ? 0 : start + 1;
       const rangeEnd = Math.min(start + mailboxPageSize, totalRows);
 
@@ -706,57 +869,215 @@
       }
       if ($('mailboxPrevPage')) $('mailboxPrevPage').disabled = mailboxPage <= 1;
       if ($('mailboxNextPage')) $('mailboxNextPage').disabled = mailboxPage >= totalPages;
+      if ($('mailboxExportFilter')) $('mailboxExportFilter').value = mailboxExportFilter;
 
       $('mailboxes').innerHTML = pageRows.map(m => `
         <tr>
+          <td><input type="checkbox" ${selectedMailboxIDs.has(String(m.id)) ? 'checked' : ''} onchange="handleMailboxSelectionChange(${jsArg(m.id)}, this.checked)" title="选择邮箱"></td>
           <td class="mono">${esc(m.id)}</td>
           <td>${esc(m.owner || '-')}</td>
           <td>${esc(m.label || '-')}</td>
           <td><span class="email">${esc(m.email || '-')}</span></td>
-          <td>${statusPill(m.status)}</td>
+          <td>${statusPill(m.status)} ${m.remote_missing_at ? pill('远端不存在', 'red') : ''} ${m.remote_delete_status === 'pending' ? `<span title="远端删除正在进行中，请稍后刷新">${pill('远端删除中', 'gray')}</span>` : ''} ${m.remote_delete_status === 'unknown' ? `<span title="上次远端删除结果未知；再次勾选远端删除会重试">${pill('远端待核对', 'red')}</span>` : ''} ${m.remote_delete_status === 'failed' ? `<span title="${esc(m.remote_delete_error || '')}">${pill('远端删除失败', 'red')}</span>` : ''}</td>
+          <td>${m.api_exported ? pill('已导出') + (m.api_exported_at ? `<div class="muted">${esc(m.api_exported_at)}</div>` : '') : pill('未导出', 'gray')}</td>
           <td>${m.receive_count || 0}</td>
           <td>${esc(m.created_at || '-')}</td>
+          <td>${mailboxBindControl(m)} <button class="btn small danger" onclick="deleteMailboxFromManage(${jsArg(m.id)})">删除</button></td>
         </tr>`).join('');
       renderEmpty('mailboxes', mailboxes);
+      const pageSelect = $('mailboxPageSelectAll');
+      const selectedCount = pageRows.filter(row => selectedMailboxIDs.has(String(row.id))).length;
+      if (pageSelect) {
+        pageSelect.checked = pageRows.length > 0 && selectedCount === pageRows.length;
+        pageSelect.indeterminate = selectedCount > 0 && selectedCount < pageRows.length;
+      }
+      if ($('mailboxSelectionInfo')) $('mailboxSelectionInfo').textContent = `已选 ${selectedMailboxIDs.size} 个`;
     }
-    async function exportData() {
-      const res = await fetch('/api/runtime/export', {credentials:'same-origin'});
-      if (!res.ok) {
-        if (res.status === 401) location.href='/login';
-        log('导出失败：HTTP ' + res.status);
+
+    function filterMailboxesForManage(mailboxes) {
+      if (mailboxExportFilter === 'exported') return mailboxes.filter(mailbox => mailbox.api_exported);
+      if (mailboxExportFilter === 'unexported') return mailboxes.filter(mailbox => !mailbox.api_exported);
+      return mailboxes;
+    }
+
+    function setMailboxExportFilter() {
+      mailboxExportFilter = $('mailboxExportFilter') ? $('mailboxExportFilter').value : 'all';
+      mailboxPage = 1;
+      selectedMailboxIDs.clear();
+      renderData();
+      log('已切换邮箱导出状态：' + (mailboxExportFilter === 'exported' ? '已导出' : mailboxExportFilter === 'unexported' ? '未导出' : '全部'));
+    }
+
+    function handleMailboxSelectionChange(id, checked) {
+      id = String(id || '').trim();
+      if (!id) return;
+      if (checked) selectedMailboxIDs.add(id);
+      else selectedMailboxIDs.delete(id);
+      renderData();
+    }
+
+    function selectVisibleMailboxes(checked) {
+      for (const row of visibleMailboxPageRows) {
+        if (!row || !row.id) continue;
+        const id = String(row.id);
+        if (checked) selectedMailboxIDs.add(id);
+        else selectedMailboxIDs.delete(id);
+      }
+      renderData();
+    }
+
+    function selectAllFilteredMailboxes() {
+      for (const row of filterMailboxesForManage(mailboxesForCurrentOwner())) {
+        if (row && row.id) selectedMailboxIDs.add(String(row.id));
+      }
+      renderData();
+      log(`已全选筛选结果：${selectedMailboxIDs.size} 个邮箱`);
+    }
+
+    function clearMailboxSelection() {
+      selectedMailboxIDs.clear();
+      renderData();
+    }
+
+    function mailboxesForCurrentOwner() {
+      const data = manageData || {};
+      return (data.mailboxes || []).filter(inScope);
+    }
+
+    function mailboxSelectionScope() {
+      return {
+        owner_id: selectedOwner === '' ? '__global' : (selectedOwner === 'all' ? 'all' : selectedOwner),
+        account_key: '',
+        exported: mailboxExportFilter === 'all' ? '' : mailboxExportFilter
+      };
+    }
+
+    function selectedMailboxIDsList() {
+      return Array.from(selectedMailboxIDs);
+    }
+
+    async function exportSelectedMailboxes(mode) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要导出的邮箱');
         return;
       }
-      const blob = await res.blob();
-      const disposition = res.headers.get('content-disposition') || '';
-      const match = disposition.match(/filename="([^"]+)"/i);
-      const filename = match ? match[1] : `icloud-privacy-mail-state-${Date.now()}.json`;
-      if (window.showSaveFilePicker) {
-        try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: filename,
-            types: [{description: 'JSON 文件', accept: {'application/json': ['.json']}}],
-          });
-          const writable = await handle.createWritable();
-          await writable.write(blob);
-          await writable.close();
-          log('数据已导出');
-          return;
-        } catch (err) {
-          if (err && err.name === 'AbortError') {
-            log('已取消导出');
-            return;
-          }
+      const format = selectedMailboxExportFormat();
+      const path = mailboxExportURL(
+        `/api/runtime/export-mailbox-${mode === 'email' ? 'emails' : 'apis'}`,
+        format,
+        false
+      );
+      const exported = await downloadExportFile(
+        path,
+        `icloud-mailbox-${mode === 'email' ? 'emails' : 'apis'}-selected-${Date.now()}.${format}`,
+        format,
+        '已取消导出',
+        `已导出选中${mode === 'email' ? '邮箱' : '邮箱API'}：${ids.length} 个`,
+        '导出失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format, ids})
         }
+      );
+      if (exported && mode !== 'email') {
+        selectedMailboxIDs.clear();
+        await refresh();
       }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      log('数据已导出');
+    }
+
+    async function deleteSelectedMailboxes(deleteRemote) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要删除的邮箱');
+        return;
+      }
+      const message = deleteRemote
+        ? `确认删除 ${ids.length} 个邮箱，并同步删除 iCloud 远端隐私邮箱？远端待核对的记录需要单独确认后重试。`
+        : `确认删除 ${ids.length} 个邮箱的本地记录？`;
+      if (!confirm(message)) return;
+      const hasUnknown = ids.some(id => {
+        const row = mailboxesForCurrentOwner().find(item => item && item.id === id);
+        return row && row.remote_delete_status === 'unknown';
+      });
+      const hasFailed = ids.some(id => {
+        const row = mailboxesForCurrentOwner().find(item => item && item.id === id);
+        return row && row.remote_delete_status === 'failed';
+      });
+      if (!deleteRemote && (hasFailed || hasUnknown) && !confirm('选中邮箱包含远端删除失败或待核对的记录，确认已核对 iCloud 后再清理这些本地记录？')) {
+        return;
+      }
+      try {
+        const data = await api('/api/mailboxes/bulk-delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            ids,
+            delete_remote: !!deleteRemote,
+            confirm_unknown: hasUnknown,
+            confirm_failed: !deleteRemote && hasFailed,
+            scope: mailboxSelectionScope()
+          })
+        });
+        selectedMailboxIDs.clear();
+        await refresh();
+        log(`批量删除完成：本地 ${data.deleted || 0}，远端 ${data.remote_deleted || 0}，失败 ${data.failed || 0}`);
+        (data.failures || []).forEach(item => {
+          log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+      } catch (err) {
+        log('批量删除失败：' + err.message);
+        const data = err.data || {};
+        selectedMailboxIDs.clear();
+        await refresh().catch(refreshErr => log('批量删除后刷新列表失败：' + refreshErr.message));
+        if (Number(data.deleted || 0) > 0) {
+          log(`批量删除部分完成：本地删除 ${data.deleted || 0}，远端删除 ${data.remote_deleted || 0}，仍失败 ${data.failed || 0}`);
+        }
+        (data.failures || []).forEach(item => {
+          log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+      }
+    }
+
+    async function deleteMailboxFromManage(id) {
+      const row = mailboxesForCurrentOwner().find(item => item.id === id);
+      const deleteRemote = confirm('是否同时删除 iCloud 创建的远端隐私邮箱？点击“取消”只删除本地记录。');
+      if (!confirm(`确认删除邮箱「${row ? row.email : id}」吗？`)) return;
+      try {
+        const confirmUnknown = row && row.remote_delete_status === 'unknown';
+        const confirmFailed = !deleteRemote && row && row.remote_delete_status === 'failed';
+        if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
+        await api(`/api/mailboxes/${encodeURIComponent(id)}?delete_remote=${deleteRemote ? '1' : '0'}&confirm_unknown=${confirmUnknown ? '1' : '0'}&confirm_failed=${confirmFailed ? '1' : '0'}`, {method: 'DELETE'});
+        selectedMailboxIDs.delete(String(id));
+        await refresh();
+        log('邮箱已删除：' + (row ? row.email : id));
+      } catch (err) {
+        log('删除邮箱失败：' + err.message);
+        await refresh().catch(refreshErr => log('删除失败后刷新列表失败：' + refreshErr.message));
+      }
+    }
+    async function exportData() {
+      const params = new URLSearchParams();
+      if (selectedOwner === '') {
+        params.set('owner_id', '__global');
+      } else if (selectedOwner === 'all') {
+        params.set('owner_id', 'all');
+      } else if (selectedOwner) {
+        params.set('owner_id', selectedOwner);
+      }
+      await downloadExportFile(
+        '/api/runtime/export?' + params.toString(),
+        `icloud-privacy-mail-state-${Date.now()}.json`,
+        'json',
+        '已取消导出',
+        '数据已导出',
+        '导出失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({})
+        }
+      );
     }
     function selectedMailboxExportFormat() {
       const el = $('mailboxExportFormat');
@@ -768,29 +1089,49 @@
       if (!select) return;
       const current = select.value || '';
       const counts = new Map();
+      let unboundCount = 0;
       for (const mailbox of mailboxes || []) {
-        if (mailbox.account_id) counts.set(mailbox.account_id, (counts.get(mailbox.account_id) || 0) + 1);
+        if (mailbox.account_id) {
+          counts.set(mailbox.account_id, (counts.get(mailbox.account_id) || 0) + 1);
+        } else {
+          unboundCount++;
+        }
       }
       const options = ['<option value="">当前查看全部登录态</option>'];
+      if (unboundCount > 0) {
+        options.push(`<option value="unbound">未绑定 Apple 账号 · ${unboundCount}</option>`);
+      }
       for (const account of accounts || []) {
         const count = counts.get(account.id) || 0;
         const title = [account.label, account.apple_id].filter(Boolean).join(' / ') || account.id;
         options.push(`<option value="${esc(account.id)}">${esc(title)} · ${count}</option>`);
       }
       select.innerHTML = options.join('');
-      const values = new Set(['', ...(accounts || []).map(account => account.id)]);
+      const values = new Set(['', 'unbound', ...(accounts || []).map(account => account.id)]);
       select.value = values.has(current) ? current : '';
     }
 
-    function mailboxExportURL(path, format) {
+    function mailboxExportURL(path, format, includeAccount = true) {
       const params = new URLSearchParams({format});
       const accountID = $('mailboxExportAccount') ? $('mailboxExportAccount').value : '';
-      if (selectedOwner && selectedOwner !== 'all') params.set('owner_id', selectedOwner);
-      if (accountID) params.set('account_id', accountID);
+      if (selectedOwner === '') {
+        params.set('owner_id', '__global');
+      } else if (selectedOwner === 'all') {
+        params.set('owner_id', 'all');
+      } else if (selectedOwner) {
+        params.set('owner_id', selectedOwner);
+      }
+      if (includeAccount && accountID) params.set('account_id', accountID);
+      if (mailboxExportFilter === 'exported' || mailboxExportFilter === 'unexported') {
+        params.set('api_exported', mailboxExportFilter === 'exported' ? '1' : '0');
+      }
       return `${path}?${params.toString()}`;
     }
 
     function exportFileTypes(format) {
+      if (format === 'json') {
+        return [{description: 'JSON 文件', accept: {'application/json': ['.json']}}];
+      }
       if (format === 'csv') {
         return [{description: 'CSV 文件', accept: {'text/csv': ['.csv']}}];
       }
@@ -803,36 +1144,80 @@
       return [{description: 'TXT 文件', accept: {'text/plain': ['.txt']}}];
     }
 
-    async function downloadExportFile(path, fallbackName, format, cancelText, successText, failText) {
-      const res = await fetch(path, {credentials:'same-origin'});
-      if (!res.ok) {
-        if (res.status === 401) {
-          location.href='/login';
-          return;
-        }
-        log(failText + '：HTTP ' + res.status);
-        return;
+    function newExportRollbackToken() {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID();
       }
-      const blob = await res.blob();
-      const disposition = res.headers.get('content-disposition') || '';
-      const match = disposition.match(/filename="([^"]+)"/i);
-      const filename = match ? match[1] : fallbackName;
+      return 'export-' + Date.now() + '-' + Math.random().toString(16).slice(2).padEnd(8, '0');
+    }
+
+    async function downloadExportFile(path, fallbackName, format, cancelText, successText, failText, options = {}) {
+      let saveHandle = null;
       if (window.showSaveFilePicker) {
         try {
-          const handle = await window.showSaveFilePicker({
-            suggestedName: filename,
+          saveHandle = await window.showSaveFilePicker({
+            suggestedName: fallbackName,
             types: exportFileTypes(format),
           });
-          const writable = await handle.createWritable();
-          await writable.write(blob);
-          await writable.close();
-          log(successText);
-          return;
         } catch (err) {
           if (err && err.name === 'AbortError') {
             log(cancelText);
-            return;
+            return false;
           }
+          log('系统保存对话框不可用，改用浏览器默认下载：' + err.message);
+        }
+      }
+      const requestOptions = Object.assign({credentials:'same-origin'}, options);
+      if (String(path || '').indexOf('export-mailbox-apis') >= 0) {
+        let payload = {};
+        try {
+          if (requestOptions.body) payload = JSON.parse(requestOptions.body);
+        } catch (_) {}
+        if (!payload.rollback_token) payload.rollback_token = newExportRollbackToken();
+        requestOptions.body = JSON.stringify(payload);
+      }
+      requestOptions.headers = requestHeaders(requestOptions);
+      let res;
+      try {
+        res = await fetch(path, requestOptions);
+      } catch (err) {
+        await rollbackMailboxAPIExport(null, requestOptions, path);
+        log(failText + '：' + err.message);
+        return false;
+      }
+      if (!res.ok) {
+        if (res.status === 401) {
+          location.href='/login';
+          return false;
+        }
+        let message = `HTTP ${res.status}`;
+        try {
+          const data = await res.json();
+          message = data.message || data.code || message;
+        } catch (_) {}
+        log(failText + '：' + message);
+        return false;
+      }
+      let blob;
+      try {
+        blob = await res.blob();
+      } catch (err) {
+        await rollbackMailboxAPIExport(res, options, path);
+        log(failText + '：' + err.message);
+        return false;
+      }
+      const disposition = res.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename="([^"]+)"/i);
+      const filename = match ? match[1] : fallbackName;
+      if (saveHandle) {
+        try {
+          const writable = await saveHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          log(successText);
+          return true;
+        } catch (err) {
+          log('保存文件失败，改用浏览器默认下载：' + err.message);
         }
       }
       const url = URL.createObjectURL(blob);
@@ -844,19 +1229,56 @@
       a.remove();
       URL.revokeObjectURL(url);
       log(successText);
+      return true;
+    }
+
+    async function rollbackMailboxAPIExport(res, options, path) {
+      if (String(path || '').indexOf('export-mailbox-apis') < 0) return;
+      let payload = {};
+      try {
+        if (options && options.body) payload = JSON.parse(options.body);
+      } catch (_) {}
+      const exportedAt = res && res.headers ? (res.headers.get('X-IPM-API-Exported-At') || '') : '';
+      if (exportedAt) payload.exported_at = exportedAt;
+      if (!payload.exported_at && !payload.rollback_token) return;
+      let unmarkPath = '/api/runtime/unmark-mailbox-apis';
+      try {
+        const exportURL = new URL(path, window.location.origin);
+        const params = new URLSearchParams();
+        ['owner_id', 'account_id', 'account_key', 'search', 'q', 'api_exported', 'exported'].forEach(key => {
+          const value = exportURL.searchParams.get(key);
+          if (value) params.set(key, value);
+        });
+        const ownerID = exportURL.searchParams.get('owner_id');
+        if (ownerID && payload.owner_id == null) payload.owner_id = ownerID;
+        const query = params.toString();
+        if (query) unmarkPath += '?' + query;
+      } catch (_) {}
+      try {
+        await api(unmarkPath, {method: 'POST', body: JSON.stringify(payload)});
+      } catch (_) {}
     }
 
     async function exportMailboxAPIs() {
       const format = selectedMailboxExportFormat();
       const accountID = $('mailboxExportAccount') ? $('mailboxExportAccount').value : '';
-      await downloadExportFile(
+      const exported = await downloadExportFile(
         mailboxExportURL('/api/runtime/export-mailbox-apis', format),
         `icloud-mailbox-apis-${Date.now()}.${format}`,
         format,
         '已取消导出邮箱API',
         `邮箱API已导出 ${format.toUpperCase()}：${accountID ? '指定登录态' : '当前查看范围'}，每行一个邮箱API`,
-        '导出邮箱API失败'
+        '导出邮箱API失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format})
+        }
       );
+      if (exported) {
+        selectedMailboxIDs.clear();
+        await refresh();
+      }
     }
 
     async function exportMailboxEmails() {
@@ -868,12 +1290,21 @@
         format,
         '已取消导出邮箱',
         `邮箱已导出 ${format.toUpperCase()}：${accountID ? '指定登录态' : '当前查看范围'}，一行一个邮箱`,
-        '导出邮箱失败'
+        '导出邮箱失败',
+        {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({format})
+        }
       );
     }
     async function logout() {
-      await api('/api/auth/logout', {method:'POST', body:'{}'});
-      location.href = '/login';
+      try {
+        await api('/api/auth/logout', {method:'POST', body:'{}'});
+        location.href = '/login';
+      } catch (err) {
+        log('退出登录失败：' + err.message);
+      }
     }
 
     initViewNavigation();

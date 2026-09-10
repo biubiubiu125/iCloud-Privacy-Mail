@@ -55,6 +55,7 @@ type appleAuthEndpoints struct {
 type appleAuthSession struct {
 	Endpoints           appleAuthEndpoints
 	AppleID             string
+	ProxyURL            string
 	ClientID            string
 	FrameID             string
 	UserAgent           string
@@ -121,10 +122,15 @@ type appleAccountInfo struct {
 }
 
 type appleAuthPending struct {
-	ID        string
-	Session   *appleAuthSession
-	CreatedAt time.Time
-	ExpiresAt time.Time
+	ID             string
+	Session        *appleAuthSession
+	OwnerID        string
+	TargetOwnerID  string
+	TargetOwnerSet bool
+	AccountID      string
+	ProxyExplicit  bool
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
 }
 
 type appleAuthPendingStore struct {
@@ -141,22 +147,33 @@ func newAppleAuthPendingStore() *appleAuthPendingStore {
 }
 
 func (s *appleAuthPendingStore) put(session *appleAuthSession) (appleAuthPending, error) {
+	return s.putForOwner(session, "")
+}
+
+func (s *appleAuthPendingStore) putForOwner(session *appleAuthSession, ownerID string) (appleAuthPending, error) {
+	return s.putForOwnerWithProxy(session, ownerID, false)
+}
+
+func (s *appleAuthPendingStore) putForOwnerWithProxy(session *appleAuthSession, ownerID string, proxyExplicit bool) (appleAuthPending, error) {
 	id, err := randomToken(18)
 	if err != nil {
 		return appleAuthPending{}, err
 	}
 	now := time.Now()
 	pending := appleAuthPending{
-		ID:        id,
-		Session:   session,
-		CreatedAt: now,
-		ExpiresAt: now.Add(10 * time.Minute),
+		ID:            id,
+		Session:       session,
+		OwnerID:       strings.TrimSpace(ownerID),
+		ProxyExplicit: proxyExplicit,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(10 * time.Minute),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
-	s.items[id] = pending
-	return pending, nil
+	stored := cloneAppleAuthPending(pending)
+	s.items[id] = stored
+	return cloneAppleAuthPending(stored), nil
 }
 
 func (s *appleAuthPendingStore) get(id string) (appleAuthPending, bool) {
@@ -165,13 +182,62 @@ func (s *appleAuthPendingStore) get(id string) (appleAuthPending, bool) {
 	defer s.mu.Unlock()
 	s.cleanupLocked(now)
 	pending, ok := s.items[strings.TrimSpace(id)]
-	return pending, ok
+	if !ok {
+		return appleAuthPending{}, false
+	}
+	return cloneAppleAuthPending(pending), true
+}
+
+func (s *appleAuthPendingStore) update(id string, pending appleAuthPending) bool {
+	now := time.Now()
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupLocked(now)
+	current, ok := s.items[id]
+	if !ok || now.After(current.ExpiresAt) {
+		return false
+	}
+	pending.ID = id
+	pending.CreatedAt = current.CreatedAt
+	pending.ExpiresAt = current.ExpiresAt
+	s.items[id] = cloneAppleAuthPending(pending)
+	return true
 }
 
 func (s *appleAuthPendingStore) delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.items, strings.TrimSpace(id))
+}
+
+func (s *appleAuthPendingStore) setProxyExplicit(id string, proxyExplicit bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id = strings.TrimSpace(id)
+	pending, ok := s.items[id]
+	if !ok {
+		return
+	}
+	pending.ProxyExplicit = proxyExplicit
+	s.items[id] = pending
+}
+
+func (s *appleAuthPendingStore) setLoginTarget(id, ownerID, accountID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id = strings.TrimSpace(id)
+	pending, ok := s.items[id]
+	if !ok {
+		return
+	}
+	pending.TargetOwnerID = strings.TrimSpace(ownerID)
+	pending.TargetOwnerSet = true
+	pending.AccountID = strings.TrimSpace(accountID)
+	s.items[id] = pending
 }
 
 func (s *appleAuthPendingStore) cleanupLocked(now time.Time) {
@@ -182,13 +248,41 @@ func (s *appleAuthPendingStore) cleanupLocked(now time.Time) {
 	}
 }
 
+func cloneAppleAuthPending(in appleAuthPending) appleAuthPending {
+	out := in
+	out.Session = cloneAppleAuthSession(in.Session)
+	return out
+}
+
+func cloneAppleAuthSession(in *appleAuthSession) *appleAuthSession {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.TwoFactorPhone = append(json.RawMessage(nil), in.TwoFactorPhone...)
+	out.Cookies = append([]SessionCookie(nil), in.Cookies...)
+	return &out
+}
+
 func (c *AppleAuthClient) StartLogin(ctx context.Context, appleID, password, defaultHost, clientID string, pendingStore *appleAuthPendingStore, twoFactorMethod string) (appleAuthStartResult, error) {
+	return c.StartLoginWithProxy(ctx, appleID, password, defaultHost, clientID, pendingStore, twoFactorMethod, "")
+}
+
+func (c *AppleAuthClient) StartLoginWithProxy(ctx context.Context, appleID, password, defaultHost, clientID string, pendingStore *appleAuthPendingStore, twoFactorMethod, proxyURL string) (appleAuthStartResult, error) {
+	return c.StartLoginWithProxyForOwner(ctx, appleID, password, defaultHost, clientID, pendingStore, twoFactorMethod, proxyURL, "")
+}
+
+func (c *AppleAuthClient) StartLoginWithProxyForOwner(ctx context.Context, appleID, password, defaultHost, clientID string, pendingStore *appleAuthPendingStore, twoFactorMethod, proxyURL, ownerID string) (appleAuthStartResult, error) {
 	appleID = strings.ToLower(strings.TrimSpace(appleID))
 	if appleID == "" || strings.TrimSpace(password) == "" {
 		return appleAuthStartResult{}, errCode("apple_credentials_missing", "缺少 Apple ID 或密码", false)
 	}
+	proxyURL, err := normalizeProxyURL(proxyURL)
+	if err != nil {
+		return appleAuthStartResult{}, err
+	}
 	method := normalizeAppleTwoFactorMethod(twoFactorMethod)
-	result, err := c.startLoginOnHost(ctx, appleID, password, defaultHost, clientID, pendingStore, method)
+	result, err := c.startLoginOnHost(ctx, appleID, password, defaultHost, clientID, pendingStore, method, proxyURL, ownerID)
 	if err == nil {
 		return result, nil
 	}
@@ -201,13 +295,25 @@ func (c *AppleAuthClient) StartLogin(ctx context.Context, appleID, password, def
 	if currentHost == nextHost {
 		return appleAuthStartResult{}, err
 	}
-	return c.startLoginOnHost(ctx, appleID, password, nextHost, clientID, pendingStore, method)
+	return c.startLoginOnHost(ctx, appleID, password, nextHost, clientID, pendingStore, method, proxyURL, ownerID)
 }
 
 func (c *AppleAuthClient) StartAppleAccountManageLogin(ctx context.Context, appleID, password string, pendingStore *appleAuthPendingStore, twoFactorMethod string) (appleAuthStartResult, error) {
+	return c.StartAppleAccountManageLoginWithProxy(ctx, appleID, password, pendingStore, twoFactorMethod, "")
+}
+
+func (c *AppleAuthClient) StartAppleAccountManageLoginWithProxy(ctx context.Context, appleID, password string, pendingStore *appleAuthPendingStore, twoFactorMethod, proxyURL string) (appleAuthStartResult, error) {
+	return c.StartAppleAccountManageLoginWithProxyForOwner(ctx, appleID, password, pendingStore, twoFactorMethod, proxyURL, "")
+}
+
+func (c *AppleAuthClient) StartAppleAccountManageLoginWithProxyForOwner(ctx context.Context, appleID, password string, pendingStore *appleAuthPendingStore, twoFactorMethod, proxyURL, ownerID string) (appleAuthStartResult, error) {
 	appleID = strings.ToLower(strings.TrimSpace(appleID))
 	if appleID == "" || strings.TrimSpace(password) == "" {
 		return appleAuthStartResult{}, errCode("apple_credentials_missing", "缺少 Apple ID 或密码", false)
+	}
+	proxyURL, err := normalizeProxyURL(proxyURL)
+	if err != nil {
+		return appleAuthStartResult{}, err
 	}
 	method := normalizeAppleTwoFactorMethod(twoFactorMethod)
 	frameID, err := randomUUID()
@@ -217,6 +323,7 @@ func (c *AppleAuthClient) StartAppleAccountManageLogin(ctx context.Context, appl
 	session := &appleAuthSession{
 		Endpoints: appleAccountManageAuthEndpoints(),
 		AppleID:   appleID,
+		ProxyURL:  proxyURL,
 		ClientID:  appleAccountManageOAuthClientID,
 		FrameID:   strings.ToLower(frameID),
 		UserAgent: appleAccountManageUserAgent,
@@ -249,7 +356,7 @@ func (c *AppleAuthClient) StartAppleAccountManageLogin(ctx context.Context, appl
 			}
 			message = "Apple Account 已向受信任手机号发送短信验证码；收到 6 位验证码后提交"
 		}
-		pending, err := pendingStore.put(session)
+		pending, err := pendingStore.putForOwnerWithProxy(session, ownerID, proxyURL != "")
 		if err != nil {
 			return appleAuthStartResult{}, err
 		}
@@ -273,7 +380,7 @@ func (c *AppleAuthClient) StartAppleAccountManageLogin(ctx context.Context, appl
 	}, nil
 }
 
-func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, password, host, clientID string, pendingStore *appleAuthPendingStore, twoFactorMethod string) (appleAuthStartResult, error) {
+func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, password, host, clientID string, pendingStore *appleAuthPendingStore, twoFactorMethod, proxyURL, ownerID string) (appleAuthStartResult, error) {
 	frameID, err := randomUUID()
 	if err != nil {
 		return appleAuthStartResult{}, err
@@ -281,6 +388,7 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 	session := &appleAuthSession{
 		Endpoints: appleAuthEndpointsForHost(host),
 		AppleID:   appleID,
+		ProxyURL:  proxyURL,
 		ClientID:  firstNonEmpty(clientID, defaultAppleOAuthClientID),
 		FrameID:   strings.ToLower(frameID),
 	}
@@ -316,7 +424,7 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 			}
 			message = "Apple 已要求 2FA；自动触发验证码未确认，请查看受信任设备后输入验证码"
 		}
-		pending, err := pendingStore.put(session)
+		pending, err := pendingStore.putForOwnerWithProxy(session, ownerID, proxyURL != "")
 		if err != nil {
 			return appleAuthStartResult{}, err
 		}
@@ -335,7 +443,7 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 		if errors.As(err, &redirect) {
 			return appleAuthStartResult{}, err
 		}
-		pending, putErr := pendingStore.put(session)
+		pending, putErr := pendingStore.putForOwnerWithProxy(session, ownerID, proxyURL != "")
 		if putErr != nil {
 			return appleAuthStartResult{}, putErr
 		}
@@ -390,8 +498,11 @@ func (c *AppleAuthClient) SubmitAppleAccountManage2FA(ctx context.Context, pendi
 			return ICloudSession{}, err
 		}
 	}
-	if err := c.trustSession(ctx, session); err != nil && os.Getenv("IPM_DEBUG_APPLE_ACCOUNT") == "1" {
-		fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_TRUST_DEBUG status=skipped err=%s\n", err.Error())
+	if err := c.trustSession(ctx, session); err != nil {
+		if os.Getenv("IPM_DEBUG_APPLE_ACCOUNT") == "1" {
+			fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_TRUST_DEBUG status=failed err=%s\n", err.Error())
+		}
+		return ICloudSession{}, errCode("apple_account_trust_failed", "Apple Account 二次验证已通过，但信任登录态未完成："+publicErrorMessage(err), true)
 	}
 	return c.authWithAppleAccountManage(ctx, session)
 }
@@ -673,6 +784,7 @@ func (c *AppleAuthClient) primeAppleAccountManageState(ctx context.Context, sess
 		Kind:      LoginStateAppleAccount,
 		Host:      "appleid.apple.com",
 		Origin:    appleAccountManageOrigin,
+		ProxyURL:  session.ProxyURL,
 		UserAgent: firstNonEmpty(session.UserAgent, appleAccountManageUserAgent),
 	}
 	client := &ICloudClient{client: c.httpClient}
@@ -704,7 +816,7 @@ func (c *AppleAuthClient) validateTrustedDeviceCode(ctx context.Context, session
 		if errors.As(err, &redirect) {
 			return err
 		}
-		return errCode("apple_2fa_failed", "Apple 2FA 验证失败："+err.Error(), true)
+		return errCode("apple_2fa_failed", "Apple 2FA 验证失败："+publicErrorMessage(err), true)
 	}
 	return nil
 }
@@ -721,7 +833,7 @@ func (c *AppleAuthClient) validatePhoneSecurityCode(ctx context.Context, session
 	}
 	_, _, err = c.do(ctx, session, http.MethodPost, session.Endpoints.Auth+"/verify/phone/securitycode", session.twoFactorHeaders(), body, nil, false)
 	if err != nil {
-		return errCode("apple_2fa_failed", "Apple 短信 2FA 验证失败："+err.Error(), true)
+		return errCode("apple_2fa_failed", "Apple 短信 2FA 验证失败："+publicErrorMessage(err), true)
 	}
 	return nil
 }
@@ -737,7 +849,7 @@ func appleAccountFallbackPhoneNumber(phoneNumber json.RawMessage, fallbacks ...j
 			return fallback
 		}
 	}
-	return json.RawMessage(`{"id":1,"nonFTEU":true}`)
+	return nil
 }
 
 func appleAccountPhoneNumberPayload(phoneNumber json.RawMessage, includeNonFTEU bool) (map[string]any, error) {
@@ -745,7 +857,11 @@ func appleAccountPhoneNumberPayload(phoneNumber json.RawMessage, includeNonFTEU 
 	if err := json.Unmarshal(phoneNumber, &phone); err != nil {
 		return nil, errCode("invalid_phone_number_payload", "短信验证码缺少有效 phoneNumber 参数", false)
 	}
-	if _, ok := phone["id"]; !ok {
+	id, ok := phone["id"]
+	if !ok || id == nil {
+		return nil, errCode("invalid_phone_number_payload", "短信验证码缺少有效 phoneNumber 参数", false)
+	}
+	if idString, ok := id.(string); ok && strings.TrimSpace(idString) == "" {
 		return nil, errCode("invalid_phone_number_payload", "短信验证码缺少有效 phoneNumber 参数", false)
 	}
 	if !includeNonFTEU {
@@ -854,6 +970,7 @@ func (c *AppleAuthClient) authWithAppleAccountManage(ctx context.Context, sessio
 		Kind:      LoginStateAppleAccount,
 		Host:      "appleid.apple.com",
 		Origin:    appleAccountManageOrigin,
+		ProxyURL:  session.ProxyURL,
 		SavedAt:   now,
 		Cookies:   session.cloneCookies(),
 		Scnt:      firstNonEmpty(session.Scnt, session.ManageScnt),
@@ -868,6 +985,7 @@ func (c *AppleAuthClient) authWithAppleAccountManage(ctx context.Context, sessio
 	return ICloudSession{
 		SavedAt:     now,
 		AppleID:     session.AppleID,
+		ProxyURL:    session.ProxyURL,
 		Host:        "appleid.apple.com",
 		LoginStates: []LoginState{refreshed},
 		Note:        "saved from Apple Account management protocol login",
@@ -893,30 +1011,33 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 		return ICloudSession{}, err
 	}
 	cookies := session.cloneCookies()
-	validate, err := NewICloudSessionValidator().Validate(ctx, cookies, session.Endpoints.Host)
+	validate, err := NewICloudSessionValidator().ValidateWithProxy(ctx, cookies, session.Endpoints.Host, session.ProxyURL)
 	if err != nil {
 		return ICloudSession{}, err
 	}
 	savedAt := time.Now()
 	return ICloudSession{
-		SavedAt:            savedAt,
-		AppleID:            firstNonEmpty(validate.AppleID, account.DSInfo.AppleID, account.DSInfo.PrimaryEmail, session.AppleID),
-		DSID:               validate.DSID,
-		ClientID:           validate.ClientID,
-		ClientBuildNumber:  validate.ClientBuildNumber,
-		MasteringNumber:    validate.MasteringNumber,
-		PremiumMailBaseURL: strings.TrimRight(validate.PremiumMailBaseURL, "/"),
-		MailGatewayBaseURL: strings.TrimRight(validate.MailGatewayBaseURL, "/"),
-		MailBaseURL:        strings.TrimRight(validate.MailBaseURL, "/"),
-		Host:               session.Endpoints.Host,
-		IsICloudPlus:       validate.IsICloudPlus,
-		CanCreateHME:       validate.CanCreateHME,
-		Cookies:            cookies,
+		SavedAt:                   savedAt,
+		AppleID:                   firstNonEmpty(validate.AppleID, account.DSInfo.AppleID, account.DSInfo.PrimaryEmail, session.AppleID),
+		ProxyURL:                  session.ProxyURL,
+		DSID:                      validate.DSID,
+		ClientID:                  validate.ClientID,
+		ClientBuildNumber:         validate.ClientBuildNumber,
+		MasteringNumber:           validate.MasteringNumber,
+		PremiumMailBaseURL:        strings.TrimRight(validate.PremiumMailBaseURL, "/"),
+		MailGatewayBaseURL:        strings.TrimRight(validate.MailGatewayBaseURL, "/"),
+		MailBaseURL:               strings.TrimRight(validate.MailBaseURL, "/"),
+		Host:                      session.Endpoints.Host,
+		IsICloudPlus:              validate.IsICloudPlus,
+		CanCreateHME:              validate.CanCreateHME,
+		CapabilitiesAuthoritative: true,
+		Cookies:                   cookies,
 		LoginStates: []LoginState{
 			{
 				Kind:      LoginStateICloudWeb,
 				Host:      session.Endpoints.Host,
 				Origin:    session.Endpoints.Home,
+				ProxyURL:  session.ProxyURL,
 				SavedAt:   savedAt,
 				Cookies:   append([]SessionCookie(nil), cookies...),
 				UserAgent: appleAuthUserAgent,
@@ -953,7 +1074,11 @@ func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, met
 	if cookie := cookieHeader(session.Cookies, rawURL); cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
-	resp, err := c.httpClient.Do(req)
+	httpClient, err := httpClientWithProxy(c.httpClient, session.ProxyURL)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -989,7 +1114,7 @@ func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, met
 		return resp.StatusCode, data, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, nil, errCode("apple_protocol_http_error", fmt.Sprintf("Apple 协议 HTTP %d: %s", resp.StatusCode, trimForError(data)), true)
+		return resp.StatusCode, nil, errCode("apple_protocol_http_error", fmt.Sprintf("Apple 协议 HTTP %d", resp.StatusCode), true)
 	}
 	if out != nil && len(bytes.TrimSpace(data)) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -1039,6 +1164,18 @@ func isAppleTransientNetworkError(err error) bool {
 	}
 	var coded codedError
 	if errors.As(err, &coded) {
+		if coded.code == "icloud_http_error" || coded.code == "icloud_mail_http_error" {
+			text := strings.ToLower(coded.message)
+			if marker := strings.Index(text, "http "); marker >= 0 {
+				fields := strings.Fields(text[marker+len("http "):])
+				if len(fields) > 0 {
+					if status, parseErr := strconv.Atoi(strings.TrimSuffix(fields[0], ":")); parseErr == nil &&
+						status >= http.StatusInternalServerError && status <= 599 {
+						return true
+					}
+				}
+			}
+		}
 		return false
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
@@ -1049,6 +1186,13 @@ func isAppleTransientNetworkError(err error) bool {
 		return true
 	}
 	text := strings.ToLower(err.Error())
+	if fields := strings.Fields(text); len(fields) >= 3 &&
+		fields[0] == "icloud" && fields[1] == "http" {
+		if status, parseErr := strconv.Atoi(strings.TrimSuffix(fields[2], ":")); parseErr == nil &&
+			status >= http.StatusInternalServerError && status <= 599 {
+			return true
+		}
+	}
 	for _, marker := range []string{
 		"eof",
 		"timeout",

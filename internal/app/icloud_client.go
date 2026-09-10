@@ -34,6 +34,10 @@ type ICloudRemoteMailbox struct {
 	Origin         string
 }
 
+func appleAccountRemoteAnonymousID(id, anonymousID string) string {
+	return strings.TrimSpace(firstNonEmpty(anonymousID, id))
+}
+
 type ICloudSyncedMessage struct {
 	RemoteID   string
 	UID        string
@@ -47,6 +51,37 @@ type ICloudMailCleanupResult struct {
 	MovedToTrash int `json:"moved_to_trash"`
 	Destroyed    int `json:"destroyed"`
 	Skipped      int `json:"skipped"`
+}
+
+func iCloudWebSessionForClient(session ICloudSession) (ICloudSession, bool) {
+	hasWebState := false
+	for _, state := range session.LoginStates {
+		if state.Kind != LoginStateICloudWeb {
+			continue
+		}
+		hasWebState = true
+		if len(state.Cookies) == 0 {
+			continue
+		}
+		session.Cookies = append([]SessionCookie(nil), state.Cookies...)
+		session.ProxyURL = firstNonEmpty(session.ProxyURL, state.ProxyURL)
+		session.Host = firstNonEmpty(session.Host, state.Host)
+		session.SavedAt = firstNonZeroTime(session.SavedAt, state.SavedAt)
+		return session, true
+	}
+	if len(session.Cookies) > 0 && (len(session.LoginStates) == 0 || hasWebState) {
+		for _, state := range session.LoginStates {
+			if state.Kind != LoginStateICloudWeb {
+				continue
+			}
+			session.ProxyURL = firstNonEmpty(session.ProxyURL, state.ProxyURL)
+			session.Host = firstNonEmpty(session.Host, state.Host)
+			session.SavedAt = firstNonZeroTime(session.SavedAt, state.SavedAt)
+			break
+		}
+		return session, true
+	}
+	return session, false
 }
 
 func NewICloudClient() *ICloudClient {
@@ -128,6 +163,7 @@ func appleAccountLoginState(session ICloudSession) (LoginState, bool) {
 		if strings.TrimSpace(state.Scnt) == "" {
 			continue
 		}
+		state.ProxyURL = firstNonEmpty(state.ProxyURL, session.ProxyURL)
 		return state, true
 	}
 	return LoginState{}, false
@@ -201,6 +237,8 @@ func (c *ICloudClient) CheckAppleAccountManageSession(ctx context.Context, sessi
 
 func withAppleAccountLoginState(session ICloudSession, next LoginState) ICloudSession {
 	next.Kind = LoginStateAppleAccount
+	next.ProxyURL = firstNonEmpty(next.ProxyURL, session.ProxyURL)
+	session.ProxyURL = firstNonEmpty(session.ProxyURL, next.ProxyURL)
 	for i, state := range session.LoginStates {
 		if state.Kind == LoginStateAppleAccount {
 			session.LoginStates[i] = next
@@ -212,7 +250,8 @@ func withAppleAccountLoginState(session ICloudSession, next LoginState) ICloudSe
 }
 
 func (c *ICloudClient) CreatePrivacyMailbox(ctx context.Context, session ICloudSession, label, note string) (ICloudRemoteMailbox, error) {
-	if strings.TrimSpace(session.PremiumMailBaseURL) == "" || strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.PremiumMailBaseURL) == "" || strings.TrimSpace(session.DSID) == "" {
 		return ICloudRemoteMailbox{}, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	if !session.IsICloudPlus || !session.CanCreateHME {
@@ -245,7 +284,7 @@ func (c *ICloudClient) CreatePrivacyMailboxWithAppleAccount(ctx context.Context,
 	refreshedBeforeCreate := false
 	if appleAccountManageNeedsCreateRefresh(loginState, time.Now()) {
 		refreshedBeforeCreate = true
-		loginState, session, err = c.refreshAppleAccountManageStateForCreate(ctx, session, loginState, fallbackAPIKey)
+		loginState, session, err = c.refreshAppleAccountManageStateForOperation(ctx, session, loginState, fallbackAPIKey)
 		if err != nil {
 			return ICloudRemoteMailbox{}, session, err
 		}
@@ -260,14 +299,73 @@ func (c *ICloudClient) CreatePrivacyMailboxWithAppleAccount(ctx context.Context,
 	if !ok {
 		retryState = loginState
 	}
-	retryState, updatedSession, refreshErr := c.refreshAppleAccountManageStateForCreate(ctx, updatedSession, retryState, fallbackAPIKey)
+	retryState, updatedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, updatedSession, retryState, fallbackAPIKey)
 	if refreshErr != nil {
 		return ICloudRemoteMailbox{}, updatedSession, refreshErr
 	}
 	return c.createPrivacyMailboxWithAppleAccountState(ctx, updatedSession, retryState, fallbackAPIKey, label, note)
 }
 
-func (c *ICloudClient) refreshAppleAccountManageStateForCreate(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey string) (LoginState, ICloudSession, error) {
+func (c *ICloudClient) DeletePrivacyMailboxWithAppleAccount(ctx context.Context, session ICloudSession, fallbackAPIKey, anonymousID string) (ICloudSession, error) {
+	anonymousID = strings.TrimSpace(anonymousID)
+	if anonymousID == "" {
+		return session, errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
+	}
+	loginState, ok := appleAccountLoginState(session)
+	if !ok {
+		return session, errCode("apple_account_session_missing", "当前登录态缺少 Apple Account 管理态，请重新协议登录", true)
+	}
+	release, err := acquireAppleAccountOperationGate(ctx, appleAccountOperationKey(session, loginState))
+	if err != nil {
+		return session, err
+	}
+	defer release()
+
+	fallbackAPIKey = strings.TrimSpace(fallbackAPIKey)
+	refreshedBeforeDelete := false
+	if appleAccountManageNeedsCreateRefresh(loginState, time.Now()) {
+		refreshedBeforeDelete = true
+		loginState, session, err = c.refreshAppleAccountManageStateForOperation(ctx, session, loginState, fallbackAPIKey)
+		if err != nil {
+			return session, err
+		}
+	}
+
+	updatedSession, err := c.deletePrivacyMailboxWithAppleAccountState(ctx, session, loginState, fallbackAPIKey, anonymousID)
+	if err == nil || !isCodedError(err, "apple_account_auth_failed") || refreshedBeforeDelete {
+		return updatedSession, err
+	}
+
+	retryState, ok := appleAccountLoginState(updatedSession)
+	if !ok {
+		retryState = loginState
+	}
+	retryState, updatedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, updatedSession, retryState, fallbackAPIKey)
+	if refreshErr != nil {
+		return updatedSession, refreshErr
+	}
+	return c.deletePrivacyMailboxWithAppleAccountState(ctx, updatedSession, retryState, fallbackAPIKey, anonymousID)
+}
+
+func (c *ICloudClient) deletePrivacyMailboxWithAppleAccountState(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey, anonymousID string) (ICloudSession, error) {
+	apiKey := strings.TrimSpace(firstNonEmpty(loginState.APIKey, fallbackAPIKey))
+	if apiKey == "" {
+		return session, errCode("apple_account_api_key_missing", "Apple Account 管理态缺少 api_key，请重新完成 Apple Account 登录流程", true)
+	}
+	loginState.APIKey = apiKey
+	session = withAppleAccountLoginState(session, loginState)
+	path := "/account/manage/email/private/" + url.PathEscape(strings.TrimSpace(anonymousID)) + "/remove"
+	raw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodDelete, path, nil, nil)
+	if err != nil {
+		if !isAppleAccountRemoveGone(raw, err) {
+			return withAppleAccountLoginState(session, loginState), err
+		}
+	}
+	markAppleAccountManageOK(&loginState)
+	return withAppleAccountLoginState(session, loginState), nil
+}
+
+func (c *ICloudClient) refreshAppleAccountManageStateForOperation(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey string) (LoginState, ICloudSession, error) {
 	refreshed, err := c.refreshAppleAccountManageStateUnlocked(ctx, loginState)
 	loginState = refreshed
 	session = withAppleAccountLoginState(session, loginState)
@@ -292,55 +390,81 @@ func (c *ICloudClient) createPrivacyMailboxWithAppleAccountState(ctx context.Con
 
 	var generated struct {
 		EmailAddress string `json:"emailAddress"`
+		Email        string `json:"email"`
 	}
 	generatedRaw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPost, "/account/manage/email/private/add", map[string]any{}, &generated)
 	if err != nil {
 		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), err
 	}
-	if strings.TrimSpace(generated.EmailAddress) == "" {
+	generatedEmail := strings.TrimSpace(firstNonEmpty(generated.EmailAddress, generated.Email))
+	if generatedEmail == "" {
 		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), errCode("apple_account_generate_empty", "Apple Account 未返回候选隐私邮箱；"+appleAccountRawResponseDetail("生成候选隐私邮箱", generatedRaw), true)
 	}
 
 	var completed struct {
 		EmailAddress string `json:"emailAddress"`
+		Email        string `json:"email"`
 		Label        string `json:"label"`
 		Note         string `json:"note"`
 		ID           string `json:"id"`
-		Active       bool   `json:"active"`
+		AnonymousID  string `json:"anonymousId"`
+		Active       *bool  `json:"active"`
+		IsActive     *bool  `json:"isActive"`
 	}
 	completedRaw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPut, "/account/manage/email/private/add/complete", map[string]string{
-		"emailAddress": generated.EmailAddress,
+		"emailAddress": generatedEmail,
 		"label":        label,
 		"note":         note,
 	}, &completed)
 	if err != nil {
-		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), err
+		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), errCode(
+			"apple_account_create_uncertain",
+			"Apple Account 已提交隐私邮箱确认请求，但未收到可确认的结果；请先同步远端隐私邮箱列表确认后再重试",
+			true,
+		)
 	}
 
+	active := true
+	if completed.Active != nil {
+		active = *completed.Active
+	} else if completed.IsActive != nil {
+		active = *completed.IsActive
+	}
 	remote := ICloudRemoteMailbox{
-		AnonymousID: strings.TrimSpace(completed.ID),
-		Email:       strings.ToLower(strings.TrimSpace(firstNonEmpty(completed.EmailAddress, generated.EmailAddress))),
+		AnonymousID: appleAccountRemoteAnonymousID(completed.ID, completed.AnonymousID),
+		Email:       strings.ToLower(strings.TrimSpace(firstNonEmpty(completed.EmailAddress, completed.Email, generatedEmail))),
 		Label:       strings.TrimSpace(firstNonEmpty(completed.Label, label)),
 		Note:        strings.TrimSpace(firstNonEmpty(completed.Note, note, "created by Apple Account private email API")),
-		IsActive:    completed.Active,
+		IsActive:    active,
 		Origin:      "APPLE_ACCOUNT",
 	}
 	if remote.AnonymousID != "" {
 		var confirmed struct {
 			EmailAddress   string `json:"emailAddress"`
+			Email          string `json:"email"`
 			Label          string `json:"label"`
 			Note           string `json:"note"`
 			ID             string `json:"id"`
+			AnonymousID    string `json:"anonymousId"`
 			ForwardToEmail string `json:"forwardToEmail"`
-			Active         bool   `json:"active"`
+			Active         *bool  `json:"active"`
+			IsActive       *bool  `json:"isActive"`
 		}
 		path := "/account/manage/email/private/" + url.PathEscape(remote.AnonymousID) + ".em"
 		if err := c.callAppleAccount(ctx, &loginState, apiKey, http.MethodGet, path, nil, &confirmed); err == nil {
-			remote.Email = strings.ToLower(strings.TrimSpace(firstNonEmpty(confirmed.EmailAddress, remote.Email)))
+			remote.AnonymousID = firstNonEmpty(
+				appleAccountRemoteAnonymousID(confirmed.ID, confirmed.AnonymousID),
+				remote.AnonymousID,
+			)
+			remote.Email = strings.ToLower(strings.TrimSpace(firstNonEmpty(confirmed.EmailAddress, confirmed.Email, remote.Email)))
 			remote.Label = strings.TrimSpace(firstNonEmpty(confirmed.Label, remote.Label))
 			remote.Note = strings.TrimSpace(firstNonEmpty(confirmed.Note, remote.Note))
 			remote.ForwardToEmail = strings.TrimSpace(confirmed.ForwardToEmail)
-			remote.IsActive = confirmed.Active
+			if confirmed.Active != nil {
+				remote.IsActive = *confirmed.Active
+			} else if confirmed.IsActive != nil {
+				remote.IsActive = *confirmed.IsActive
+			}
 		}
 	}
 	if remote.Email == "" {
@@ -560,7 +684,13 @@ func (c *ICloudClient) callAppleAccountPortalOnce(ctx context.Context, loginStat
 	if err != nil {
 		return nil, err
 	}
-	rel := &url.URL{Path: strings.TrimLeft(path, "/")}
+	rel, err := url.Parse(strings.TrimLeft(path, "/"))
+	if err != nil {
+		return nil, err
+	}
+	if rel.IsAbs() || rel.Host != "" {
+		return nil, errCode("apple_account_invalid_endpoint", "Apple Account 接口路径无效", false)
+	}
 	rawURL := base.ResolveReference(rel).String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -588,7 +718,11 @@ func (c *ICloudClient) callAppleAccountPortalOnce(ctx context.Context, loginStat
 		req.Header.Set("X-Apple-I-TimeZone", appleAccountManageTimeZone)
 		req.Header.Set("X-Apple-I-FD-Client-Info", appleAccountFDClientInfo(userAgent))
 	}
-	resp, err := c.client.Do(req)
+	httpClient, err := httpClientWithProxy(c.client, loginState.ProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -618,40 +752,504 @@ func (c *ICloudClient) callAppleAccountPortalOnce(ctx context.Context, loginStat
 }
 
 func (c *ICloudClient) ListPrivacyMailboxes(ctx context.Context, session ICloudSession) ([]ICloudRemoteMailbox, error) {
-	if strings.TrimSpace(session.PremiumMailBaseURL) == "" || strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	if _, ok := appleAccountLoginState(session); ok && !iCloudWebLoginSaved(session) {
+		remotes, _, err := c.ListPrivacyMailboxesForOriginWithSession(ctx, session, mailboxRemoteOriginAppleAccount)
+		return remotes, err
+	}
+	return c.listICloudWebPrivacyMailboxes(ctx, session)
+}
+
+func (c *ICloudClient) ListPrivacyMailboxesForOrigin(ctx context.Context, session ICloudSession, origin string) ([]ICloudRemoteMailbox, error) {
+	remotes, _, err := c.ListPrivacyMailboxesForOriginWithSession(ctx, session, origin)
+	return remotes, err
+}
+
+func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSession(ctx context.Context, session ICloudSession, origin string) ([]ICloudRemoteMailbox, ICloudSession, error) {
+	return c.ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx, session, origin, "")
+}
+
+func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx context.Context, session ICloudSession, origin, fallbackAPIKey string) ([]ICloudRemoteMailbox, ICloudSession, error) {
+	switch strings.ToUpper(strings.TrimSpace(origin)) {
+	case mailboxRemoteOriginAppleAccount, strings.ToUpper(string(mailboxCreateChannelAppleAccount)):
+		state, ok := appleAccountLoginState(session)
+		if !ok {
+			return nil, session, errCode("apple_account_session_missing", "未保存 Apple Account 新接口登录态，请先完成新接口登录", true)
+		}
+		release, err := acquireAppleAccountOperationGate(ctx, appleAccountOperationKey(session, state))
+		if err != nil {
+			return nil, session, err
+		}
+		defer release()
+		fallbackAPIKey = strings.TrimSpace(fallbackAPIKey)
+		state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
+		remotes, err := c.listAppleAccountPrivacyMailboxes(ctx, &state)
+		if err != nil && (isCodedError(err, "apple_account_auth_failed") || isCodedError(err, "apple_account_api_key_missing")) {
+			refreshedState, refreshedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, session, state, fallbackAPIKey)
+			if refreshErr != nil {
+				return nil, refreshedSession, refreshErr
+			}
+			session = refreshedSession
+			state = refreshedState
+			state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
+			remotes, err = c.listAppleAccountPrivacyMailboxes(ctx, &state)
+		}
+		if err != nil {
+			return nil, withAppleAccountLoginState(session, state), err
+		}
+		markAppleAccountManageOK(&state)
+		return remotes, withAppleAccountLoginState(session, state), nil
+	case mailboxRemoteOriginICloudWeb, strings.ToUpper(string(mailboxCreateChannelICloudWeb)):
+		remotes, err := c.listICloudWebPrivacyMailboxes(ctx, session)
+		return remotes, session, err
+	default:
+		return nil, session, errCode("icloud_mailbox_remote_origin_unknown", "无法识别隐私邮箱列表来源，已拒绝调用错误的接口", false)
+	}
+}
+
+const maxPrivacyMailboxListPages = 100
+
+func (c *ICloudClient) listICloudWebPrivacyMailboxes(ctx context.Context, session ICloudSession) ([]ICloudRemoteMailbox, error) {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.PremiumMailBaseURL) == "" || strings.TrimSpace(session.DSID) == "" {
 		return nil, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
-	var out struct {
-		HMEEmails []struct {
-			AnonymousID    string `json:"anonymousId"`
-			HME            string `json:"hme"`
-			Label          string `json:"label"`
-			ForwardToEmail string `json:"forwardToEmail"`
-			IsActive       bool   `json:"isActive"`
-			Origin         string `json:"origin"`
-		} `json:"hmeEmails"`
-	}
-	if err := retryAppleTransient(ctx, func() error {
-		return c.call(ctx, session, http.MethodGet, "/v2/hme/list", nil, &out)
-	}); err != nil {
-		return nil, err
-	}
-	remotes := make([]ICloudRemoteMailbox, 0, len(out.HMEEmails))
-	for _, item := range out.HMEEmails {
-		email := strings.ToLower(strings.TrimSpace(item.HME))
-		if email == "" {
-			continue
+	remotes := make([]ICloudRemoteMailbox, 0)
+	seenRemoteIDs := make(map[string]string)
+	seenEmails := make(map[string]string)
+	seenCursors := make(map[string]struct{})
+	path := "/v2/hme/list"
+	for pageIndex := 0; ; pageIndex++ {
+		var out struct {
+			HMEEmails         json.RawMessage `json:"hmeEmails"`
+			HasMore           *bool           `json:"hasMore"`
+			HasMoreSnake      *bool           `json:"has_more"`
+			NextCursor        string          `json:"nextCursor"`
+			NextCursorSnake   string          `json:"next_cursor"`
+			NextPageToken     string          `json:"nextPageToken"`
+			ContinuationToken string          `json:"continuationToken"`
+			Items             []struct {
+				AnonymousID    string `json:"anonymousId"`
+				ID             string `json:"id"`
+				HME            string `json:"hme"`
+				Label          string `json:"label"`
+				ForwardToEmail string `json:"forwardToEmail"`
+				Active         *bool  `json:"active"`
+				IsActive       *bool  `json:"isActive"`
+				Origin         string `json:"origin"`
+			} `json:"-"`
 		}
-		remotes = append(remotes, ICloudRemoteMailbox{
-			AnonymousID:    strings.TrimSpace(item.AnonymousID),
-			Email:          email,
-			Label:          strings.TrimSpace(item.Label),
-			ForwardToEmail: strings.TrimSpace(item.ForwardToEmail),
-			IsActive:       item.IsActive,
-			Origin:         strings.TrimSpace(item.Origin),
-		})
+		if err := retryAppleTransient(ctx, func() error {
+			return c.call(ctx, session, http.MethodGet, path, nil, &out)
+		}); err != nil {
+			return nil, err
+		}
+		if len(bytes.TrimSpace(out.HMEEmails)) == 0 || bytes.Equal(bytes.TrimSpace(out.HMEEmails), []byte("null")) {
+			return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表响应缺少 hmeEmails，未执行本地远端缺失标记", true)
+		}
+		if err := json.Unmarshal(out.HMEEmails, &out.Items); err != nil {
+			return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表字段无法解析，未执行本地远端缺失标记", true)
+		}
+		for _, item := range out.Items {
+			email := strings.ToLower(strings.TrimSpace(item.HME))
+			if email == "" {
+				return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表包含缺少邮箱地址的记录，未执行本地远端缺失标记", true)
+			}
+			anonymousID := appleAccountRemoteAnonymousID(item.ID, item.AnonymousID)
+			if anonymousID == "" {
+				return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表包含缺少远端匿名 ID 的记录，未执行本地远端缺失标记", true)
+			}
+			remoteKey := strings.ToLower(anonymousID)
+			if previousEmail, ok := seenRemoteIDs[remoteKey]; ok {
+				return nil, errCode("icloud_mailbox_list_incomplete", fmt.Sprintf("iCloud 隐私邮箱列表包含重复远端匿名 ID（%s，对应 %s 和 %s），未执行本地远端缺失标记", anonymousID, previousEmail, email), true)
+			}
+			if previousRemoteID, ok := seenEmails[email]; ok {
+				return nil, errCode("icloud_mailbox_list_incomplete", fmt.Sprintf("iCloud 隐私邮箱列表包含重复邮箱地址（%s，对应 %s 和 %s），未执行本地远端缺失标记", email, previousRemoteID, anonymousID), true)
+			}
+			seenRemoteIDs[remoteKey] = email
+			seenEmails[email] = anonymousID
+			isActive := true
+			if item.Active != nil {
+				isActive = *item.Active
+			} else if item.IsActive != nil {
+				isActive = *item.IsActive
+			}
+			remotes = append(remotes, ICloudRemoteMailbox{
+				AnonymousID:    anonymousID,
+				Email:          email,
+				Label:          strings.TrimSpace(item.Label),
+				ForwardToEmail: strings.TrimSpace(item.ForwardToEmail),
+				IsActive:       isActive,
+				// This endpoint is the legacy iCloud Web provider. The payload's
+				// origin field describes how Apple classified the mailbox, not
+				// which provider endpoint must be used for later deletion.
+				Origin: mailboxRemoteOriginICloudWeb,
+			})
+		}
+		hasMore := out.HasMore != nil && *out.HasMore
+		if out.HasMoreSnake != nil {
+			hasMore = hasMore || *out.HasMoreSnake
+		}
+		queryKey, cursor, more, err := mailboxListNextCursor(
+			hasMore,
+			out.NextCursor,
+			out.NextCursorSnake,
+			out.NextPageToken,
+			out.ContinuationToken,
+		)
+		if err != nil {
+			return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表标记仍有下一页但未返回下一页游标，未执行本地远端缺失标记", true)
+		}
+		if !more {
+			return remotes, nil
+		}
+		if pageIndex+1 >= maxPrivacyMailboxListPages {
+			return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表分页超过安全上限，未执行本地远端缺失标记", true)
+		}
+		if _, exists := seenCursors[cursor]; exists {
+			return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表分页游标重复，未执行本地远端缺失标记", true)
+		}
+		seenCursors[cursor] = struct{}{}
+		path = appendURLQuery(path, queryKey, cursor)
 	}
-	return remotes, nil
+}
+
+type appleAccountMailboxListPage struct {
+	HMEEmails         json.RawMessage `json:"hmeEmails"`
+	HasMore           *bool           `json:"hasMore"`
+	HasMoreSnake      *bool           `json:"has_more"`
+	NextCursor        string          `json:"nextCursor"`
+	NextCursorSnake   string          `json:"next_cursor"`
+	NextPageToken     string          `json:"nextPageToken"`
+	ContinuationToken string          `json:"continuationToken"`
+}
+
+type appleAccountMailboxListResponse struct {
+	appleAccountMailboxListPage
+	Result  appleAccountMailboxListPage `json:"result"`
+	Data    appleAccountMailboxListPage `json:"data"`
+	Success *bool                       `json:"success"`
+}
+
+type appleAccountMailboxListItem struct {
+	AnonymousID    string `json:"anonymousId"`
+	ID             string `json:"id"`
+	HME            string `json:"hme"`
+	EmailAddress   string `json:"emailAddress"`
+	Email          string `json:"email"`
+	Label          string `json:"label"`
+	Note           string `json:"note"`
+	ForwardToEmail string `json:"forwardToEmail"`
+	Active         *bool  `json:"active"`
+	IsActive       *bool  `json:"isActive"`
+	Origin         string `json:"origin"`
+}
+
+func (c *ICloudClient) listAppleAccountPrivacyMailboxes(ctx context.Context, loginState *LoginState) ([]ICloudRemoteMailbox, error) {
+	if loginState == nil {
+		return nil, errCode("apple_account_session_missing", "未保存 Apple Account 新接口登录态，请先完成新接口登录", true)
+	}
+	apiKey := strings.TrimSpace(loginState.APIKey)
+	if apiKey == "" {
+		return nil, errCode("apple_account_api_key_missing", "Apple Account 管理态缺少 api_key，请重新完成 Apple Account 登录流程", true)
+	}
+	remotes := make([]ICloudRemoteMailbox, 0)
+	seenRemoteIDs := make(map[string]string)
+	seenEmails := make(map[string]string)
+	seenCursors := make(map[string]struct{})
+	path := "/account/manage/email/private"
+	for pageIndex := 0; ; pageIndex++ {
+		raw, err := c.callAppleAccountRaw(ctx, loginState, apiKey, http.MethodGet, path, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		page, err := parseAppleAccountMailboxListPage(raw)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range page.items {
+			email := strings.ToLower(strings.TrimSpace(firstNonEmpty(item.HME, item.EmailAddress, item.Email)))
+			if email == "" {
+				return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表包含缺少邮箱地址的记录，未执行本地远端缺失标记；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+			}
+			anonymousID := appleAccountRemoteAnonymousID(item.ID, item.AnonymousID)
+			if anonymousID == "" {
+				return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表包含缺少远端匿名 ID 的记录，未执行本地远端缺失标记；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+			}
+			remoteKey := strings.ToLower(anonymousID)
+			if previousEmail, ok := seenRemoteIDs[remoteKey]; ok {
+				return nil, errCode("apple_account_mailbox_list_incomplete", fmt.Sprintf("Apple Account 隐私邮箱列表包含重复远端匿名 ID（%s，对应 %s 和 %s），未执行本地远端缺失标记；%s", anonymousID, previousEmail, email, appleAccountRawResponseDetail("读取隐私邮箱列表", raw)), true)
+			}
+			if previousRemoteID, ok := seenEmails[email]; ok {
+				return nil, errCode("apple_account_mailbox_list_incomplete", fmt.Sprintf("Apple Account 隐私邮箱列表包含重复邮箱地址（%s，对应 %s 和 %s），未执行本地远端缺失标记；%s", email, previousRemoteID, anonymousID, appleAccountRawResponseDetail("读取隐私邮箱列表", raw)), true)
+			}
+			seenRemoteIDs[remoteKey] = email
+			seenEmails[email] = anonymousID
+			isActive := true
+			if item.Active != nil {
+				isActive = *item.Active
+			} else if item.IsActive != nil {
+				isActive = *item.IsActive
+			}
+			remotes = append(remotes, ICloudRemoteMailbox{
+				AnonymousID:    anonymousID,
+				Email:          email,
+				Label:          strings.TrimSpace(item.Label),
+				Note:           strings.TrimSpace(item.Note),
+				ForwardToEmail: strings.TrimSpace(item.ForwardToEmail),
+				IsActive:       isActive,
+				Origin:         mailboxRemoteOriginAppleAccount,
+			})
+		}
+		if !page.hasMore && !page.hasNextPage {
+			return remotes, nil
+		}
+		if pageIndex+1 >= maxPrivacyMailboxListPages {
+			return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表分页超过安全上限，未执行本地远端缺失标记", true)
+		}
+		if page.nextCursor == "" || page.nextCursorParam == "" {
+			return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表仍有未读取的分页但缺少下一页游标，未执行本地远端缺失标记", true)
+		}
+		if _, exists := seenCursors[page.nextCursor]; exists {
+			return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表分页游标重复，未执行本地远端缺失标记", true)
+		}
+		seenCursors[page.nextCursor] = struct{}{}
+		path = appendURLQuery(path, page.nextCursorParam, page.nextCursor)
+	}
+}
+
+type parsedAppleAccountMailboxList struct {
+	items           []appleAccountMailboxListItem
+	hasMore         bool
+	hasNextPage     bool
+	nextCursorParam string
+	nextCursor      string
+	responseBody    []byte
+}
+
+func parseAppleAccountMailboxListPage(raw appleAccountRawResponse) (parsedAppleAccountMailboxList, error) {
+	trimmed := bytes.TrimSpace(raw.Body)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表响应为空", true)
+	}
+	if trimmed[0] == '[' {
+		items, err := parseAppleAccountMailboxListItems(trimmed)
+		if err != nil {
+			return parsedAppleAccountMailboxList{}, err
+		}
+		return parsedAppleAccountMailboxList{items: items, responseBody: append([]byte(nil), trimmed...)}, nil
+	}
+	var response appleAccountMailboxListResponse
+	if err := json.Unmarshal(trimmed, &response); err != nil {
+		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_bad_response", "Apple Account 隐私邮箱列表返回无法解析；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+	}
+	page := mergeAppleAccountMailboxListPage(response.appleAccountMailboxListPage, response.Result)
+	page = mergeAppleAccountMailboxListPage(page, response.Data)
+	if len(page.HMEEmails) == 0 {
+		if response.Success != nil && !*response.Success {
+			return parsedAppleAccountMailboxList{}, errCode("apple_account_api_failed", "Apple Account 隐私邮箱列表接口返回失败；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+		}
+		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表响应缺少 hmeEmails，未执行本地远端缺失标记；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+	}
+	items, err := parseAppleAccountMailboxListItems(page.HMEEmails)
+	if err != nil {
+		return parsedAppleAccountMailboxList{}, err
+	}
+	hasMore := page.HasMore != nil && *page.HasMore
+	if page.HasMoreSnake != nil {
+		hasMore = hasMore || *page.HasMoreSnake
+	}
+	nextCursorParam, nextCursor, more, cursorErr := mailboxListNextCursor(
+		hasMore,
+		page.NextCursor,
+		page.NextCursorSnake,
+		page.NextPageToken,
+		page.ContinuationToken,
+	)
+	if cursorErr != nil {
+		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表标记仍有下一页但未返回下一页游标，未执行本地远端缺失标记", true)
+	}
+	return parsedAppleAccountMailboxList{
+		items:           items,
+		hasMore:         more,
+		hasNextPage:     more,
+		nextCursorParam: nextCursorParam,
+		nextCursor:      nextCursor,
+		responseBody:    append([]byte(nil), trimmed...),
+	}, nil
+}
+
+func mergeAppleAccountMailboxListPage(primary, nested appleAccountMailboxListPage) appleAccountMailboxListPage {
+	if len(primary.HMEEmails) == 0 {
+		primary.HMEEmails = nested.HMEEmails
+	}
+	if primary.HasMore == nil {
+		primary.HasMore = nested.HasMore
+	}
+	if primary.HasMoreSnake == nil {
+		primary.HasMoreSnake = nested.HasMoreSnake
+	}
+	if strings.TrimSpace(primary.NextCursor) == "" {
+		primary.NextCursor = nested.NextCursor
+	}
+	if strings.TrimSpace(primary.NextCursorSnake) == "" {
+		primary.NextCursorSnake = nested.NextCursorSnake
+	}
+	if strings.TrimSpace(primary.NextPageToken) == "" {
+		primary.NextPageToken = nested.NextPageToken
+	}
+	if strings.TrimSpace(primary.ContinuationToken) == "" {
+		primary.ContinuationToken = nested.ContinuationToken
+	}
+	return primary
+}
+
+func parseAppleAccountMailboxListItems(raw json.RawMessage) ([]appleAccountMailboxListItem, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表响应缺少 hmeEmails，未执行本地远端缺失标记", true)
+	}
+	var items []appleAccountMailboxListItem
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return nil, errCode("apple_account_mailbox_list_bad_response", "Apple Account 隐私邮箱列表返回无法解析", true)
+	}
+	return items, nil
+}
+
+func appleAccountMailboxListPageIncomplete(page parsedAppleAccountMailboxList) error {
+	if page.hasMore || page.hasNextPage {
+		return errors.New("Apple Account 隐私邮箱列表仍有未读取的分页，未执行本地远端缺失标记")
+	}
+	return nil
+}
+
+func mailboxListNextCursor(hasMore bool, nextCursor, nextCursorSnake, nextPageToken, continuationToken string) (string, string, bool, error) {
+	candidates := []struct {
+		param string
+		value string
+	}{
+		{param: "cursor", value: nextCursor},
+		{param: "next_cursor", value: nextCursorSnake},
+		{param: "pageToken", value: nextPageToken},
+		{param: "continuationToken", value: continuationToken},
+	}
+	for _, candidate := range candidates {
+		if value := strings.TrimSpace(candidate.value); value != "" {
+			return candidate.param, value, true, nil
+		}
+	}
+	if hasMore {
+		return "", "", true, errors.New("隐私邮箱列表标记仍有下一页但未返回下一页游标")
+	}
+	return "", "", false, nil
+}
+
+func appendURLQuery(rawPath, key, value string) string {
+	u, err := url.Parse(rawPath)
+	if err != nil {
+		return rawPath
+	}
+	q := u.Query()
+	q.Set(strings.TrimSpace(key), value)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (c *ICloudClient) DeactivatePrivacyMailbox(ctx context.Context, session ICloudSession, anonymousID string) error {
+	anonymousID = strings.TrimSpace(anonymousID)
+	if anonymousID == "" {
+		return errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
+	}
+	return c.call(ctx, session, http.MethodPost, "/v1/hme/deactivate", map[string]string{
+		"anonymousId": anonymousID,
+	}, nil)
+}
+
+func (c *ICloudClient) DeletePrivacyMailbox(ctx context.Context, session ICloudSession, anonymousID string) error {
+	anonymousID = strings.TrimSpace(anonymousID)
+	if anonymousID == "" {
+		return errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
+	}
+	if err := c.call(ctx, session, http.MethodPost, "/v1/hme/deactivate", map[string]string{
+		"anonymousId": anonymousID,
+	}, nil); err != nil && !isRemoteMailboxAlreadyInactive(err) && !isICloudHMEDeleteGone(err) {
+		return err
+	}
+	if err := c.call(ctx, session, http.MethodPost, "/v1/hme/delete", map[string]string{
+		"anonymousId": anonymousID,
+	}, nil); err != nil && !isICloudHMEDeleteGone(err) {
+		return err
+	}
+	return nil
+}
+
+func isAppleAccountRemoveGone(raw appleAccountRawResponse, err error) bool {
+	if raw.StatusCode != http.StatusNotFound && raw.StatusCode != http.StatusGone {
+		return false
+	}
+	if looksLikeHTML(raw.Body) {
+		return false
+	}
+	return err != nil
+}
+
+func isICloudHMEDeleteGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	var coded codedError
+	if !errors.As(err, &coded) {
+		return false
+	}
+	lower := strings.ToLower(coded.code + " " + coded.message)
+	if strings.Contains(lower, "<html") {
+		return false
+	}
+	switch coded.code {
+	case "icloud_http_error":
+		return strings.Contains(lower, "http 404") || strings.Contains(lower, "http 410")
+	case "icloud_api_failed":
+		return isICloudHMEAlreadyGoneMessage(coded.message)
+	}
+	return false
+}
+
+func isICloudHMEAlreadyGoneMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	for _, token := range []string{"already deleted", "already removed", "does not exist", "no longer exist"} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRemoteMailboxAlreadyInactive(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(text, "http 404") || strings.Contains(text, "http 410") || strings.Contains(text, "<html") {
+		return false
+	}
+	for _, token := range []string{
+		"already inactive",
+		"already deactivated",
+		"hme_already_inactive",
+	} {
+		if strings.Contains(text, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeHTML(data []byte) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := bytes.ToLower(trimmed)
+	return bytes.HasPrefix(lower, []byte("<!")) || bytes.Contains(lower[:min(len(lower), 256)], []byte("<html"))
 }
 
 func (c *ICloudClient) generate(ctx context.Context, session ICloudSession) (string, error) {
@@ -677,7 +1275,8 @@ func (c *ICloudClient) reserve(ctx context.Context, session ICloudSession, hme, 
 			Label          string `json:"label"`
 			Note           string `json:"note"`
 			ForwardToEmail string `json:"forwardToEmail"`
-			IsActive       bool   `json:"isActive"`
+			Active         *bool  `json:"active"`
+			IsActive       *bool  `json:"isActive"`
 		} `json:"hme"`
 	}
 	if err := c.call(ctx, session, http.MethodPost, "/v1/hme/reserve", map[string]string{
@@ -685,7 +1284,17 @@ func (c *ICloudClient) reserve(ctx context.Context, session ICloudSession, hme, 
 		"label": label,
 		"note":  note,
 	}, &out); err != nil {
-		return ICloudRemoteMailbox{}, err
+		return ICloudRemoteMailbox{}, errCode(
+			"icloud_create_uncertain",
+			"iCloud 已提交隐私邮箱确认请求，但未收到可确认的结果；请先同步远端隐私邮箱列表确认后再重试",
+			true,
+		)
+	}
+	isActive := true
+	if out.HME.Active != nil {
+		isActive = *out.HME.Active
+	} else if out.HME.IsActive != nil {
+		isActive = *out.HME.IsActive
 	}
 	return ICloudRemoteMailbox{
 		AnonymousID:    out.HME.AnonymousID,
@@ -693,7 +1302,7 @@ func (c *ICloudClient) reserve(ctx context.Context, session ICloudSession, hme, 
 		Label:          out.HME.Label,
 		Note:           out.HME.Note,
 		ForwardToEmail: out.HME.ForwardToEmail,
-		IsActive:       out.HME.IsActive,
+		IsActive:       isActive,
 		Origin:         "ICLOUD_WEB",
 	}, nil
 }
@@ -754,7 +1363,11 @@ func (c *ICloudClient) fetchAppleAccountManageTokenScntOnce(ctx context.Context,
 		req.Header.Set("Cookie", cookie)
 	}
 
-	resp, err := c.client.Do(req)
+	httpClient, err := httpClientWithProxy(c.client, loginState.ProxyURL)
+	if err != nil {
+		return "", err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -778,12 +1391,9 @@ func (c *ICloudClient) fetchAppleAccountManageTokenScntOnce(ctx context.Context,
 func (c *ICloudClient) callAppleAccountRaw(ctx context.Context, loginState *LoginState, apiKey, method, path string, body any, result any) (appleAccountRawResponse, error) {
 	var raw appleAccountRawResponse
 	err := retryAppleTransient(ctx, func() error {
-		next, err := c.callAppleAccountRawOnce(ctx, loginState, apiKey, method, path, body, result)
-		if err != nil {
-			return err
-		}
+		next, callErr := c.callAppleAccountRawOnce(ctx, loginState, apiKey, method, path, body, result)
 		raw = next
-		return nil
+		return callErr
 	})
 	return raw, err
 }
@@ -796,7 +1406,13 @@ func (c *ICloudClient) callAppleAccountRawOnce(ctx context.Context, loginState *
 	if err != nil {
 		return appleAccountRawResponse{}, err
 	}
-	rel := &url.URL{Path: strings.TrimLeft(path, "/")}
+	rel, err := url.Parse(strings.TrimLeft(path, "/"))
+	if err != nil {
+		return appleAccountRawResponse{}, err
+	}
+	if rel.IsAbs() || rel.Host != "" {
+		return appleAccountRawResponse{}, errCode("apple_account_invalid_endpoint", "Apple Account 接口路径无效", false)
+	}
 	rawURL := base.ResolveReference(rel).String()
 
 	var reader io.Reader
@@ -838,7 +1454,11 @@ func (c *ICloudClient) callAppleAccountRawOnce(ctx context.Context, loginState *
 		req.Header.Set("Cookie", cookie)
 	}
 
-	resp, err := c.client.Do(req)
+	httpClient, err := httpClientWithProxy(c.client, loginState.ProxyURL)
+	if err != nil {
+		return appleAccountRawResponse{}, err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return appleAccountRawResponse{}, err
 	}
@@ -1116,28 +1736,20 @@ func appleAccountBodyLooksAuthExpired(lower string) bool {
 	return strings.Contains(lower, "authentication") && (strings.Contains(lower, "failed") || strings.Contains(lower, "expired"))
 }
 
-func appleAccountErrorDetail(status int, data []byte, stage string) string {
+func appleAccountErrorDetail(status int, _ []byte, stage string) string {
 	stage = strings.TrimSpace(stage)
 	if stage == "" {
 		stage = "未知阶段"
 	}
-	body := strings.TrimSpace(appleDebugBody(data))
-	if body == "" {
-		body = "空响应"
-	}
-	return fmt.Sprintf("阶段：%s；HTTP %d；原始返回：%s", stage, status, body)
+	return fmt.Sprintf("阶段：%s；HTTP %d", stage, status)
 }
 
-func appleAccountResponseDetail(stage string, data []byte) string {
+func appleAccountResponseDetail(stage string, _ []byte) string {
 	stage = strings.TrimSpace(stage)
 	if stage == "" {
 		stage = "未知阶段"
 	}
-	body := strings.TrimSpace(appleDebugBody(data))
-	if body == "" {
-		body = "空响应"
-	}
-	return fmt.Sprintf("阶段：%s；原始返回：%s", stage, body)
+	return "阶段：" + stage
 }
 
 func appleAccountRawResponseDetail(stage string, raw appleAccountRawResponse) string {
@@ -1145,14 +1757,10 @@ func appleAccountRawResponseDetail(stage string, raw appleAccountRawResponse) st
 	if stage == "" {
 		stage = "未知阶段"
 	}
-	body := strings.TrimSpace(appleDebugBody(raw.Body))
-	if body == "" {
-		body = "空响应"
-	}
 	if raw.StatusCode > 0 {
-		return fmt.Sprintf("阶段：%s；HTTP %d；原始返回：%s", stage, raw.StatusCode, body)
+		return fmt.Sprintf("阶段：%s；HTTP %d", stage, raw.StatusCode)
 	}
-	return fmt.Sprintf("阶段：%s；原始返回：%s", stage, body)
+	return "阶段：" + stage
 }
 
 func appleAccountRequestStage(method, path string) string {
@@ -1171,12 +1779,16 @@ func appleAccountRequestStage(method, path string) string {
 		return "新接口保活"
 	case method == http.MethodGet && path == "/account/manage/forwardemail":
 		return "读取转发邮箱"
+	case method == http.MethodGet && path == "/account/manage/email/private":
+		return "读取隐私邮箱列表"
 	case method == http.MethodPost && path == "/account/manage/email/private/add":
 		return "生成候选隐私邮箱"
 	case method == http.MethodPut && path == "/account/manage/email/private/add/complete":
 		return "确认创建隐私邮箱"
 	case method == http.MethodGet && strings.HasPrefix(path, "/account/manage/email/private/") && strings.HasSuffix(path, ".em"):
 		return "确认隐私邮箱详情"
+	case method == http.MethodDelete && strings.HasPrefix(path, "/account/manage/email/private/") && strings.HasSuffix(path, "/remove"):
+		return "删除隐私邮箱"
 	default:
 		return strings.TrimSpace(method + " " + path)
 	}
@@ -1188,6 +1800,10 @@ func isCodedError(err error, code string) bool {
 }
 
 func (c *ICloudClient) call(ctx context.Context, session ICloudSession, method, path string, body any, result any) error {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok {
+		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
+	}
 	u, err := c.endpoint(session, path)
 	if err != nil {
 		return err
@@ -1217,7 +1833,11 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 		req.Header.Set("Cookie", cookie)
 	}
 
-	resp, err := c.client.Do(req)
+	httpClient, err := httpClientWithProxy(c.client, session.ProxyURL)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1227,7 +1847,10 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("icloud HTTP %d: %s", resp.StatusCode, trimForError(data))
+		if looksLikeHTML(data) {
+			return errCode("icloud_html_response", fmt.Sprintf("iCloud HTTP %d 返回了网页而不是接口结果", resp.StatusCode), true)
+		}
+		return errCode("icloud_http_error", fmt.Sprintf("iCloud HTTP %d", resp.StatusCode), true)
 	}
 	var envelope struct {
 		Success bool            `json:"success"`
@@ -1239,7 +1862,7 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 		Timestamp int64 `json:"timestamp"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return errCode("icloud_bad_response", "iCloud 返回无法解析；原始返回："+trimForError(data), true)
+		return errCode("icloud_bad_response", "iCloud 返回无法解析", true)
 	}
 	if !envelope.Success {
 		msg := "iCloud 接口返回失败"
@@ -1250,7 +1873,7 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 	}
 	if result != nil {
 		if err := json.Unmarshal(envelope.Result, result); err != nil {
-			return errCode("icloud_bad_result", "iCloud 结果无法解析；原始返回："+trimForError(envelope.Result), true)
+			return errCode("icloud_bad_result", "iCloud 结果无法解析", true)
 		}
 	}
 	return nil
@@ -1262,9 +1885,12 @@ func iCloudAPIError(message string) error {
 		message = "iCloud 接口返回失败"
 	}
 	if isICloudHMELimitMessage(message) {
-		return errCode("icloud_hme_limit", "iCloud 已达到当前隐私邮箱创建上限，请稍后再试；原始返回："+trimForError([]byte(message)), true)
+		return errCode("icloud_hme_limit", "iCloud 已达到当前隐私邮箱创建上限，请稍后再试", true)
 	}
-	return errCode("icloud_api_failed", message, true)
+	if isRemoteMailboxAlreadyInactive(errors.New(message)) || isICloudHMEAlreadyGoneMessage(message) {
+		return errCode("icloud_api_failed", "iCloud 接口返回失败："+message, true)
+	}
+	return errCode("icloud_api_failed", "iCloud 接口返回失败", true)
 }
 
 func isICloudHMELimitMessage(message string) bool {
@@ -1275,7 +1901,8 @@ func isICloudHMELimitMessage(message string) bool {
 }
 
 func (c *ICloudClient) SyncMailboxMessages(ctx context.Context, session ICloudSession, mailbox Mailbox, after time.Time, keyword string, maxThreads int) ([]ICloudSyncedMessage, error) {
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.DSID) == "" {
 		return nil, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	if strings.TrimSpace(mailbox.Email) == "" {
@@ -1321,7 +1948,8 @@ func (c *ICloudClient) SyncMailboxMessages(ctx context.Context, session ICloudSe
 }
 
 func (c *ICloudClient) SyncMailboxMessagesBatch(ctx context.Context, session ICloudSession, mailboxes []Mailbox, after time.Time, keyword string, maxThreads int) (map[string][]ICloudSyncedMessage, error) {
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.DSID) == "" {
 		return nil, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	if maxThreads <= 0 || maxThreads > 50 {
@@ -1421,7 +2049,8 @@ func looksLikeVerificationText(text, keyword string) bool {
 }
 
 func (c *ICloudClient) CheckMailSession(ctx context.Context, session ICloudSession) error {
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.DSID) == "" {
 		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	if _, err := mailGatewayBaseURL(session); err != nil {
@@ -1655,7 +2284,8 @@ func (c *ICloudClient) messageBody(ctx context.Context, session ICloudSession, f
 
 func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session ICloudSession, remoteIDs []string) (ICloudMailCleanupResult, error) {
 	var result ICloudMailCleanupResult
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.DSID) == "" {
 		return result, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	folders, err := c.mailFolders(ctx, session)
@@ -1705,7 +2335,8 @@ func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session IC
 }
 
 func (c *ICloudClient) EmptyTrash(ctx context.Context, session ICloudSession) (int, error) {
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok || strings.TrimSpace(session.DSID) == "" {
 		return 0, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
 	}
 	folders, err := c.mailFolders(ctx, session)
@@ -1995,6 +2626,10 @@ func chunkStrings(values []string, size int) [][]string {
 }
 
 func (c *ICloudClient) callMail(ctx context.Context, session ICloudSession, path string, body any, clientIntent string, result any) error {
+	var ok bool
+	if session, ok = iCloudWebSessionForClient(session); !ok {
+		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
+	}
 	base, err := mailGatewayBaseURL(session)
 	if err != nil {
 		return err
@@ -2031,7 +2666,11 @@ func (c *ICloudClient) callMail(ctx context.Context, session ICloudSession, path
 	if cookie := cookieHeader(session.Cookies, u); cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
-	resp, err := c.client.Do(req)
+	httpClient, err := httpClientWithProxy(c.client, session.ProxyURL)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -2041,7 +2680,7 @@ func (c *ICloudClient) callMail(ctx context.Context, session ICloudSession, path
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("icloud mail %s HTTP %d: %s", path, resp.StatusCode, trimForError(data))
+		return errCode("icloud_mail_http_error", fmt.Sprintf("iCloud 邮件接口 HTTP %d", resp.StatusCode), true)
 	}
 	if result != nil {
 		if err := json.Unmarshal(data, result); err != nil {
@@ -2060,7 +2699,13 @@ func (c *ICloudClient) endpointWithBase(session ICloudSession, baseURL, path str
 	if err != nil {
 		return "", err
 	}
-	rel := &url.URL{Path: strings.TrimLeft(path, "/")}
+	rel, err := url.Parse(strings.TrimLeft(path, "/"))
+	if err != nil {
+		return "", err
+	}
+	if rel.IsAbs() || rel.Host != "" {
+		return "", errCode("icloud_invalid_endpoint", "iCloud 接口路径无效", false)
+	}
 	u := base.ResolveReference(rel)
 	q := u.Query()
 	q.Set("clientBuildNumber", firstNonEmpty(session.ClientBuildNumber, "2622Build20"))

@@ -5,6 +5,7 @@ dist/
 编译临时/
 发布目录/
 *.exe
+panel
 *.dll
 *.so
 *.dylib

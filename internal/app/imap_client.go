@@ -14,7 +14,9 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net"
+	"net/http"
 	"net/mail"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +24,10 @@ import (
 )
 
 const (
-	defaultICloudIMAPHost = "imap.mail.me.com"
-	defaultICloudIMAPPort = 993
-	imapIdleReadTimeout   = 25 * time.Minute
+	defaultICloudIMAPHost     = "imap.mail.me.com"
+	defaultICloudIMAPPort     = 993
+	imapIdleReadTimeout       = 25 * time.Minute
+	imapProxyHandshakeTimeout = 15 * time.Second
 )
 
 var iCloudIMAPDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53", "127.0.0.53:53"}
@@ -58,9 +61,27 @@ func newICloudIMAPDialer(serverName string) tls.Dialer {
 }
 
 func dialICloudIMAPTLS(ctx context.Context, serverName string, port int) (net.Conn, error) {
+	return dialICloudIMAPTLSWithProxy(ctx, serverName, port, "")
+}
+
+func dialICloudIMAPTLSWithProxy(ctx context.Context, serverName string, port int, proxyURL string) (net.Conn, error) {
 	serverName = firstNonEmpty(strings.TrimSpace(serverName), defaultICloudIMAPHost)
 	if port <= 0 {
 		port = defaultICloudIMAPPort
+	}
+	if strings.TrimSpace(proxyURL) != "" {
+		normalized, err := normalizeProxyURL(proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		parsed, err := url.Parse(normalized)
+		if err != nil {
+			return nil, errCode("invalid_proxy_url", "代理地址格式不正确", false)
+		}
+		if isSOCKSProxy(parsed) {
+			return dialICloudIMAPTLSViaSOCKS(ctx, serverName, port, parsed)
+		}
+		return dialICloudIMAPTLSViaHTTPProxy(ctx, serverName, port, parsed)
 	}
 	var lastErr error
 	if strings.EqualFold(strings.TrimSuffix(serverName, "."), defaultICloudIMAPHost) {
@@ -91,6 +112,206 @@ func dialICloudIMAPTLS(ctx context.Context, serverName string, port int) (net.Co
 		return nil, fmt.Errorf("IMAP DNS-over-TCP 解析失败：%v；域名拨号失败：%w", lookupErr, err)
 	}
 	return nil, err
+}
+
+func dialICloudIMAPTLSViaProxy(ctx context.Context, serverName string, port int, proxyURL string) (net.Conn, error) {
+	return dialICloudIMAPTLSWithProxy(ctx, serverName, port, proxyURL)
+}
+
+func dialICloudIMAPTLSViaSOCKS(ctx context.Context, serverName string, port int, parsed *url.URL) (net.Conn, error) {
+	networkDialer, err := proxyNetworkDialer(parsed)
+	if err != nil {
+		return nil, err
+	}
+	target := net.JoinHostPort(serverName, strconv.Itoa(port))
+	conn, err := networkDialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		return nil, err
+	}
+	closeConn := true
+	defer func() {
+		if closeConn {
+			_ = conn.Close()
+		}
+	}()
+	if err := conn.SetDeadline(imapProxyDeadline(ctx)); err != nil {
+		return nil, err
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	closeConn = false
+	return tlsConn, nil
+}
+
+func imapProxyDeadline(ctx context.Context) time.Time {
+	handshakeDeadline := time.Now().Add(imapProxyHandshakeTimeout)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(handshakeDeadline) {
+		handshakeDeadline = deadline
+	}
+	return handshakeDeadline
+}
+
+func dialICloudIMAPTLSViaHTTPProxy(ctx context.Context, serverName string, port int, parsed *url.URL) (net.Conn, error) {
+	address := proxyDialAddress(parsed)
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	closeConn := true
+	defer func() {
+		if closeConn {
+			_ = conn.Close()
+		}
+	}()
+
+	baseConn := conn
+	handshakeDone := make(chan struct{})
+	var handshakeMu sync.Mutex
+	handshakeComplete := false
+	go func() {
+		select {
+		case <-ctx.Done():
+			handshakeMu.Lock()
+			if !handshakeComplete {
+				_ = baseConn.Close()
+			}
+			handshakeMu.Unlock()
+		case <-handshakeDone:
+		}
+	}()
+	defer func() {
+		handshakeMu.Lock()
+		handshakeComplete = true
+		handshakeMu.Unlock()
+		close(handshakeDone)
+	}()
+
+	if err := conn.SetDeadline(imapProxyDeadline(ctx)); err != nil {
+		return nil, err
+	}
+
+	if strings.EqualFold(parsed.Scheme, "https") {
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName: parsed.Hostname(),
+			MinVersion: tls.VersionTLS12,
+		})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
+	}
+
+	target := net.JoinHostPort(serverName, strconv.Itoa(port))
+	request := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
+	if parsed.User != nil {
+		username := parsed.User.Username()
+		password, _ := parsed.User.Password()
+		auth := username + ":" + password
+		request += "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(auth)) + "\r\n"
+	}
+	request += "\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		return nil, err
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		return nil, err
+	}
+	if response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("IMAP 代理 CONNECT 失败：HTTP %d", response.StatusCode)
+	}
+	conn, err = wrapHTTPConnectConn(conn, reader)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: serverName,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	closeConn = false
+	return tlsConn, nil
+}
+
+type prefixConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if c == nil || c.reader == nil {
+		return 0, net.ErrClosed
+	}
+	return c.reader.Read(p)
+}
+
+func wrapHTTPConnectConn(conn net.Conn, reader *bufio.Reader) (net.Conn, error) {
+	if conn == nil {
+		return nil, errors.New("IMAP 代理连接为空")
+	}
+	if reader == nil || reader.Buffered() == 0 {
+		return conn, nil
+	}
+	leftover := make([]byte, reader.Buffered())
+	if _, err := io.ReadFull(reader, leftover); err != nil {
+		return nil, err
+	}
+	return &prefixConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(leftover), conn)}, nil
+}
+
+func imapDialError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var coded codedError
+	if errors.As(err, &coded) {
+		return err
+	}
+	return errCode("imap_connect_failed", "连接 iCloud IMAP 失败，请检查网络、代理或稍后重试", true)
+}
+
+func proxyDialAddress(proxyURL *url.URL) string {
+	if proxyURL == nil {
+		return ""
+	}
+	host := proxyURL.Hostname()
+	port := proxyURL.Port()
+	if port == "" {
+		switch strings.ToLower(strings.TrimSpace(proxyURL.Scheme)) {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func dialICloudIMAPTLSIPs(ctx context.Context, serverName string, port int, ips []net.IP) (net.Conn, error) {
@@ -411,6 +632,10 @@ func dnsFallbackNetworks(network string) []string {
 }
 
 func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error {
+	return CheckICloudIMAPLoginWithProxy(ctx, email, appPassword, "")
+}
+
+func CheckICloudIMAPLoginWithProxy(ctx context.Context, email, appPassword, proxyURL string) error {
 	email = strings.TrimSpace(email)
 	appPassword = strings.TrimSpace(appPassword)
 	if email == "" {
@@ -422,9 +647,9 @@ func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error 
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
-	conn, err := dialICloudIMAPTLS(ctx, defaultICloudIMAPHost, defaultICloudIMAPPort)
+	conn, err := dialICloudIMAPTLSWithProxy(ctx, defaultICloudIMAPHost, defaultICloudIMAPPort, proxyURL)
 	if err != nil {
-		return errCode("imap_connect_failed", "连接 iCloud IMAP 失败："+err.Error(), true)
+		return imapDialError(err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(25 * time.Second))
@@ -432,7 +657,7 @@ func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败："+err.Error(), true)
+		return errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败，请稍后重试", true)
 	}
 	if !strings.Contains(strings.ToUpper(greeting), "OK") {
 		return errCode("imap_greeting_failed", "iCloud IMAP 未就绪："+imapResponseSummary([]string{greeting}), true)
@@ -440,7 +665,7 @@ func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error 
 
 	loginLines, err := imapCommand(conn, reader, "A001", "LOGIN "+imapQuote(email)+" "+imapQuote(appPassword))
 	if err != nil {
-		return errCode("imap_login_failed", "iCloud IMAP 登录请求失败："+err.Error(), true)
+		return errCode("imap_login_failed", "iCloud IMAP 登录请求失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(loginLines, "A001") {
 		return errCode("imap_login_failed", "iCloud IMAP 登录失败，请确认 iCloud 邮箱账号和 App 专用密码："+imapResponseSummary(loginLines), false)
@@ -448,7 +673,7 @@ func CheckICloudIMAPLogin(ctx context.Context, email, appPassword string) error 
 
 	selectLines, err := imapCommand(conn, reader, "A002", "SELECT INBOX")
 	if err != nil {
-		return errCode("imap_select_failed", "打开 iCloud 收件箱失败："+err.Error(), true)
+		return errCode("imap_select_failed", "打开 iCloud 收件箱失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(selectLines, "A002") {
 		return errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
@@ -465,9 +690,9 @@ func WatchICloudIMAPExists(ctx context.Context, state LoginState, onExists func(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	conn, err := dialICloudIMAPTLS(ctx, state.IMAPHost, state.IMAPPort)
+	conn, err := dialICloudIMAPTLSWithProxy(ctx, state.IMAPHost, state.IMAPPort, state.ProxyURL)
 	if err != nil {
-		return errCode("imap_connect_failed", "连接 iCloud IMAP 失败："+err.Error(), true)
+		return imapDialError(err)
 	}
 	defer conn.Close()
 	stopClose := make(chan struct{})
@@ -483,21 +708,21 @@ func WatchICloudIMAPExists(ctx context.Context, state LoginState, onExists func(
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败："+err.Error(), true)
+		return errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败，请稍后重试", true)
 	}
 	if !strings.Contains(strings.ToUpper(greeting), "OK") {
 		return errCode("imap_greeting_failed", "iCloud IMAP 未就绪："+imapResponseSummary([]string{greeting}), true)
 	}
 	loginLines, err := imapCommand(conn, reader, "A001", "LOGIN "+imapQuote(state.IMAPUsername)+" "+imapQuote(state.IMAPAppPassword))
 	if err != nil {
-		return errCode("imap_login_failed", "iCloud IMAP 登录请求失败："+err.Error(), true)
+		return errCode("imap_login_failed", "iCloud IMAP 登录请求失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(loginLines, "A001") {
 		return errCode("imap_login_failed", "iCloud IMAP 登录失败，请确认 iCloud 邮箱账号和 App 专用密码："+imapResponseSummary(loginLines), false)
 	}
 	selectLines, err := imapCommand(conn, reader, "A002", "SELECT INBOX")
 	if err != nil {
-		return errCode("imap_select_failed", "打开 iCloud 收件箱失败："+err.Error(), true)
+		return errCode("imap_select_failed", "打开 iCloud 收件箱失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(selectLines, "A002") {
 		return errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
@@ -620,8 +845,10 @@ func imapQuote(value string) string {
 }
 
 func imapResponseSummary(lines []string) string {
-	joined := strings.Join(lines, "；")
-	return trimForError([]byte(joined))
+	if len(lines) == 0 {
+		return "远端 IMAP 返回为空"
+	}
+	return "远端 IMAP 返回未就绪"
 }
 
 func SyncICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []Mailbox, after time.Time, keyword string, maxMessages int) (map[string][]ICloudSyncedMessage, error) {
@@ -639,9 +866,9 @@ func LatestICloudIMAPUID(ctx context.Context, state LoginState) (string, error) 
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	conn, err := dialICloudIMAPTLS(ctx, state.IMAPHost, state.IMAPPort)
+	conn, err := dialICloudIMAPTLSWithProxy(ctx, state.IMAPHost, state.IMAPPort, state.ProxyURL)
 	if err != nil {
-		return "", errCode("imap_connect_failed", "连接 iCloud IMAP 失败："+err.Error(), true)
+		return "", imapDialError(err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -649,21 +876,21 @@ func LatestICloudIMAPUID(ctx context.Context, state LoginState) (string, error) 
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return "", errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败："+err.Error(), true)
+		return "", errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败，请稍后重试", true)
 	}
 	if !strings.Contains(strings.ToUpper(greeting), "OK") {
 		return "", errCode("imap_greeting_failed", "iCloud IMAP 未就绪："+imapResponseSummary([]string{greeting}), true)
 	}
 	loginLines, err := imapCommand(conn, reader, "A001", "LOGIN "+imapQuote(state.IMAPUsername)+" "+imapQuote(state.IMAPAppPassword))
 	if err != nil {
-		return "", errCode("imap_login_failed", "iCloud IMAP 登录请求失败："+err.Error(), true)
+		return "", errCode("imap_login_failed", "iCloud IMAP 登录请求失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(loginLines, "A001") {
 		return "", errCode("imap_login_failed", "iCloud IMAP 登录失败，请确认 iCloud 邮箱账号和 App 专用密码："+imapResponseSummary(loginLines), false)
 	}
 	selectLines, err := imapCommand(conn, reader, "A002", "SELECT INBOX")
 	if err != nil {
-		return "", errCode("imap_select_failed", "打开 iCloud 收件箱失败："+err.Error(), true)
+		return "", errCode("imap_select_failed", "打开 iCloud 收件箱失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(selectLines, "A002") {
 		return "", errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
@@ -696,9 +923,9 @@ func SyncICloudIMAPMessagesWithCursor(ctx context.Context, state LoginState, mai
 
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	conn, err := dialICloudIMAPTLS(ctx, state.IMAPHost, state.IMAPPort)
+	conn, err := dialICloudIMAPTLSWithProxy(ctx, state.IMAPHost, state.IMAPPort, state.ProxyURL)
 	if err != nil {
-		return iCloudIMAPSyncResult{}, errCode("imap_connect_failed", "连接 iCloud IMAP 失败："+err.Error(), true)
+		return iCloudIMAPSyncResult{}, imapDialError(err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
@@ -706,28 +933,28 @@ func SyncICloudIMAPMessagesWithCursor(ctx context.Context, state LoginState, mai
 	reader := bufio.NewReader(conn)
 	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return iCloudIMAPSyncResult{}, errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败："+err.Error(), true)
+		return iCloudIMAPSyncResult{}, errCode("imap_greeting_failed", "读取 iCloud IMAP 欢迎信息失败，请稍后重试", true)
 	}
 	if !strings.Contains(strings.ToUpper(greeting), "OK") {
 		return iCloudIMAPSyncResult{}, errCode("imap_greeting_failed", "iCloud IMAP 未就绪："+imapResponseSummary([]string{greeting}), true)
 	}
 	loginLines, err := imapCommand(conn, reader, "A001", "LOGIN "+imapQuote(state.IMAPUsername)+" "+imapQuote(state.IMAPAppPassword))
 	if err != nil {
-		return iCloudIMAPSyncResult{}, errCode("imap_login_failed", "iCloud IMAP 登录请求失败："+err.Error(), true)
+		return iCloudIMAPSyncResult{}, errCode("imap_login_failed", "iCloud IMAP 登录请求失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(loginLines, "A001") {
 		return iCloudIMAPSyncResult{}, errCode("imap_login_failed", "iCloud IMAP 登录失败，请确认 iCloud 邮箱账号和 App 专用密码："+imapResponseSummary(loginLines), false)
 	}
 	selectLines, err := imapCommand(conn, reader, "A002", "SELECT INBOX")
 	if err != nil {
-		return iCloudIMAPSyncResult{}, errCode("imap_select_failed", "打开 iCloud 收件箱失败："+err.Error(), true)
+		return iCloudIMAPSyncResult{}, errCode("imap_select_failed", "打开 iCloud 收件箱失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(selectLines, "A002") {
 		return iCloudIMAPSyncResult{}, errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
 	}
 	searchLines, err := imapCommand(conn, reader, "A003", imapSearchCommand(state, mailboxes, after))
 	if err != nil {
-		return iCloudIMAPSyncResult{}, errCode("imap_search_failed", "搜索 iCloud IMAP 邮件失败："+err.Error(), true)
+		return iCloudIMAPSyncResult{}, errCode("imap_search_failed", "搜索 iCloud IMAP 邮件失败，请稍后重试", true)
 	}
 	if !imapTaggedOK(searchLines, "A003") {
 		return iCloudIMAPSyncResult{}, errCode("imap_search_failed", "搜索 iCloud IMAP 邮件失败："+imapResponseSummary(searchLines), true)
@@ -738,7 +965,7 @@ func SyncICloudIMAPMessagesWithCursor(ctx context.Context, state LoginState, mai
 		return iCloudIMAPSyncResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}}, nil
 	}
 	sortInts(uids)
-	uids = lastIntValues(uids, maxMessages)
+	uids = firstIntValues(uids, maxMessages)
 	lastUID := ""
 	if len(uids) > 0 {
 		lastUID = strconv.Itoa(uids[len(uids)-1])
@@ -750,7 +977,7 @@ func SyncICloudIMAPMessagesWithCursor(ctx context.Context, state LoginState, mai
 		tag++
 		lines, literals, err := imapCommandWithLiterals(conn, reader, fmt.Sprintf("A%03d", tag), "UID FETCH "+imapUIDSet(chunk)+" (UID BODY.PEEK[]<0.200000>)")
 		if err != nil {
-			return iCloudIMAPSyncResult{}, errCode("imap_fetch_failed", "读取 iCloud IMAP 邮件失败："+err.Error(), true)
+			return iCloudIMAPSyncResult{}, errCode("imap_fetch_failed", "读取 iCloud IMAP 邮件失败，请稍后重试", true)
 		}
 		if !imapTaggedOK(lines, fmt.Sprintf("A%03d", tag)) {
 			return iCloudIMAPSyncResult{}, errCode("imap_fetch_failed", "读取 iCloud IMAP 邮件失败："+imapResponseSummary(lines), true)
@@ -992,11 +1219,11 @@ func sortInts(values []int) {
 	}
 }
 
-func lastIntValues(values []int, limit int) []int {
+func firstIntValues(values []int, limit int) []int {
 	if limit <= 0 || len(values) <= limit {
 		return values
 	}
-	return values[len(values)-limit:]
+	return values[:limit]
 }
 
 func chunkInts(values []int, size int) [][]int {

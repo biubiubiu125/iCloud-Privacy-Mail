@@ -1,0 +1,114 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify release tag is reusable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "published release already exists for $RELEASE_TAG; create a new tag instead" >&2
+              exit 1
+            fi
+            echo "Release $RELEASE_TAG is an existing draft and may be rebuilt"
+          else
+            echo "Release $RELEASE_TAG does not exist yet"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify Go source
+        run: |
+          set -euo pipefail
+          go test -count=1 ./...
+          go vet ./...
+          go build ./...
+
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APP_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          build() {
+            local goos="$1"
+            local goarch="$2"
+            local asset_name="$3"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
+              -trimpath \
+              -ldflags="-s -w -X icloud-privacy-mail/internal/app.AppVersion=${RELEASE_TAG} -X icloud-privacy-mail/internal/app.AppCommit=${GITHUB_SHA} -X icloud-privacy-mail/internal/app.AppBuiltAt=${APP_BUILT_AT}" \
+              -o "dist/${asset_name}" ./cmd/panel
+          }
+          build linux amd64 icloud-privacy-mail_linux_amd64
+          build linux arm64 icloud-privacy-mail_linux_arm64
+          build windows amd64 icloud-privacy-mail_windows_amd64.exe
+          sha256sum dist/* > dist/SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              echo "published release already exists for $RELEASE_TAG; create a new tag instead" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')"
+          if [ "$is_draft" != "true" ]; then
+            echo "release $RELEASE_TAG is no longer a draft; refusing to overwrite published assets" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "$RELEASE_TAG" --json isDraft -q '.isDraft')"
+          if [ "$is_draft" != "true" ]; then
+            echo "release $RELEASE_TAG is already published; refusing to change it" >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false

@@ -451,6 +451,9 @@ func TestPublicSessionSeparatesLoginStateKinds(t *testing.T) {
 	if !appleOnly.AppleAccountLoginSaved || !appleOnly.AppleAccountManageReady {
 		t.Fatalf("apple account state not exposed: %+v", appleOnly)
 	}
+	if !appleOnly.ProviderConfigured {
+		t.Fatalf("apple account manage state should expose provider as configured: %+v", appleOnly)
+	}
 	if appleOnly.ICloudWebLoginSaved || appleOnly.NeedsManualLogin {
 		t.Fatalf("apple-only state mixed with iCloud web: %+v", appleOnly)
 	}
@@ -471,6 +474,21 @@ func TestPublicSessionSeparatesLoginStateKinds(t *testing.T) {
 	}
 	if icloudOnly.AppleAccountNextRefreshAt != "" || icloudOnly.AppleAccountManageExpiresAt != "" {
 		t.Fatalf("icloud-only state should not expose apple account refresh time: %+v", icloudOnly)
+	}
+}
+
+func TestPublicSessionCountsNestedICloudWebCookies(t *testing.T) {
+	got := publicSession(&ICloudSession{
+		LoginStates: []LoginState{{
+			Kind: LoginStateICloudWeb,
+			Cookies: []SessionCookie{
+				{Name: "session", Value: "cookie-value"},
+				{Name: "x-apple-id-session-id", Value: "session-id"},
+			},
+		}},
+	})
+	if got.CookieCount != 2 {
+		t.Fatalf("nested iCloud web CookieCount = %d, want 2", got.CookieCount)
 	}
 }
 
@@ -586,6 +604,544 @@ func TestAppleAccountKeepAliveRoundSavesUpdatedState(t *testing.T) {
 	}
 }
 
+func TestAppleAccountKeepAliveWaitsForMailboxAccountOperation(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-gate"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAlive gate", "keepalive-gate@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "keepalive-gate@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:          LoginStateAppleAccount,
+			Scnt:          "old-scnt",
+			APIKey:        "old-key",
+			LastCheckedAt: time.Now().Add(-time.Hour),
+			LastCheckOK:   true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger()).(*Server)
+	entered := make(chan struct{})
+	handler.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		close(entered)
+		return state, nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(context.Background(), mailboxAccountOperationKey(ownerID, account.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		handler.keepAliveAppleAccountRound(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+		releaseAccountOperation()
+		t.Fatal("Apple Account keepalive ran while the mailbox account operation was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAccountOperation()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("Apple Account keepalive did not resume after the mailbox account operation was released")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Apple Account keepalive round did not finish")
+	}
+}
+
+func TestAppleAccountKeepAliveUsesSessionStateAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-fresh"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAlive fresh", "keepalive-fresh@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   account.AppleID,
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:          LoginStateAppleAccount,
+			Scnt:          "stale-scnt",
+			APIKey:        "stale-key",
+			LastCheckedAt: time.Now().Add(-time.Hour),
+			LastCheckOK:   true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger()).(*Server)
+	seen := make(chan string, 1)
+	handler.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		seen <- state.APIKey
+		return state, nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, account.ID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		handler.keepAliveAppleAccountRound(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-seen:
+		releaseAccountOperation()
+		t.Fatal("keepalive provider ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.LoginStates[0].Scnt = "fresh-scnt"
+	fresh.LoginStates[0].APIKey = "fresh-key"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seen:
+		if got != "fresh-key" {
+			t.Fatalf("keepalive provider API key = %q, want fresh-key", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("keepalive provider was not called")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive round did not finish")
+	}
+}
+
+func TestICloudSessionCheckWaitsForMailboxAccountOperation(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := ""
+	account, err := store.AddAccountForOwner(ownerID, "Session check gate", "session-check-gate@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "session-check-gate@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:              LoginStateICloudIMAP,
+			IMAPEmail:         "session-check-gate@example.com",
+			IMAPAppPassword:   "app-password",
+			IMAPHost:          defaultICloudIMAPHost,
+			IMAPPort:          defaultICloudIMAPPort,
+			LastCheckedAt:     time.Now().Add(-time.Hour),
+			LastCheckOK:       true,
+			LastStatusMessage: "取码登录正常",
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	entered := make(chan struct{})
+	check := func(ctx context.Context, email, appPassword string) error {
+		close(entered)
+		return nil
+	}
+	handler.checkIMAPLogin = check
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		return check(ctx, email, appPassword)
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(context.Background(), mailboxAccountOperationKey(ownerID, account.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/session/check", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCheckICloudSession(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+		releaseAccountOperation()
+		t.Fatal("iCloud session check ran while the mailbox account operation was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAccountOperation()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud session check did not resume after the mailbox account operation was released")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud session check did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("iCloud session check status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestICloudSessionCheckUsesSessionAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := ""
+	account, err := store.AddAccountForOwnerWithProxy(ownerID, "Session check fresh", "session-check-fresh@example.com", "", "http://proxy-old:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := testIMAPSession(ownerID, account.ID, account.AppleID)
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenProxy := make(chan string, 1)
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		seenProxy <- proxyURL
+		return nil
+	}
+	handler.checkIMAPLogin = func(ctx context.Context, email, appPassword string) error {
+		t.Fatal("proxy-aware IMAP checker should be used")
+		return nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, account.ID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/session/check", strings.NewReader(
+		fmt.Sprintf(`{"account_id":%q}`, account.ID),
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCheckICloudSession(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-seenProxy:
+		releaseAccountOperation()
+		t.Fatal("iCloud session check ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := store.UpdateAccountProxyForOwner(ownerID, account.ID, "http://proxy-fresh:8080"); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seenProxy:
+		if got != "http://proxy-fresh:8080" {
+			t.Fatalf("session check proxy = %q, want fresh proxy", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session check did not call the IMAP checker")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("session check did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("session check status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestICloudIMAPLoginCheckWaitsForMailboxAccountOperation(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := ""
+	account, err := store.AddAccountForOwner(ownerID, "IMAP check gate", "imap-check-gate@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		AccountID: account.ID,
+		AppleID:   "imap-check-gate@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:              LoginStateICloudIMAP,
+			IMAPEmail:         "imap-check-gate@example.com",
+			IMAPAppPassword:   "app-password",
+			IMAPHost:          defaultICloudIMAPHost,
+			IMAPPort:          defaultICloudIMAPPort,
+			LastCheckedAt:     time.Now().Add(-time.Hour),
+			LastCheckOK:       true,
+			LastStatusMessage: "取码登录正常",
+		}},
+	}
+	if err := store.SaveICloudSession(session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	entered := make(chan struct{})
+	check := func(ctx context.Context, email, appPassword string) error {
+		close(entered)
+		return nil
+	}
+	handler.checkIMAPLogin = check
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		return check(ctx, email, appPassword)
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(context.Background(), mailboxAccountOperationKey(ownerID, account.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/check", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCheckICloudIMAPLogin(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+		releaseAccountOperation()
+		t.Fatal("iCloud IMAP login check ran while the mailbox account operation was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAccountOperation()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud IMAP login check did not resume after the mailbox account operation was released")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud IMAP login check did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("iCloud IMAP login check status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestICloudIMAPLoginCheckUsesSessionAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := ""
+	account, err := store.AddAccountForOwnerWithProxy(ownerID, "IMAP check fresh", "imap-check-fresh@example.com", "", "http://proxy-old:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := testIMAPSession(ownerID, account.ID, account.AppleID)
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenProxy := make(chan string, 1)
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		seenProxy <- proxyURL
+		return nil
+	}
+	handler.checkIMAPLogin = func(ctx context.Context, email, appPassword string) error {
+		t.Fatal("proxy-aware IMAP checker should be used")
+		return nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, account.ID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/check", strings.NewReader(
+		fmt.Sprintf(`{"account_id":%q}`, account.ID),
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCheckICloudIMAPLogin(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-seenProxy:
+		releaseAccountOperation()
+		t.Fatal("IMAP login check ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := store.UpdateAccountProxyForOwner(ownerID, account.ID, "http://proxy-fresh:8080"); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seenProxy:
+		if got != "http://proxy-fresh:8080" {
+			t.Fatalf("IMAP login check proxy = %q, want fresh proxy", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP login check did not call the checker")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("IMAP login check did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("IMAP login check status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSaveICloudIMAPLoginWaitsForMailboxAccountOperation(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-imap-save-gate"
+	account, err := store.AddAccountForOwner(ownerID, "IMAP save gate", "imap-save-gate@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	entered := make(chan struct{})
+	handler.checkIMAPLogin = func(ctx context.Context, email, appPassword string) error {
+		close(entered)
+		return nil
+	}
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		return handler.checkIMAPLogin(ctx, email, appPassword)
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(context.Background(), mailboxAccountOperationKey(ownerID, account.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(
+		`{"account_id":"`+account.ID+`","email":"imap-save-gate@example.com","app_password":"app-password"}`,
+	))
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleSaveICloudIMAPLogin(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-entered:
+		releaseAccountOperation()
+		t.Fatal("iCloud IMAP login save ran while the mailbox account operation was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAccountOperation()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud IMAP login save did not resume after the mailbox account operation was released")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("iCloud IMAP login save did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("iCloud IMAP login save status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSaveICloudIMAPLoginUsesAccountProxyAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := ""
+	account, err := store.AddAccountForOwnerWithProxy(ownerID, "IMAP save fresh", "imap-save-fresh@example.com", "", "http://proxy-old:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenProxy := make(chan string, 1)
+	handler.checkIMAPLoginWithProxy = func(ctx context.Context, email, appPassword, proxyURL string) error {
+		seenProxy <- proxyURL
+		return nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, account.ID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(
+		fmt.Sprintf(`{"account_id":%q,"email":%q,"app_password":"app-password"}`, account.ID, account.AppleID),
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleSaveICloudIMAPLogin(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-seenProxy:
+		releaseAccountOperation()
+		t.Fatal("IMAP login save ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := store.UpdateAccountProxyForOwner(ownerID, account.ID, "http://proxy-fresh:8080"); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seenProxy:
+		if got != "http://proxy-fresh:8080" {
+			t.Fatalf("IMAP login save proxy = %q, want fresh proxy", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP login save did not call the checker")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("IMAP login save did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("IMAP login save status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestAppleAccountKeepAliveRoundSkipsFailedLoginState(t *testing.T) {
 	store := newTestStore(t)
 	ownerID := "owner-keepalive-failed"
@@ -669,6 +1225,25 @@ func TestPublicViewsExposeFullAppleID(t *testing.T) {
 	}
 }
 
+func TestPublicMailboxClearsAPIActiveAfterRemoteDeleteSucceeded(t *testing.T) {
+	server := &Server{cfg: Config{PublicBaseURL: "https://mail.example"}, logger: discardLogger()}
+	got := server.publicMailbox(httptest.NewRequest(http.MethodGet, "https://panel.example/", nil), Mailbox{
+		ID:                 "mailbox-1",
+		Email:              "alias@icloud.com",
+		APIToken:           "secret-token",
+		APIActive:          true,
+		ICloudActive:       false,
+		Status:             StatusDisabled,
+		RemoteDeleteStatus: "succeeded",
+	})
+	if got.APIActive {
+		t.Fatalf("public mailbox APIActive = true after remote delete succeeded, want false")
+	}
+	if got.RemoteDeleteStatus != "succeeded" {
+		t.Fatalf("public mailbox remote delete status = %q, want succeeded", got.RemoteDeleteStatus)
+	}
+}
+
 func TestStatusReturnsOwnerICloudSessionForAdminUser(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{}, store, discardLogger())
@@ -685,22 +1260,72 @@ func TestStatusReturnsOwnerICloudSessionForAdminUser(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	_, peerUser := registerTestUser(t, handler, "status-peer", "user123")
+	peerAccount, err := store.AddAccountForOwner(peerUser.ID, "Peer account", "peer@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSessionForOwner(peerUser.ID, ICloudSession{
+		SavedAt:       time.Now(),
+		AppleID:       peerAccount.AppleID,
+		AccountID:     peerAccount.ID,
+		IsICloudPlus:  true,
+		CanCreateHME:  true,
+		Cookies:       []SessionCookie{{Name: "session", Value: "peer", Domain: ".icloud.com.cn", Path: "/"}},
+		LastCheckOK:   true,
+		LastCheckedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	var body struct {
-		ICloudSession publicICloudSession `json:"icloud_session"`
+		ICloudSession  publicICloudSession   `json:"icloud_session"`
+		ICloudSessions []publicICloudSession `json:"icloud_sessions"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
 	if !body.ICloudSession.Saved || body.ICloudSession.CookieCount != 1 || !body.ICloudSession.ProviderConfigured {
 		t.Fatalf("icloud session = %+v, want saved owner session", body.ICloudSession)
+	}
+	adminSessionID := body.ICloudSession.AccountID
+	if strings.TrimSpace(adminSessionID) == "" {
+		t.Fatalf("admin status session has no account id: %+v", body.ICloudSession)
+	}
+	if len(body.ICloudSessions) != 1 || body.ICloudSessions[0].AccountID != adminSessionID {
+		t.Fatalf("home status sessions = %+v, want only admin session", body.ICloudSessions)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/status?owner_id=all", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("all-owner status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.ICloudSessions) != 2 {
+		t.Fatalf("all-owner status sessions = %+v, want both admin and peer sessions", body.ICloudSessions)
+	}
+	seen := map[string]struct{}{}
+	for _, session := range body.ICloudSessions {
+		seen[session.AccountID] = struct{}{}
+	}
+	for _, want := range []string{adminSessionID, peerAccount.ID} {
+		if _, ok := seen[want]; !ok {
+			t.Fatalf("all-owner status sessions = %+v, missing %q", body.ICloudSessions, want)
+		}
 	}
 }
 
@@ -713,12 +1338,15 @@ func TestICloudCreateLimitErrorIsClassified(t *testing.T) {
 	if coded.code != "icloud_hme_limit" || !coded.retryable {
 		t.Fatalf("coded error = %+v, want icloud_hme_limit retryable", coded)
 	}
-	if !strings.Contains(err.Error(), "原始返回：You have reached the limit") {
-		t.Fatalf("error = %q, want raw limit message", err.Error())
+	if !strings.Contains(err.Error(), "已达到当前隐私邮箱创建上限") {
+		t.Fatalf("error = %q, want sanitized limit message", err.Error())
+	}
+	if strings.Contains(err.Error(), "You have reached the limit") {
+		t.Fatalf("error leaked provider response: %q", err.Error())
 	}
 }
 
-func TestAppleAccountAPIErrorIncludesStageHTTPAndRawBody(t *testing.T) {
+func TestAppleAccountAPIErrorIncludesStageHTTPWithoutRawBody(t *testing.T) {
 	err := appleAccountAPIError(http.StatusNotFound, []byte("<html><body>not found</body></html>"), "生成候选隐私邮箱")
 	coded, ok := err.(codedError)
 	if !ok {
@@ -728,14 +1356,17 @@ func TestAppleAccountAPIErrorIncludesStageHTTPAndRawBody(t *testing.T) {
 		t.Fatalf("coded error = %+v, want apple_account_api_failed retryable", coded)
 	}
 	message := err.Error()
-	for _, want := range []string{"阶段：生成候选隐私邮箱", "HTTP 404", "<html><body>not found</body></html>"} {
+	for _, want := range []string{"阶段：生成候选隐私邮箱", "HTTP 404"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("error = %q, want %q", message, want)
 		}
 	}
+	if strings.Contains(message, "<html><body>not found</body></html>") {
+		t.Fatalf("error leaked provider response: %q", message)
+	}
 }
 
-func TestICloudClientAppleAccountGenerateEmptyIncludesRawBody(t *testing.T) {
+func TestICloudClientAppleAccountGenerateEmptyOmitsRawBody(t *testing.T) {
 	oldBaseURL := appleAccountManageBaseURL
 	defer func() { appleAccountManageBaseURL = oldBaseURL }()
 
@@ -770,7 +1401,13 @@ func TestICloudClientAppleAccountGenerateEmptyIncludesRawBody(t *testing.T) {
 		t.Fatalf("error = %#v, want apple_account_generate_empty", err)
 	}
 	message := err.Error()
-	for _, want := range []string{"阶段：生成候选隐私邮箱", `原始返回：{"unexpected":true}`} {
+	if !strings.Contains(message, "阶段：生成候选隐私邮箱") {
+		t.Fatalf("error = %q, want stage", message)
+	}
+	if strings.Contains(message, `{"unexpected":true}`) {
+		t.Fatalf("error leaked provider response: %q", message)
+	}
+	for _, want := range []string{"阶段：生成候选隐私邮箱"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("error = %q, want %q", message, want)
 		}
@@ -1868,17 +2505,44 @@ func TestAppleAuthClientAuthSRPUsesPreservedAppleAccountHashcashAndBrowserBody(t
 }
 
 func TestAppleAccountFallbackPhoneNumber(t *testing.T) {
-	if got := string(appleAccountFallbackPhoneNumber(nil)); got != `{"id":1,"nonFTEU":true}` {
-		t.Fatalf("nil fallback = %s", got)
+	if got := appleAccountFallbackPhoneNumber(nil); len(got) != 0 {
+		t.Fatalf("nil fallback = %s, want empty", got)
 	}
-	if got := string(appleAccountFallbackPhoneNumber(json.RawMessage(`null`))); got != `{"id":1,"nonFTEU":true}` {
-		t.Fatalf("null fallback = %s", got)
+	if got := appleAccountFallbackPhoneNumber(json.RawMessage(`null`)); len(got) != 0 {
+		t.Fatalf("null fallback = %s, want empty", got)
 	}
 	if got := string(appleAccountFallbackPhoneNumber(nil, json.RawMessage(`{"id":3}`))); got != `{"id":3}` {
 		t.Fatalf("stored fallback = %s", got)
 	}
 	if got := string(appleAccountFallbackPhoneNumber(json.RawMessage(`{"id":2}`))); got != `{"id":2}` {
 		t.Fatalf("explicit phone = %s", got)
+	}
+}
+
+func TestAppleAuthClientRejectsSMS2FAWithoutPhoneIdentity(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	session := &appleAuthSession{
+		Endpoints: appleAuthEndpoints{
+			Home: "https://account.apple.com",
+			Auth: ts.URL,
+		},
+		ClientID:  appleAccountManageOAuthClientID,
+		FrameID:   "unit",
+		UserAgent: appleAccountManageUserAgent,
+	}
+	client := &AppleAuthClient{httpClient: ts.Client()}
+	err := client.requestPhoneSecurityCode(t.Context(), session, nil)
+	if !isCodedError(err, "invalid_phone_number_payload") {
+		t.Fatalf("requestPhoneSecurityCode error = %#v, want invalid_phone_number_payload", err)
+	}
+	if called {
+		t.Fatal("requestPhoneSecurityCode sent a request without a trusted phone identity")
 	}
 }
 
@@ -2151,6 +2815,44 @@ func TestSubmitAppleAccountManage2FAUsesPhoneMethod(t *testing.T) {
 	}
 }
 
+func TestSubmitAppleAccountManage2FARejectsTrustFailure(t *testing.T) {
+	var trustCalls int
+	authTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /verify/trusteddevice/securitycode":
+			w.WriteHeader(http.StatusNoContent)
+		case "GET /2sv/trust":
+			trustCalls++
+			http.Error(w, "trust failed", http.StatusForbidden)
+		default:
+			t.Fatalf("unexpected auth request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer authTS.Close()
+
+	session := &appleAuthSession{
+		Endpoints: appleAuthEndpoints{
+			Home: "https://account.apple.com",
+			Auth: authTS.URL,
+			Host: "appleid.apple.com",
+		},
+		AppleID:   "trust-failure@example.com",
+		ClientID:  appleAccountManageOAuthClientID,
+		FrameID:   "unit",
+		UserAgent: appleAccountManageUserAgent,
+		Scnt:      "scnt",
+		SessionID: "session",
+	}
+	client := &AppleAuthClient{httpClient: authTS.Client()}
+	_, err := client.SubmitAppleAccountManage2FA(t.Context(), appleAuthPending{Session: session}, "123456", nil)
+	if err == nil {
+		t.Fatal("SubmitAppleAccountManage2FA succeeded after trust failure")
+	}
+	if trustCalls == 0 {
+		t.Fatal("trust endpoint was not called")
+	}
+}
+
 func TestAppleAuthClientValidatePhoneCodeUsesStoredPhoneNumber(t *testing.T) {
 	var body map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2303,7 +3005,7 @@ func TestICloudClientListPrivacyMailboxes(t *testing.T) {
 				"forwardToEmails": ["main@example.com"],
 				"hmeEmails": [
 					{"anonymousId":"a1","hme":"Phone.Created@iCloud.com","label":"PHONE","isActive":true,"forwardToEmail":"main@example.com","origin":"ON_DEMAND"},
-					{"anonymousId":"a2","hme":"old@icloud.com","isActive":false,"origin":"MAIL"}
+					{"id":"a2","hme":"old@icloud.com","isActive":false,"origin":"MAIL"}
 				]
 			}
 		}`))
@@ -2329,11 +3031,117 @@ func TestICloudClientListPrivacyMailboxes(t *testing.T) {
 	if len(remotes) != 2 {
 		t.Fatalf("remotes len = %d, want 2", len(remotes))
 	}
-	if remotes[0].Email != "phone.created@icloud.com" || remotes[0].Label != "PHONE" || !remotes[0].IsActive {
+	if remotes[0].Email != "phone.created@icloud.com" || remotes[0].Label != "PHONE" || !remotes[0].IsActive || remotes[0].Origin != "ICLOUD_WEB" {
 		t.Fatalf("first remote = %+v", remotes[0])
 	}
-	if remotes[1].Email != "old@icloud.com" || remotes[1].IsActive {
+	if remotes[1].Email != "old@icloud.com" || remotes[1].AnonymousID != "a2" || remotes[1].IsActive || remotes[1].Origin != "ICLOUD_WEB" {
 		t.Fatalf("second remote = %+v", remotes[1])
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesPaginatesICloudWeb(t *testing.T) {
+	var cursors []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("request = %s %s, want GET /v2/hme/list", r.Method, r.URL.Path)
+		}
+		cursors = append(cursors, r.URL.Query().Get("cursor"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [{"anonymousId":"web-page-1","hme":"web-page-1@icloud.com"}],
+					"hasMore": true,
+					"nextCursor": "web-cursor-2"
+				}
+			}`))
+		case "web-cursor-2":
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [{"anonymousId":"web-page-2","hme":"web-page-2@icloud.com"}]
+				}
+			}`))
+		default:
+			t.Fatalf("unexpected cursor %q", r.URL.Query().Get("cursor"))
+		}
+	}))
+	defer ts.Close()
+
+	remotes, err := (&ICloudClient{client: ts.Client()}).ListPrivacyMailboxes(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "web-dsid",
+		ClientID:           "web-client",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "cookie", Domain: "127.0.0.1", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cursors, []string{"", "web-cursor-2"}) {
+		t.Fatalf("cursor sequence = %#v, want initial and next cursor", cursors)
+	}
+	if len(remotes) != 2 || remotes[0].AnonymousID != "web-page-1" || remotes[1].AnonymousID != "web-page-2" {
+		t.Fatalf("remotes = %+v, want both pages", remotes)
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesPaginatesAppleAccount(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var cursors []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/account/manage/email/private" {
+			t.Fatalf("request = %s %s, want GET /account/manage/email/private", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("X-Apple-Api-Key") != "apple-api-key" {
+			t.Fatalf("api key = %q, want apple-api-key", r.Header.Get("X-Apple-Api-Key"))
+		}
+		cursors = append(cursors, r.URL.Query().Get("cursor"))
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = w.Write([]byte(`{
+				"result": {
+					"hmeEmails": [{"id":"apple-page-1","emailAddress":"apple-page-1@icloud.com"}],
+					"hasMore": true,
+					"nextCursor": "apple-cursor-2"
+				}
+			}`))
+		case "apple-cursor-2":
+			_, _ = w.Write([]byte(`{
+				"result": {
+					"hmeEmails": [{"id":"apple-page-2","emailAddress":"apple-page-2@icloud.com"}]
+				}
+			}`))
+		default:
+			t.Fatalf("unexpected cursor %q", r.URL.Query().Get("cursor"))
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	remotes, err := (&ICloudClient{client: ts.Client()}).ListPrivacyMailboxes(t.Context(), ICloudSession{
+		AppleID: "apple-pagination@example.com",
+		LoginStates: []LoginState{{
+			Kind:    LoginStateAppleAccount,
+			Host:    "appleid.apple.com",
+			Scnt:    "scnt",
+			APIKey:  "apple-api-key",
+			Cookies: []SessionCookie{{Name: "session", Value: "cookie", Domain: "127.0.0.1", Path: "/"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cursors, []string{"", "apple-cursor-2"}) {
+		t.Fatalf("cursor sequence = %#v, want initial and next cursor", cursors)
+	}
+	if len(remotes) != 2 || remotes[0].AnonymousID != "apple-page-1" || remotes[1].AnonymousID != "apple-page-2" {
+		t.Fatalf("remotes = %+v, want both pages", remotes)
 	}
 }
 
@@ -2372,6 +3180,324 @@ func TestICloudClientListPrivacyMailboxesRetriesEOF(t *testing.T) {
 	}
 	if len(remotes) != 1 || remotes[0].Email != "retry.ok@icloud.com" {
 		t.Fatalf("remotes = %+v", remotes)
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesDefaultsMissingActiveToTrue(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"a1","hme":"missing-active@icloud.com"}
+				]
+			}
+		}`))
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	remotes, err := client.ListPrivacyMailboxes(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotes) != 1 || !remotes[0].IsActive {
+		t.Fatalf("remotes = %+v, want one active mailbox when isActive is omitted", remotes)
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesAcceptsActiveField(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"a1","hme":"inactive-active-field@icloud.com","active":false}
+				]
+			}
+		}`))
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	remotes, err := client.ListPrivacyMailboxes(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotes) != 1 || remotes[0].IsActive {
+		t.Fatalf("remotes = %+v, want one inactive mailbox when active is false", remotes)
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesRejectsIncompletePayload(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "missing hmeEmails",
+			body: `{
+				"success": true,
+				"result": {"forwardToEmails": ["main@example.com"]}
+			}`,
+		},
+		{
+			name: "has more pages",
+			body: `{
+				"success": true,
+				"result": {
+					"hmeEmails": [{"anonymousId":"a1","hme":"partial@icloud.com"}],
+					"hasMore": true,
+					"nextCursor": "cursor-2"
+				}
+			}`,
+		},
+		{
+			name: "item missing email",
+			body: `{
+				"success": true,
+				"result": {
+					"hmeEmails": [{"anonymousId":"a1","label":"broken"}]
+				}
+			}`,
+		},
+		{
+			name: "item missing remote id",
+			body: `{
+				"success": true,
+				"result": {
+					"hmeEmails": [{"hme":"missing-id@icloud.com","label":"broken"}]
+				}
+			}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer ts.Close()
+
+			client := &ICloudClient{client: ts.Client()}
+			_, err := client.ListPrivacyMailboxes(t.Context(), ICloudSession{
+				PremiumMailBaseURL: ts.URL,
+				DSID:               "123",
+				ClientID:           "cid",
+				ClientBuildNumber:  "build",
+				MasteringNumber:    "master",
+				Host:               "www.icloud.com",
+				Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
+			})
+			if !isCodedError(err, "icloud_mailbox_list_incomplete") {
+				t.Fatalf("ListPrivacyMailboxes error = %#v, want icloud_mailbox_list_incomplete", err)
+			}
+		})
+	}
+}
+
+func TestICloudClientListPrivacyMailboxesRejectsDuplicateRemoteIdentity(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"duplicate-id","hme":"first-duplicate@icloud.com","isActive":true},
+					{"anonymousId":"duplicate-id","hme":"second-duplicate@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	_, err := client.ListPrivacyMailboxes(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
+	})
+	if !isCodedError(err, "icloud_mailbox_list_incomplete") {
+		t.Fatalf("duplicate remote identity error = %#v, want icloud_mailbox_list_incomplete", err)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxDefaultsMissingActiveToTrue(t *testing.T) {
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":"candidate@icloud.com"}}`))
+		case "POST /v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":{"anonymousId":"a1","hme":"created@icloud.com","label":"LAB","note":"note","forwardToEmail":"main@example.com"}}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	remote, err := client.CreatePrivacyMailbox(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com", Path: "/"}},
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+	}, "LAB", "note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !remote.IsActive || remote.Email != "created@icloud.com" || remote.AnonymousID != "a1" {
+		t.Fatalf("remote = %+v", remote)
+	}
+	if got := strings.Join(paths, "\n"); got != "POST /v1/hme/generate\nPOST /v1/hme/reserve" {
+		t.Fatalf("paths = %q", got)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxAcceptsActiveField(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":"candidate@icloud.com"}}`))
+		case "POST /v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":{"anonymousId":"a1","hme":"created-inactive@icloud.com","label":"LAB","note":"note","forwardToEmail":"main@example.com","active":false}}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	remote, err := client.CreatePrivacyMailbox(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: "127.0.0.1", Path: "/"}},
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+	}, "LAB", "note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.IsActive {
+		t.Fatalf("remote = %+v, want inactive mailbox when active is false", remote)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxDefaultsMissingReserveActiveToTrue(t *testing.T) {
+	var seenReserve bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":"candidate@icloud.com"}}`))
+		case "POST /v1/hme/reserve":
+			seenReserve = true
+			_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hme":{"anonymousId":"a1","hme":"created@icloud.com","label":"LAB","note":"note","forwardToEmail":"main@example.com"}}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	remote, err := client.CreatePrivacyMailbox(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com", Path: "/"}},
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+	}, "LAB", "note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !seenReserve {
+		t.Fatal("reserve request was not sent")
+	}
+	if !remote.IsActive || remote.Email != "created@icloud.com" {
+		t.Fatalf("remote = %+v", remote)
+	}
+}
+
+func TestICloudClientDeactivateAndDeletePrivacyMailbox(t *testing.T) {
+	var paths []string
+	var bodies []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, string(data))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{}}`))
+	}))
+	defer ts.Close()
+
+	client := &ICloudClient{client: ts.Client()}
+	err := client.DeletePrivacyMailbox(t.Context(), ICloudSession{
+		PremiumMailBaseURL: ts.URL,
+		DSID:               "123",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "x", Domain: ".icloud.com", Path: "/"}},
+	}, "anon-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{
+		"POST /v1/hme/deactivate",
+		"POST /v1/hme/delete",
+	}
+	if !reflect.DeepEqual(paths, wantPaths) {
+		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
+	}
+	for _, body := range bodies {
+		if !strings.Contains(body, `"anonymousId":"anon-123"`) {
+			t.Fatalf("body = %q, want anonymousId", body)
+		}
 	}
 }
 
@@ -2416,6 +3542,61 @@ func TestUpsertMailboxFromRemoteCreatesAndUpdates(t *testing.T) {
 	}
 }
 
+func TestUpsertMailboxFromRemoteUsesRemoteIdentityWhenEmailChanges(t *testing.T) {
+	store := newTestStore(t)
+	existing, err := store.AddMailboxForOwnerWithRemote("owner-identity-change", "account-identity-change", ICloudRemoteMailbox{
+		AnonymousID: "stable-remote-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "old-address@icloud.com",
+		Label:       "old",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, created, err := store.UpsertMailboxFromRemote("owner-identity-change", "account-identity-change", ICloudRemoteMailbox{
+		AnonymousID: "stable-remote-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "new-address@icloud.com",
+		Label:       "new",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || updated.ID != existing.ID || updated.Email != "new-address@icloud.com" || updated.Label != "new" {
+		t.Fatalf("remote identity update = %+v created=%v, want same mailbox with new email", updated, created)
+	}
+	if got := len(store.Snapshot().Mailboxes); got != 1 {
+		t.Fatalf("mailbox count after remote identity update = %d, want 1", got)
+	}
+}
+
+func TestUpsertMailboxFromRemoteRejectsAccountCollision(t *testing.T) {
+	store := newTestStore(t)
+	existing, err := store.AddMailboxForOwnerWithRemote("owner-account-collision", "account-old", ICloudRemoteMailbox{
+		AnonymousID: "account-collision-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "account-collision@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = store.UpsertMailboxFromRemote("owner-account-collision", "account-new", ICloudRemoteMailbox{
+		Email:    existing.Email,
+		IsActive: true,
+	}, "")
+	if !isCodedError(err, "mailbox_remote_identity_conflict") {
+		t.Fatalf("account collision error = %#v, want mailbox_remote_identity_conflict", err)
+	}
+	unchanged, _ := store.FindMailboxByID(existing.ID)
+	if unchanged.AccountID != "account-old" || unchanged.RemoteAnonymousID != "account-collision-id" {
+		t.Fatalf("existing mailbox changed after account collision: %+v", unchanged)
+	}
+}
 func TestMailboxSyncAfterUsesCursorOverlap(t *testing.T) {
 	now := time.Date(2026, 6, 22, 11, 0, 0, 0, time.UTC)
 	mailbox := Mailbox{LastSyncAt: now.Add(-time.Minute)}
@@ -2470,6 +3651,7 @@ func TestSaveICloudIMAPLoginStoresStateWithoutReturningPassword(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"IMAP.User@iCloud.com","app_password":"app-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save imap login status = %d body=%s", rr.Code, rr.Body.String())
@@ -2511,7 +3693,7 @@ func TestSaveICloudIMAPLoginCanAttachICloudMailAliasToDifferentAppleID(t *testin
 	}
 	cookie, user := registerTestUser(t, handler, "imap-alias-user", "imap123")
 
-	primaryAppleID := "1953258942@qq.com"
+	primaryAppleID := "primary.owner@example.com"
 	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
 		OwnerID: user.ID,
 		AppleID: primaryAppleID,
@@ -2533,10 +3715,10 @@ func TestSaveICloudIMAPLoginCanAttachICloudMailAliasToDifferentAppleID(t *testin
 	accountID := sessions[0].AccountID
 	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
 		OwnerID: user.ID,
-		AppleID: "q1953258942@icloud.com",
+		AppleID: "alias.one@icloud.com",
 		LoginStates: []LoginState{{
 			Kind:            LoginStateICloudIMAP,
-			IMAPEmail:       "q1953258942@icloud.com",
+			IMAPEmail:       "alias.one@icloud.com",
 			IMAPAppPassword: "old-secret",
 		}},
 	}); err != nil {
@@ -2547,15 +3729,16 @@ func TestSaveICloudIMAPLoginCanAttachICloudMailAliasToDifferentAppleID(t *testin
 	}
 
 	rr := httptest.NewRecorder()
-	payload := fmt.Sprintf(`{"account_id":%q,"email":"Q1953258942@iCloud.com","app_password":"app-secret"}`, accountID)
+	payload := fmt.Sprintf(`{"account_id":%q,"email":"Alias.One@iCloud.com","app_password":"app-secret"}`, accountID)
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save imap alias status = %d body=%s", rr.Code, rr.Body.String())
 	}
-	if checkedEmail != "q1953258942@icloud.com" || checkedPassword != "app-secret" {
+	if checkedEmail != "alias.one@icloud.com" || checkedPassword != "app-secret" {
 		t.Fatalf("checked credentials = %q/%q", checkedEmail, checkedPassword)
 	}
 	var body struct {
@@ -2567,7 +3750,7 @@ func TestSaveICloudIMAPLoginCanAttachICloudMailAliasToDifferentAppleID(t *testin
 	if body.Session.AccountID != accountID || body.Session.AppleID != primaryAppleID {
 		t.Fatalf("response session = %+v, want account %s apple id %s", body.Session, accountID, primaryAppleID)
 	}
-	if !body.Session.ICloudIMAPLoginSaved || body.Session.ICloudIMAPEmail != "q1953258942@icloud.com" {
+	if !body.Session.ICloudIMAPLoginSaved || body.Session.ICloudIMAPEmail != "alias.one@icloud.com" {
 		t.Fatalf("response imap state = %+v", body.Session)
 	}
 	sessions = store.ICloudSessionsForOwner(user.ID)
@@ -2581,7 +3764,7 @@ func TestSaveICloudIMAPLoginCanAttachICloudMailAliasToDifferentAppleID(t *testin
 		t.Fatalf("stored session identity = %+v", sessions[0])
 	}
 	state, ok := iCloudIMAPLoginState(sessions[0])
-	if !ok || state.IMAPEmail != "q1953258942@icloud.com" || state.IMAPAppPassword != "app-secret" {
+	if !ok || state.IMAPEmail != "alias.one@icloud.com" || state.IMAPAppPassword != "app-secret" {
 		t.Fatalf("stored imap state = %+v ok=%v", state, ok)
 	}
 }
@@ -2595,7 +3778,7 @@ func TestSaveICloudIMAPLoginMatchesCreateAccountByEmailLocalPart(t *testing.T) {
 	}
 	cookie, user := registerTestUser(t, handler, "imap-localpart-user", "imap123")
 
-	primaryAppleID := "qq1953258942@gmail.com"
+	primaryAppleID := "secondary.owner@example.com"
 	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
 		OwnerID: user.ID,
 		AppleID: primaryAppleID,
@@ -2612,9 +3795,10 @@ func TestSaveICloudIMAPLoginMatchesCreateAccountByEmailLocalPart(t *testing.T) {
 	accountID := store.ICloudSessionsForOwner(user.ID)[0].AccountID
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"qq1953258942@icloud.com","app_password":"app-secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"secondary.owner@icloud.com","app_password":"app-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save imap alias status = %d body=%s", rr.Code, rr.Body.String())
@@ -2627,7 +3811,7 @@ func TestSaveICloudIMAPLoginMatchesCreateAccountByEmailLocalPart(t *testing.T) {
 		t.Fatalf("stored session identity = %+v", sessions[0])
 	}
 	state, ok := iCloudIMAPLoginState(sessions[0])
-	if !ok || state.IMAPEmail != "qq1953258942@icloud.com" {
+	if !ok || state.IMAPEmail != "secondary.owner@icloud.com" {
 		t.Fatalf("stored imap state = %+v ok=%v", state, ok)
 	}
 }
@@ -2641,7 +3825,7 @@ func TestSaveICloudIMAPLoginMatchesAppleSecondaryEmailPrefix(t *testing.T) {
 	}
 	cookie, user := registerTestUser(t, handler, "imap-prefix-user", "imap123")
 
-	primaryAppleID := "1953258942@qq.com"
+	primaryAppleID := "primary.owner@example.com"
 	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
 		OwnerID: user.ID,
 		AppleID: primaryAppleID,
@@ -2655,7 +3839,7 @@ func TestSaveICloudIMAPLoginMatchesAppleSecondaryEmailPrefix(t *testing.T) {
 	accountID := store.ICloudSessionsForOwner(user.ID)[0].AccountID
 	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
 		OwnerID: user.ID,
-		AppleID: "qq1953258942@gmail.com",
+		AppleID: "secondary.owner@example.com",
 		LoginStates: []LoginState{{
 			Kind:   LoginStateAppleAccount,
 			Host:   "appleid.apple.com",
@@ -2668,9 +3852,10 @@ func TestSaveICloudIMAPLoginMatchesAppleSecondaryEmailPrefix(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"q1953258942@icloud.com","app_password":"app-secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"primary.owner@icloud.com","app_password":"app-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save imap prefix alias status = %d body=%s", rr.Code, rr.Body.String())
@@ -2690,7 +3875,7 @@ func TestSaveICloudIMAPLoginMatchesAppleSecondaryEmailPrefix(t *testing.T) {
 		t.Fatalf("stored session identity = %+v", matched)
 	}
 	state, ok := iCloudIMAPLoginState(matched)
-	if !ok || state.IMAPEmail != "q1953258942@icloud.com" {
+	if !ok || state.IMAPEmail != "primary.owner@icloud.com" {
 		t.Fatalf("stored imap state = %+v ok=%v", state, ok)
 	}
 }
@@ -2708,6 +3893,7 @@ func TestSaveICloudIMAPLoginFailureDoesNotStorePassword(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/imap-login/save", strings.NewReader(`{"email":"fail@icloud.com","app_password":"bad-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadGateway {
 		t.Fatalf("save imap login failure status = %d body=%s", rr.Code, rr.Body.String())
@@ -2809,8 +3995,10 @@ func TestRuntimeExportIncludesAccountsMailboxesAndSession(t *testing.T) {
 	handler := NewServer(Config{}, store, discardLogger())
 	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export?owner_id=all", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("export status = %d body=%s", rr.Code, rr.Body.String())
@@ -2843,8 +4031,10 @@ func TestMailboxAPITextExportIsScoped(t *testing.T) {
 	userBox := createTestMailboxWithCookie(t, handler, userCookie, "USER", "user-alias@icloud.com")
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-apis", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(userCookie)
+	addClosureTestCSRF(req, userCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("user mailbox api export status = %d body=%s", rr.Code, rr.Body.String())
@@ -2853,7 +4043,7 @@ func TestMailboxAPITextExportIsScoped(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/plain", ct)
 	}
 	userBody := rr.Body.String()
-	if !strings.Contains(userBody, userBox.Email+"----"+userBox.APIURL+"\n") {
+	if !strings.Contains(userBody, userBox.Email+"----"+userBox.APIURL+"----") {
 		t.Fatalf("user export missing own mailbox api: %q", userBody)
 	}
 	if strings.Contains(userBody, adminBox.Email) {
@@ -2861,14 +4051,16 @@ func TestMailboxAPITextExportIsScoped(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-apis", nil)
+	req = httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis?owner_id=all", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin mailbox api export status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	adminBody := rr.Body.String()
-	for _, row := range []string{adminBox.Email + "----" + adminBox.APIURL + "\n", userBox.Email + "----" + userBox.APIURL + "\n"} {
+	for _, row := range []string{adminBox.Email + "----" + adminBox.APIURL + "----", userBox.Email + "----" + userBox.APIURL + "----"} {
 		if !strings.Contains(adminBody, row) {
 			t.Fatalf("admin export missing row %q in %q", row, adminBody)
 		}
@@ -2885,8 +4077,10 @@ func TestMailboxEmailExportFormatsAreScoped(t *testing.T) {
 	userBox := createTestMailboxWithCookie(t, handler, userCookie, "USER", "user-alias@icloud.com")
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-emails?format=csv", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?format=csv", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(userCookie)
+	addClosureTestCSRF(req, userCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("user mailbox email export status = %d body=%s", rr.Code, rr.Body.String())
@@ -2903,8 +4097,10 @@ func TestMailboxEmailExportFormatsAreScoped(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-emails?format=tsv", nil)
+	req = httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?format=tsv&owner_id=all", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin mailbox email export status = %d body=%s", rr.Code, rr.Body.String())
@@ -2914,6 +4110,483 @@ func TestMailboxEmailExportFormatsAreScoped(t *testing.T) {
 		if !strings.Contains(adminBody, email) {
 			t.Fatalf("admin export missing email %q in %q", email, adminBody)
 		}
+	}
+}
+
+func TestMailboxAPIExportMarksMailboxesAsExported(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
+
+	mailbox := createTestMailboxWithCookie(t, handler, adminCookie, "ADMIN", "export-mark@icloud.com")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(`{"format":"txt"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("api export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, ok := store.FindMailboxByID(mailbox.ID)
+	if !ok {
+		t.Fatal("mailbox missing after export")
+	}
+	if updated.APIExportedAt.IsZero() {
+		t.Fatalf("APIExportedAt = zero, want exported mark")
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/mailboxes?api_exported=1", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("filtered list status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Mailboxes []publicMailbox `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Mailboxes) != 1 || body.Mailboxes[0].ID != mailbox.ID || !body.Mailboxes[0].APIExported {
+		t.Fatalf("filtered exported mailboxes = %+v", body.Mailboxes)
+	}
+}
+
+func TestMailboxGETAPIExportRequiresPost(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "get-export-no-mark", "admin123")
+
+	mailbox := createTestMailboxWithCookie(t, handler, adminCookie, "ADMIN", "get-export-no-mark@icloud.com")
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-apis", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET api export status = %d body=%s, want 405", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Allow"); got != http.MethodPost {
+		t.Fatalf("GET api export Allow = %q, want %q", got, http.MethodPost)
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "mailbox_api_export_requires_post" {
+		t.Fatalf("GET API export code = %q", body.Code)
+	}
+	updated, ok := store.FindMailboxByID(mailbox.ID)
+	if !ok {
+		t.Fatal("mailbox missing after GET export")
+	}
+	if !updated.APIExportedAt.IsZero() {
+		t.Fatalf("GET API export marked mailbox as exported: %+v", updated)
+	}
+}
+
+func TestMailboxAPIExportRejectsNonJSONPost(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "export-non-json", "admin123")
+	mailbox := createTestMailboxWithCookie(t, handler, adminCookie, "ADMIN", "export-non-json@icloud.com")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader("format=txt"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("non-JSON API export status = %d body=%s, want 415", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != "mailbox_api_export_requires_json" {
+		t.Fatalf("non-JSON API export code = %q", response.Code)
+	}
+	updated, ok := store.FindMailboxByID(mailbox.ID)
+	if !ok {
+		t.Fatal("mailbox missing after non-JSON API export")
+	}
+	if !updated.APIExportedAt.IsZero() {
+		t.Fatalf("non-JSON API export marked mailbox as exported: %+v", updated)
+	}
+}
+
+func TestMailboxExportRejectsEmptySelectedIDs(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "empty-export", "admin123")
+	_ = createTestMailboxWithCookie(t, handler, adminCookie, "ONE", "empty-export@icloud.com")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis?ids=", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("empty selected export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "mailbox_ids_missing" {
+		t.Fatalf("empty selected export code = %q", body.Code)
+	}
+}
+
+func TestMailboxExportRejectsEmptyRenderedResult(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "api", method: http.MethodPost, path: "/api/runtime/export-mailbox-apis"},
+		{name: "email", method: http.MethodPost, path: "/api/runtime/export-mailbox-emails"},
+	}
+	formats := []string{"txt", "csv", "tsv", "jsonl"}
+	for _, test := range tests {
+		for _, format := range formats {
+			t.Run(test.name+"-"+format, func(t *testing.T) {
+				store := newTestStore(t)
+				handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+				adminCookie, _ := registerTestUser(t, handler, "empty-result-"+test.name+"-"+format, "admin123")
+				mailbox := createTestMailboxWithCookie(t, handler, adminCookie, "EMPTY", "empty-result-"+test.name+"-"+format+"@icloud.com")
+
+				path := test.path + "?format=" + url.QueryEscape(format) + "&search=does-not-exist"
+				var body io.Reader = strings.NewReader(`{}`)
+				req := httptest.NewRequest(test.method, path, body)
+				req.Header.Set("Content-Type", "application/json")
+				req.AddCookie(adminCookie)
+				addClosureTestCSRF(req, adminCookie)
+				rr := httptest.NewRecorder()
+				handler.ServeHTTP(rr, req)
+				if rr.Code != http.StatusNotFound {
+					t.Fatalf("empty %s export status = %d body=%s, want 404", test.name, rr.Code, rr.Body.String())
+				}
+				if got := rr.Header().Get("Content-Disposition"); got != "" {
+					t.Fatalf("empty %s export Content-Disposition = %q, want empty", test.name, got)
+				}
+				var response struct {
+					Code string `json:"code"`
+				}
+				if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode empty %s export response: %v; body=%s", test.name, err, rr.Body.String())
+				}
+				if response.Code != "mailbox_export_empty" {
+					t.Fatalf("empty %s export code = %q, want mailbox_export_empty", test.name, response.Code)
+				}
+				updated, ok := store.FindMailboxByID(mailbox.ID)
+				if !ok {
+					t.Fatal("mailbox disappeared after empty export")
+				}
+				if !updated.APIExportedAt.IsZero() {
+					t.Fatalf("empty export marked mailbox as exported: %+v", updated)
+				}
+			})
+		}
+	}
+}
+
+func TestMailboxExportRejectsNullSelectedIDs(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "null-export", "admin123")
+	_ = createTestMailboxWithCookie(t, handler, adminCookie, "ONE", "null-export@icloud.com")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(`{"format":"txt","ids":null}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("null selected export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "mailbox_ids_missing" {
+		t.Fatalf("null selected export code = %q", body.Code)
+	}
+}
+
+func TestMailboxExportRejectsSelectedIDsWithoutAccessibleMatches(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "missing-selected-export", "admin123")
+	_ = createTestMailboxWithCookie(t, handler, adminCookie, "ONE", "selected-present@icloud.com")
+
+	body, err := json.Marshal(map[string]any{
+		"format": "txt",
+		"ids":    []string{"missing-mailbox-id"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing selected export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != "mailbox_not_found" {
+		t.Fatalf("missing selected export code = %q", resp.Code)
+	}
+}
+
+func TestMailboxExportRejectsPartiallyMissingSelectedIDs(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "partial-selected-export", "admin123")
+	mailbox := createTestMailboxWithCookie(t, handler, adminCookie, "ONE", "partial-selected@icloud.com")
+
+	body, err := json.Marshal(map[string]any{
+		"format": "txt",
+		"ids":    []string{mailbox.ID, "missing-mailbox-id"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("partial selected export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != "mailbox_selection_changed" {
+		t.Fatalf("partial selected export code = %q", resp.Code)
+	}
+	updated, ok := store.FindMailboxByID(mailbox.ID)
+	if !ok {
+		t.Fatal("mailbox missing after rejected partial export")
+	}
+	if !updated.APIExportedAt.IsZero() {
+		t.Fatalf("partially rejected export marked mailbox: %+v", updated)
+	}
+}
+
+func TestMailboxListRejectsInvalidExportedFilter(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "invalid-export-filter-list", "admin123")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/mailboxes?api_exported=maybe", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid exported list filter status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != "invalid_export_filter" {
+		t.Fatalf("invalid exported list filter code = %q", resp.Code)
+	}
+}
+
+func TestMailboxExportRejectsInvalidExportedFilter(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "invalid-export-filter-export", "admin123")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?api_exported=maybe", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid exported export filter status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code != "invalid_export_filter" {
+		t.Fatalf("invalid exported export filter code = %q", resp.Code)
+	}
+}
+
+func TestMailboxListSearchRespectsAccountFilter(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "search-filter", "admin123")
+	accOne, err := store.AddAccountForOwner("", "Apple One", "one@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accTwo, err := store.AddAccountForOwner("", "Apple Two", "two@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", accOne.ID, "Shared Alpha", "shared-alpha@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", accTwo.ID, "Shared Beta", "shared-beta@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/mailboxes?owner_id=all&account_key="+url.QueryEscape(accOne.ID)+"&search=shared", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Mailboxes []publicMailbox `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Mailboxes) != 1 {
+		t.Fatalf("mailboxes len = %d, want 1", len(body.Mailboxes))
+	}
+	if body.Mailboxes[0].AccountID != accOne.ID {
+		t.Fatalf("mailbox account = %q, want %q", body.Mailboxes[0].AccountID, accOne.ID)
+	}
+}
+
+func TestDeleteMailboxCanDeleteRemoteMailbox(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger()).(*Server)
+	adminCookie, admin := registerTestUser(t, handler, "admin", "admin123")
+	mailbox, err := store.AddMailboxForOwnerWithRemote(admin.ID, "account-remote-delete", ICloudRemoteMailbox{
+		AnonymousID: "remote-delete-hook",
+		Origin:      "APPLE_ACCOUNT",
+		Email:       "remote-delete@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveTestAppleAccountSession(t, store, admin.ID, "account-remote-delete", "remote-delete@example.com")
+	called := false
+	handler.deleteRemoteMailbox = func(ctx context.Context, remote Mailbox) error {
+		called = true
+		if remote.ID != mailbox.ID {
+			t.Fatalf("remote mailbox = %+v, want %s", remote, mailbox.ID)
+		}
+		return nil
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/api/mailboxes/"+mailbox.ID+"?delete_remote=1", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !called {
+		t.Fatal("remote delete hook not called")
+	}
+	if _, ok := store.FindMailboxByID(mailbox.ID); ok {
+		t.Fatal("mailbox still exists after delete")
+	}
+}
+
+func TestBulkDeleteMailboxesCanDeleteRemoteMailbox(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger()).(*Server)
+	adminCookie, admin := registerTestUser(t, handler, "admin", "admin123")
+	first, err := store.AddMailboxForOwnerWithRemote(admin.ID, "account-bulk-remote", ICloudRemoteMailbox{
+		AnonymousID: "bulk-remote-1",
+		Origin:      "APPLE_ACCOUNT",
+		Email:       "one-delete@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.AddMailboxForOwnerWithRemote(admin.ID, "account-bulk-remote", ICloudRemoteMailbox{
+		AnonymousID: "bulk-remote-2",
+		Origin:      "APPLE_ACCOUNT",
+		Email:       "two-delete@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveTestAppleAccountSession(t, store, admin.ID, "account-bulk-remote", "bulk-remote@example.com")
+	called := []string{}
+	handler.deleteRemoteMailbox = func(ctx context.Context, remote Mailbox) error {
+		called = append(called, remote.ID)
+		return nil
+	}
+
+	body := fmt.Sprintf(`{"ids":[%q,%q],"delete_remote":true}`, first.ID, second.ID)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/mailboxes/bulk-delete", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Deleted       int `json:"deleted"`
+		RemoteDeleted int `json:"remote_deleted"`
+		Failed        int `json:"failed"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Deleted != 2 || resp.RemoteDeleted != 2 || resp.Failed != 0 {
+		t.Fatalf("bulk delete response = %+v", resp)
+	}
+	if !reflect.DeepEqual(called, []string{first.ID, second.ID}) {
+		t.Fatalf("remote delete calls = %#v", called)
+	}
+	if _, ok := store.FindMailboxByID(first.ID); ok {
+		t.Fatal("first mailbox still exists")
+	}
+	if _, ok := store.FindMailboxByID(second.ID); ok {
+		t.Fatal("second mailbox still exists")
 	}
 }
 
@@ -2937,14 +4610,16 @@ func TestMailboxExportFiltersByAccountID(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-apis?account_id="+url.QueryEscape(accOne.ID), nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis?owner_id=all&account_id="+url.QueryEscape(accOne.ID), strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("account filtered api export status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "one-alias@icloud.com----https://mail.example/api/v1/mailboxes/one-alias@icloud.com/code?key=") {
+	if !strings.Contains(body, "one-alias@icloud.com----https://mail.example/api/v1/mailboxes/one-alias@icloud.com/code----") {
 		t.Fatalf("filtered export missing account one API: %q", body)
 	}
 	if strings.Contains(body, "two-alias@icloud.com") {
@@ -2952,8 +4627,10 @@ func TestMailboxExportFiltersByAccountID(t *testing.T) {
 	}
 
 	rr = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-emails?format=jsonl&account_id="+url.QueryEscape(accTwo.ID), nil)
+	req = httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?format=jsonl&owner_id=all&account_id="+url.QueryEscape(accTwo.ID), strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("account filtered email export status = %d body=%s", rr.Code, rr.Body.String())
@@ -2961,6 +4638,178 @@ func TestMailboxExportFiltersByAccountID(t *testing.T) {
 	body = rr.Body.String()
 	if !strings.Contains(body, `"email":"two-alias@icloud.com"`) || strings.Contains(body, "one-alias@icloud.com") || strings.Contains(body, "/api/v1/") {
 		t.Fatalf("filtered email export body = %q", body)
+	}
+}
+
+func TestMailboxExportFiltersGlobalOwnerSentinel(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
+	globalAccount, err := store.AddAccountForOwner("", "Global Apple", "global@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userAccount, err := store.AddAccountForOwner("owner-global-export", "User Apple", "user@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", globalAccount.ID, "GLOBAL", "global-alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("owner-global-export", userAccount.ID, "USER", "user-alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis?owner_id=__global", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("global owner export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "global-alias@icloud.com----https://mail.example/api/v1/mailboxes/global-alias@icloud.com/code----") {
+		t.Fatalf("global owner export missing global mailbox API: %q", body)
+	}
+	if strings.Contains(body, "user-alias@icloud.com") {
+		t.Fatalf("global owner export leaked user mailbox: %q", body)
+	}
+}
+
+func TestMailboxExportPostJSONFiltersByAccountID(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "post-account-filter", "admin123")
+	accOne, err := store.AddAccountForOwner("", "Apple One", "one@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accTwo, err := store.AddAccountForOwner("", "Apple Two", "two@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", accOne.ID, "ONE", "post-one@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", accTwo.ID, "TWO", "post-two@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"format":     "jsonl",
+		"account_id": accTwo.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?owner_id=all", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("post account filtered export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"email":"post-two@icloud.com"`) || strings.Contains(body, "post-one@icloud.com") {
+		t.Fatalf("post account filtered export body = %q", body)
+	}
+}
+
+func TestMailboxExportFiltersByAPIExportedState(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "export-state-filter", "admin123")
+	exported := createTestMailboxWithCookie(t, handler, adminCookie, "DONE", "already-exported@icloud.com")
+	unexported := createTestMailboxWithCookie(t, handler, adminCookie, "PENDING", "not-yet-exported@icloud.com")
+	if _, err := store.MarkMailboxesAPIExported([]string{exported.ID}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?api_exported=0", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexported filtered export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if body != unexported.Email+"\n" {
+		t.Fatalf("unexported filtered export body = %q", body)
+	}
+
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?api_exported=1", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("exported filtered export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body = rr.Body.String()
+	if body != exported.Email+"\n" {
+		t.Fatalf("exported filtered export body = %q", body)
+	}
+}
+
+func TestMailboxExportFiltersBySearchKeyword(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "export-search-filter", "admin123")
+	if _, err := store.AddMailboxForOwner("", "", "Alpha", "alpha-search@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", "", "Beta", "beta-other@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?owner_id=all&search=alpha", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("search filtered export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if body := rr.Body.String(); body != "alpha-search@icloud.com\n" {
+		t.Fatalf("search filtered export body = %q", body)
+	}
+}
+
+func TestMailboxExportFiltersUnboundMailboxes(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
+	account, err := store.AddAccountForOwner("", "Bound Apple", "bound@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", "", "UNBOUND", "unbound@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner("", account.ID, "BOUND", "bound@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?owner_id=all&account_id=unbound", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unbound email export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if body != "unbound@icloud.com\n" {
+		t.Fatalf("unbound email export body = %q", body)
 	}
 }
 
@@ -2985,8 +4834,10 @@ func TestMailboxExportAdminOwnerAndAccountFilter(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-emails?owner_id="+url.QueryEscape(normalUser.ID)+"&account_id="+url.QueryEscape(userAcc.ID), nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?owner_id="+url.QueryEscape(normalUser.ID)+"&account_id="+url.QueryEscape(userAcc.ID), strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("owner/account filtered export status = %d body=%s", rr.Code, rr.Body.String())
@@ -3003,8 +4854,10 @@ func TestMailboxExportRejectsInvalidFormat(t *testing.T) {
 	adminCookie, _ := registerTestUser(t, handler, "admin", "admin123")
 
 	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/runtime/export-mailbox-emails?format=xlsx", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-emails?format=xlsx", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("invalid format status = %d body=%s", rr.Code, rr.Body.String())
@@ -3027,6 +4880,7 @@ func TestUserLoginScopesDataAndFirstUserIsAdmin(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin auth me = %d body=%s", rr.Code, rr.Body.String())
@@ -3048,6 +4902,7 @@ func TestUserLoginScopesDataAndFirstUserIsAdmin(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/mailboxes", nil)
 	req.AddCookie(userCookie)
+	addClosureTestCSRF(req, userCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("user list mailboxes = %d body=%s", rr.Code, rr.Body.String())
@@ -3065,6 +4920,7 @@ func TestUserLoginScopesDataAndFirstUserIsAdmin(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/manage/data", nil)
 	req.AddCookie(userCookie)
+	addClosureTestCSRF(req, userCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("user manage data = %d body=%s", rr.Code, rr.Body.String())
@@ -3082,6 +4938,7 @@ func TestUserLoginScopesDataAndFirstUserIsAdmin(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/manage/data", nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin manage data = %d body=%s", rr.Code, rr.Body.String())
@@ -3113,6 +4970,7 @@ func TestUserLoginScopesDataAndFirstUserIsAdmin(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/mailboxes/"+userMailbox.ID+"/status", strings.NewReader(`{"status":"used"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin mutate user mailbox = %d body=%s", rr.Code, rr.Body.String())
@@ -3148,6 +5006,7 @@ func TestAdminCanDeleteNormalUserAndOwnedData(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/api/admin/users/"+normalUser.ID, nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("admin delete user = %d body=%s", rr.Code, rr.Body.String())
@@ -3178,6 +5037,7 @@ func TestAdminCanDeleteNormalUserAndOwnedData(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/manage/data", nil)
 	req.AddCookie(userCookie)
+	addClosureTestCSRF(req, userCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("deleted user manage data = %d body=%s, want 401", rr.Code, rr.Body.String())
@@ -3192,6 +5052,7 @@ func TestAdminDeleteUserRejectsSelfAndAdminAccounts(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/api/admin/users/"+adminUser.ID, nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "cannot_delete_self") {
 		t.Fatalf("admin self delete = %d body=%s", rr.Code, rr.Body.String())
@@ -3215,6 +5076,7 @@ func TestAdminDeleteUserRejectsSelfAndAdminAccounts(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodDelete, "/api/admin/users/"+secondAdmin.ID, nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "cannot_delete_admin_user") {
 		t.Fatalf("delete other admin = %d body=%s", rr.Code, rr.Body.String())
@@ -4201,6 +6063,180 @@ func TestSyncMailboxCodeBatchStoresIMAPAccountCursor(t *testing.T) {
 	}
 }
 
+func TestSyncMailboxCodeBatchUsesIMAPStateAfterGateWait(t *testing.T) {
+	oldInterval := mailboxMailSyncMinInterval
+	mailboxMailSyncMinInterval = 0
+	t.Cleanup(func() { mailboxMailSyncMinInterval = oldInterval })
+
+	store := newTestStore(t)
+	ownerID := "owner-imap-fresh-state"
+	accountID := "account-imap-fresh-state"
+	initial := testIMAPSession(ownerID, accountID, "fresh-state@icloud.com")
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwner(ownerID, accountID, "fresh-state", "fresh-state.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenPassword := make(chan string, 1)
+	handler.syncCodeMailboxBatchWithCursor = func(ctx context.Context, state LoginState, mailboxes []Mailbox, after time.Time, keyword string, maxMessages int) (iCloudIMAPSyncResult, error) {
+		seenPassword <- state.IMAPAppPassword
+		return iCloudIMAPSyncResult{}, nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, syncErr := handler.syncMailboxCodeBatchForOwnerWithLimit(
+			context.Background(),
+			ownerID,
+			[]Mailbox{mailbox},
+			time.Time{},
+			"ChatGPT",
+			10,
+		)
+		done <- syncErr
+	}()
+
+	select {
+	case <-seenPassword:
+		releaseAccountOperation()
+		t.Fatal("IMAP sync provider ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := initial
+	fresh.LoginStates[0].IMAPAppPassword = "fresh-app-password"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seenPassword:
+		if got != "fresh-app-password" {
+			t.Fatalf("IMAP sync app password = %q, want fresh-app-password", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP sync provider was not called")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("IMAP sync error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP sync did not finish")
+	}
+}
+
+func TestSyncMailboxBatchUsesICloudSessionAfterGateWait(t *testing.T) {
+	oldInterval := mailboxMailSyncMinInterval
+	mailboxMailSyncMinInterval = 0
+	t.Cleanup(func() { mailboxMailSyncMinInterval = oldInterval })
+
+	store := newTestStore(t)
+	ownerID := "owner-icloud-fresh-session"
+	accountID := "account-icloud-fresh-session"
+	initial := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: accountID,
+		AppleID:   "icloud-fresh-session@example.com",
+		SavedAt:   time.Now(),
+		Cookies: []SessionCookie{{
+			Name:   "session",
+			Value:  "stale-cookie",
+			Domain: "127.0.0.1",
+			Path:   "/",
+		}},
+		LoginStates: []LoginState{{
+			Kind: LoginStateICloudWeb,
+			Cookies: []SessionCookie{{
+				Name:   "session",
+				Value:  "stale-cookie",
+				Domain: "127.0.0.1",
+				Path:   "/",
+			}},
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwner(ownerID, accountID, "fresh-session", "fresh-session.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenCookie := make(chan string, 1)
+	handler.syncMailboxBatch = func(ctx context.Context, session ICloudSession, mailboxes []Mailbox, after time.Time, keyword string, maxThreads int) (map[string][]ICloudSyncedMessage, error) {
+		seenCookie <- session.Cookies[0].Value
+		return map[string][]ICloudSyncedMessage{}, nil
+	}
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.syncMailboxBatchForOwnerWithLimit(
+			context.Background(),
+			ownerID,
+			[]Mailbox{mailbox},
+			time.Time{},
+			"ChatGPT",
+			10,
+		)
+	}()
+
+	select {
+	case <-seenCookie:
+		releaseAccountOperation()
+		t.Fatal("iCloud sync provider ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.Cookies[0].Value = "fresh-cookie"
+	fresh.LoginStates[0].Cookies[0].Value = "fresh-cookie"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case got := <-seenCookie:
+		if got != "fresh-cookie" {
+			t.Fatalf("iCloud sync cookie = %q, want fresh-cookie", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("iCloud sync provider was not called")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("iCloud sync error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("iCloud sync did not finish")
+	}
+}
+
 func TestSyncMailboxCodeBatchSkipsEmptyMailboxCursorWrites(t *testing.T) {
 	oldInterval := mailboxMailSyncMinInterval
 	mailboxMailSyncMinInterval = 0
@@ -4272,7 +6308,7 @@ func TestEnsureMailWatcherIMAPBaselineStoresAccountUID(t *testing.T) {
 	if len(groups) != 1 {
 		t.Fatalf("IMAP groups = %d, want 1", len(groups))
 	}
-	if err := server.ensureMailWatcherIMAPBaseline(context.Background(), groups[0]); err != nil {
+	if err := server.ensureMailWatcherIMAPBaseline(context.Background(), &groups[0]); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -4295,6 +6331,246 @@ func TestEnsureMailWatcherIMAPBaselineStoresAccountUID(t *testing.T) {
 	}
 	if !updated.LastSyncAt.IsZero() || updated.LastSyncUID != "" {
 		t.Fatalf("mailbox cursor changed: LastSyncAt=%s LastSyncUID=%q", updated.LastSyncAt, updated.LastSyncUID)
+	}
+}
+
+func TestMailWatcherGroupsExcludeRemoteDeleteIneligibleMailboxes(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-watcher-remote-delete"
+	accountID := "acc-watcher-remote-delete"
+	if err := store.SaveICloudSessionForOwner(ownerID, testIMAPSession(ownerID, accountID, "watcher-owner@icloud.com")); err != nil {
+		t.Fatal(err)
+	}
+	available, err := store.AddMailboxForOwner(ownerID, accountID, "available", "available.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.AddMailboxForOwner(ownerID, accountID, "pending", "pending.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginMailboxRemoteDelete(pending.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := store.AddMailboxForOwner(ownerID, accountID, "unknown", "unknown.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkMailboxRemoteDeleteUnknown(unknown.ID, "provider timeout", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	succeeded, err := store.AddMailboxForOwner(ownerID, accountID, "succeeded", "succeeded.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkMailboxRemoteDeleteSucceeded(succeeded.ID, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewServer(Config{}, store, discardLogger()).(*Server)
+	groups := server.mailWatcherGroups()
+	if len(groups) != 1 {
+		t.Fatalf("mail watcher groups = %d, want 1: %+v", len(groups), groups)
+	}
+	if len(groups[0].mailboxes) != 1 || groups[0].mailboxes[0].ID != available.ID {
+		t.Fatalf("mail watcher mailboxes = %+v, want only available mailbox %q", groups[0].mailboxes, available.ID)
+	}
+
+	imapGroups := server.mailWatcherIMAPGroups()
+	if len(imapGroups) != 1 {
+		t.Fatalf("IMAP watcher groups = %d, want 1: %+v", len(imapGroups), imapGroups)
+	}
+	if len(imapGroups[0].mailboxes) != 1 || imapGroups[0].mailboxes[0].ID != available.ID {
+		t.Fatalf("IMAP watcher mailboxes = %+v, want only available mailbox %q", imapGroups[0].mailboxes, available.ID)
+	}
+}
+
+func TestEnsureMailWatcherIMAPBaselineWaitsForMailboxAccountOperation(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-imap-baseline-gate"
+	accountID := "acc-imap-baseline-gate"
+	if err := store.SaveICloudSessionForOwner(ownerID, testIMAPSession(ownerID, accountID, "baseline-gate-owner@icloud.com")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner(ownerID, accountID, "baseline-gate", "baseline-gate.alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	entered := make(chan struct{})
+	handler.latestIMAPUID = func(ctx context.Context, state LoginState) (string, error) {
+		close(entered)
+		return "501", nil
+	}
+	groups := handler.mailWatcherIMAPGroups()
+	if len(groups) != 1 {
+		t.Fatalf("IMAP groups = %d, want 1", len(groups))
+	}
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.ensureMailWatcherIMAPBaseline(context.Background(), &groups[0])
+	}()
+
+	select {
+	case <-entered:
+		releaseAccountOperation()
+		t.Fatal("IMAP baseline ran while the mailbox account operation was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseAccountOperation()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP baseline did not finish after the mailbox account operation was released")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("IMAP baseline did not query the latest UID")
+	}
+}
+
+func TestEnsureMailWatcherIMAPBaselineUsesCurrentStateAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-imap-baseline-fresh-state"
+	accountID := "acc-imap-baseline-fresh-state"
+	initial := testIMAPSession(ownerID, accountID, "baseline-fresh-state@icloud.com")
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner(ownerID, accountID, "baseline-fresh-state", "baseline-fresh-state.alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	seenPassword := make(chan string, 1)
+	handler.latestIMAPUID = func(ctx context.Context, state LoginState) (string, error) {
+		seenPassword <- state.IMAPAppPassword
+		return "502", nil
+	}
+	groups := handler.mailWatcherIMAPGroups()
+	if len(groups) != 1 {
+		t.Fatalf("IMAP groups = %d, want 1", len(groups))
+	}
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.ensureMailWatcherIMAPBaseline(context.Background(), &groups[0])
+	}()
+
+	select {
+	case <-seenPassword:
+		releaseAccountOperation()
+		t.Fatal("IMAP baseline used a state snapshot before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.LoginStates[0].IMAPAppPassword = "fresh-app-specific-password"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case password := <-seenPassword:
+		if password != "fresh-app-specific-password" {
+			t.Fatalf("IMAP baseline password = %q, want fresh password", password)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP baseline did not query the latest UID")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("IMAP baseline error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP baseline did not finish")
+	}
+}
+
+func TestEnsureMailWatcherIMAPBaselineRejectsMissingCurrentStateAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-imap-baseline-missing-state"
+	accountID := "acc-imap-baseline-missing-state"
+	initial := testIMAPSession(ownerID, accountID, "baseline-missing-state@icloud.com")
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner(ownerID, accountID, "baseline-missing-state", "baseline-missing-state.alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	latestCalled := make(chan struct{}, 1)
+	handler.latestIMAPUID = func(ctx context.Context, state LoginState) (string, error) {
+		latestCalled <- struct{}{}
+		return "503", nil
+	}
+	groups := handler.mailWatcherIMAPGroups()
+	if len(groups) != 1 {
+		t.Fatalf("IMAP groups = %d, want 1", len(groups))
+	}
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.ensureMailWatcherIMAPBaseline(context.Background(), &groups[0])
+	}()
+
+	select {
+	case <-latestCalled:
+		releaseAccountOperation()
+		t.Fatal("IMAP baseline ran before the current state was revalidated")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	store.mu.Lock()
+	for index := range store.state.ICloudSessions {
+		if store.state.ICloudSessions[index].OwnerID == ownerID &&
+			store.state.ICloudSessions[index].AccountID == accountID {
+			store.state.ICloudSessions[index].LoginStates = nil
+		}
+	}
+	store.mu.Unlock()
+	releaseAccountOperation()
+
+	select {
+	case err := <-done:
+		if !isCodedError(err, "imap_session_missing") {
+			t.Fatalf("IMAP baseline error = %#v, want imap_session_missing", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IMAP baseline did not finish after the mailbox account operation was released")
+	}
+	select {
+	case <-latestCalled:
+		t.Fatal("IMAP baseline used stale state after the current state disappeared")
+	default:
 	}
 }
 
@@ -4322,6 +6598,61 @@ func TestMailWatcherIMAPGroupSignatureIgnoresMailboxSyncCursor(t *testing.T) {
 	}
 }
 
+func TestMailWatcherIMAPGroupsIsolateExplicitAccounts(t *testing.T) {
+	store := newTestStore(t)
+	server := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-imap-isolation"
+	accountOne, err := store.AddAccountForOwnerWithProxy(ownerID, "One", "one@example.com", "", "http://proxy-one:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountTwo, err := store.AddAccountForOwnerWithProxy(ownerID, "Two", "two@example.com", "", "http://proxy-two:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionOne := testIMAPSession(ownerID, accountOne.ID, "shared@icloud.com")
+	sessionOne.ProxyURL = accountOne.ProxyURL
+	sessionOne.LoginStates[0].ProxyURL = accountOne.ProxyURL
+	sessionOne.LoginStates[0].IMAPAppPassword = "password-one"
+	sessionTwo := testIMAPSession(ownerID, accountTwo.ID, "shared@icloud.com")
+	sessionTwo.ProxyURL = accountTwo.ProxyURL
+	sessionTwo.LoginStates[0].ProxyURL = accountTwo.ProxyURL
+	sessionTwo.LoginStates[0].IMAPAppPassword = "password-two"
+	if err := store.SaveICloudSessionForOwner(ownerID, sessionOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, sessionTwo); err != nil {
+		t.Fatal(err)
+	}
+	mailboxOne, err := store.AddMailboxForOwner(ownerID, accountOne.ID, "One alias", "one-alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailboxTwo, err := store.AddMailboxForOwner(ownerID, accountTwo.ID, "Two alias", "two-alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	groups := server.mailWatcherIMAPGroups()
+	if len(groups) != 2 {
+		t.Fatalf("IMAP groups = %d, want 2 for isolated accounts: %+v", len(groups), groups)
+	}
+	seenAccounts := make(map[string]string, len(groups))
+	for _, group := range groups {
+		if len(group.mailboxes) != 1 {
+			t.Fatalf("group %q contains %d mailboxes, want 1: %+v", group.key, len(group.mailboxes), group.mailboxes)
+		}
+		seenAccounts[group.mailboxes[0].AccountID] = group.state.ProxyURL + "|" + group.state.IMAPAppPassword
+	}
+	if seenAccounts[mailboxOne.AccountID] != accountOne.ProxyURL+"|password-one" {
+		t.Fatalf("account one IMAP state = %q, want %q", seenAccounts[mailboxOne.AccountID], accountOne.ProxyURL+"|password-one")
+	}
+	if seenAccounts[mailboxTwo.AccountID] != accountTwo.ProxyURL+"|password-two" {
+		t.Fatalf("account two IMAP state = %q, want %q", seenAccounts[mailboxTwo.AccountID], accountTwo.ProxyURL+"|password-two")
+	}
+}
+
 func TestLoginProtectsManagementAPI(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{}, store, discardLogger())
@@ -4337,6 +6668,7 @@ func TestLoginProtectsManagementAPI(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/status", nil)
 	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status with admin login = %d, want 200", rr.Code)
@@ -4433,6 +6765,15 @@ func TestClaimMailboxRequiresGlobalAPIKeyAndMarksUsed(t *testing.T) {
 	if !strings.HasPrefix(body.Mailbox.APIURL, "https://mail.example/") {
 		t.Fatalf("api_url = %q", body.Mailbox.APIURL)
 	}
+	if body.Mailbox.APIToken != mailbox.APIToken {
+		t.Fatalf("api_token = %q, want stored token", body.Mailbox.APIToken)
+	}
+	if strings.Contains(body.Mailbox.APIURL, mailbox.APIToken) {
+		t.Fatalf("api_url leaked token: %q", body.Mailbox.APIURL)
+	}
+	if body.Mailbox.OwnerID != "" || body.Mailbox.AccountID != "" || body.Mailbox.RemoteAnonymousID != "" {
+		t.Fatalf("claim leaked internal ownership fields: %+v", body.Mailbox)
+	}
 	updated, ok := store.FindMailboxByID(mailbox.ID)
 	if !ok || updated.Status != StatusUsed {
 		t.Fatalf("stored mailbox = %+v ok=%v", updated, ok)
@@ -4480,6 +6821,15 @@ func TestLookupMailboxesRequiresGlobalAPIKeyAndKeepsStatus(t *testing.T) {
 	if !strings.HasPrefix(body.Mailboxes[0].APIURL, "https://mail.example/") {
 		t.Fatalf("api_url = %q", body.Mailboxes[0].APIURL)
 	}
+	if body.Mailboxes[0].APIToken != mailbox.APIToken {
+		t.Fatalf("lookup api_token = %q, want stored token", body.Mailboxes[0].APIToken)
+	}
+	if strings.Contains(body.Mailboxes[0].APIURL, mailbox.APIToken) {
+		t.Fatalf("lookup api_url leaked token: %q", body.Mailboxes[0].APIURL)
+	}
+	if body.Mailboxes[0].OwnerID != "" || body.Mailboxes[0].AccountID != "" || body.Mailboxes[0].RemoteAnonymousID != "" {
+		t.Fatalf("lookup leaked internal ownership fields: %+v", body.Mailboxes[0])
+	}
 	updated, ok := store.FindMailboxByEmail("alias@icloud.com")
 	if !ok || updated.Status != StatusAvailable {
 		t.Fatalf("lookup changed mailbox status: %+v ok=%v", updated, ok)
@@ -4526,6 +6876,7 @@ func TestMailboxSchedulerStartsCreatesAndStops(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/start", strings.NewReader(`{"batch_size":200,"interval_seconds":60,"label":"SCH"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("start scheduler = %d body=%s", rr.Code, rr.Body.String())
@@ -4539,6 +6890,7 @@ func TestMailboxSchedulerStartsCreatesAndStops(t *testing.T) {
 		rr = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/icloud/scheduler/status", nil)
 		req.AddCookie(cookie)
+		addClosureTestCSRF(req, cookie)
 		handler.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("scheduler status = %d body=%s", rr.Code, rr.Body.String())
@@ -4562,6 +6914,7 @@ func TestMailboxSchedulerStartsCreatesAndStops(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/stop", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("stop scheduler = %d body=%s", rr.Code, rr.Body.String())
@@ -4591,6 +6944,7 @@ func TestMailboxSchedulerStatusDefaultsRoundInterval(t *testing.T) {
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/icloud/scheduler/status", nil)
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("scheduler status = %d body=%s", rr.Code, rr.Body.String())
@@ -4631,6 +6985,7 @@ func TestMailboxSchedulerStartAcceptsRoundIntervalSeconds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/start", strings.NewReader(`{"interval_minutes":60,"round_interval_seconds":7,"label":"SCH"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("start scheduler = %d body=%s", rr.Code, rr.Body.String())
@@ -4640,6 +6995,7 @@ func TestMailboxSchedulerStartAcceptsRoundIntervalSeconds(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/stop", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(cookie)
+		addClosureTestCSRF(req, cookie)
 		handler.ServeHTTP(rr, req)
 	}()
 	var body struct {
@@ -4683,6 +7039,7 @@ func TestMailboxSchedulerClearLogsKeepsCounters(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/logs/clear", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("clear scheduler logs = %d body=%s", rr.Code, rr.Body.String())
@@ -4769,6 +7126,7 @@ func TestMailboxSchedulerRunsUntilAllAccountsFailWithOnlyInterval(t *testing.T) 
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/start", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("start scheduler = %d body=%s", rr.Code, rr.Body.String())
@@ -4778,6 +7136,7 @@ func TestMailboxSchedulerRunsUntilAllAccountsFailWithOnlyInterval(t *testing.T) 
 		req := httptest.NewRequest(http.MethodPost, "/api/icloud/scheduler/stop", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(cookie)
+		addClosureTestCSRF(req, cookie)
 		handler.ServeHTTP(rr, req)
 	}()
 
@@ -4789,6 +7148,7 @@ func TestMailboxSchedulerRunsUntilAllAccountsFailWithOnlyInterval(t *testing.T) 
 		rr = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodGet, "/api/icloud/scheduler/status", nil)
 		req.AddCookie(cookie)
+		addClosureTestCSRF(req, cookie)
 		handler.ServeHTTP(rr, req)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("scheduler status = %d body=%s", rr.Code, rr.Body.String())
@@ -4955,6 +7315,7 @@ func TestMailboxSchedulerFallsBackToOldInterfaceAfterNewInterfaceFails(t *testin
 		Cookies:            []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}},
 		LoginStates: []LoginState{
 			{Kind: LoginStateAppleAccount, Host: "appleid.apple.com", Origin: "https://account.apple.com", Scnt: "scnt", SessionID: "sid"},
+			{Kind: LoginStateICloudWeb, Host: "www.icloud.com", Origin: "https://www.icloud.com", Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -4994,11 +7355,12 @@ func TestMailboxSchedulerFallsBackToOldInterfaceAfterNewInterfaceFails(t *testin
 	}
 
 	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
-	server.runMailboxSchedulerBatch(context.Background(), ownerID, job, mailboxSchedulerConfig{
+	cfg := mailboxSchedulerConfig{
 		AccountIDs: []string{accountID},
 		Label:      "SCH",
 		BatchSize:  1,
-	}, 1)
+	}
+	server.runMailboxSchedulerBatch(context.Background(), ownerID, job, cfg, 1)
 	state, events := job.snapshot()
 	attemptsMu.Lock()
 	defer attemptsMu.Unlock()
@@ -5040,6 +7402,83 @@ func TestMailboxSchedulerFallsBackToOldInterfaceAfterNewInterfaceFails(t *testin
 	}
 }
 
+func TestMailboxSchedulerDoesNotFallbackAfterUncertainNewInterfaceCreate(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	server := handler.(*Server)
+	ownerID := "owner-scheduler-uncertain"
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AppleID:            "uncertain@example.com",
+		DSID:               "dsid-uncertain",
+		PremiumMailBaseURL: "https://example.invalid",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}},
+		LoginStates: []LoginState{
+			{Kind: LoginStateAppleAccount, Host: "appleid.apple.com", Origin: "https://account.apple.com", Scnt: "scnt", SessionID: "sid"},
+			{Kind: LoginStateICloudWeb, Host: "www.icloud.com", Origin: "https://www.icloud.com", Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions := store.ICloudSessionsForOwner(ownerID)
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	accountID := sessions[0].AccountID
+
+	var attemptsMu sync.Mutex
+	attempts := map[mailboxCreateChannel]int{}
+	server.createMailboxForOwner = func(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
+		channel := mailboxCreateChannelFromContext(ctx)
+		attemptsMu.Lock()
+		attempts[channel]++
+		attemptsMu.Unlock()
+		if channel == mailboxCreateChannelAppleAccount {
+			return Mailbox{}, ICloudRemoteMailbox{}, errCode(
+				"apple_account_create_uncertain",
+				"Apple Account 已提交隐私邮箱确认请求，但未收到可确认的结果",
+				true,
+			)
+		}
+		return Mailbox{}, ICloudRemoteMailbox{}, errCode("unexpected_channel", "unexpected scheduler fallback", false)
+	}
+
+	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
+	cfg := mailboxSchedulerConfig{
+		AccountIDs: []string{accountID},
+		Label:      "SCH",
+		BatchSize:  1,
+	}
+	server.runMailboxSchedulerBatch(context.Background(), ownerID, job, cfg, 1)
+	server.runMailboxSchedulerBatch(context.Background(), ownerID, job, cfg, 2)
+	state, events := job.snapshot()
+	attemptsMu.Lock()
+	defer attemptsMu.Unlock()
+	if attempts[mailboxCreateChannelAppleAccount] != 1 {
+		t.Fatalf("new interface attempts = %d, want 1; attempts=%+v", attempts[mailboxCreateChannelAppleAccount], attempts)
+	}
+	if attempts[mailboxCreateChannelICloudWeb] != 0 {
+		t.Fatalf("old interface attempts = %d, want 0; attempts=%+v", attempts[mailboxCreateChannelICloudWeb], attempts)
+	}
+	if state.Success != 0 || state.Failed != 2 {
+		t.Fatalf("scheduler state = %+v, want success=0 failed=2 across two batches", state)
+	}
+	var sawUncertainFailure, sawSwitch bool
+	for _, event := range events {
+		if event.Type == "failed" && strings.Contains(event.Message, "未收到可确认的结果") {
+			sawUncertainFailure = true
+		}
+		if event.Type == "channel_failed" && strings.Contains(event.Message, "切换旧接口继续尝试") {
+			sawSwitch = true
+		}
+	}
+	if !sawUncertainFailure || sawSwitch {
+		t.Fatalf("events did not preserve uncertain failure without fallback: uncertain=%v switch=%v events=%+v", sawUncertainFailure, sawSwitch, events)
+	}
+}
+
 func TestMailboxSchedulerRetriesNewInterfaceAfterTransientEmptyResponse(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
@@ -5055,6 +7494,7 @@ func TestMailboxSchedulerRetriesNewInterfaceAfterTransientEmptyResponse(t *testi
 		Cookies:            []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}},
 		LoginStates: []LoginState{
 			{Kind: LoginStateAppleAccount, Host: "appleid.apple.com", Origin: "https://account.apple.com", Scnt: "scnt", SessionID: "sid"},
+			{Kind: LoginStateICloudWeb, Host: "www.icloud.com", Origin: "https://www.icloud.com", Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}}},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -5240,6 +7680,88 @@ func TestCreateAppleAccountMailboxKeepsRefreshedStateWhenCreateFails(t *testing.
 	}
 }
 
+func TestCreateAppleAccountMailboxCleansRemoteWhenRefreshedStatePersistenceFails(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-apple-create-session-persist"
+	account, err := store.AddAccountForOwner(ownerID, "Apple Account", "create-session-persist@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   account.AppleID,
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Scnt:            "scnt",
+			APIKey:          "api-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(10 * time.Minute),
+			LastCheckOK:     true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	badPath := filepath.Join(t.TempDir(), "state-dir")
+	if err := os.MkdirAll(badPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			_, _ = w.Write([]byte(`{"emailAddress":"generated-session-persist@icloud.com"}`))
+		case "PUT /account/manage/email/private/add/complete":
+			store.path = badPath
+			_, _ = w.Write([]byte(`{"emailAddress":"created-session-persist@icloud.com","id":"remote-session-persist","active":true}`))
+		case "GET /account/manage/email/private/remote-session-persist.em":
+			_, _ = w.Write([]byte(`{"emailAddress":"created-session-persist@icloud.com","id":"remote-session-persist","active":true}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer remoteServer.Close()
+	appleAccountManageBaseURL = remoteServer.URL
+
+	var cleanupCalled bool
+	var cleaned Mailbox
+	handler.deleteRemoteMailbox = func(_ context.Context, mailbox Mailbox) error {
+		cleanupCalled = true
+		cleaned = mailbox
+		return nil
+	}
+
+	_, remote, err := handler.createICloudMailboxForOwner(context.Background(), ownerID, account.ID, "LAB", "")
+	if !isCodedError(err, "icloud_session_persist_after_mailbox_create") {
+		t.Fatalf("create error = %#v, want icloud_session_persist_after_mailbox_create", err)
+	}
+	if remote.AnonymousID != "remote-session-persist" {
+		t.Fatalf("remote = %+v, want the created remote mailbox for cleanup", remote)
+	}
+	if !cleanupCalled || cleaned.RemoteAnonymousID != "remote-session-persist" {
+		t.Fatalf("cleanup = called:%t mailbox:%+v, want remote cleanup", cleanupCalled, cleaned)
+	}
+	if len(store.Snapshot().Mailboxes) != 0 {
+		t.Fatalf("local mailboxes after session persistence failure = %+v, want none", store.Snapshot().Mailboxes)
+	}
+	if strings.Join(paths, "\n") != strings.Join([]string{
+		"POST /account/manage/email/private/add",
+		"PUT /account/manage/email/private/add/complete",
+		"GET /account/manage/email/private/remote-session-persist.em",
+	}, "\n") {
+		t.Fatalf("remote paths = %#v", paths)
+	}
+}
+
 func TestSaveICloudSessionForOwnerKeepsMultipleAppleAccounts(t *testing.T) {
 	store := newTestStore(t)
 	ownerID := "owner-multi"
@@ -5369,21 +7891,23 @@ func TestSyncICloudMailboxesIsolatesSlowAccounts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	started := time.Now()
 	handler.ServeHTTP(rr, req)
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("sync took %s, want isolated timeout under 1s", elapsed)
 	}
-	if rr.Code != http.StatusOK {
-		t.Fatalf("sync = %d body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("sync = %d body=%s, want 207 for partial success", rr.Code, rr.Body.String())
 	}
 	var data struct {
 		Success   bool                      `json:"success"`
+		Partial   bool                      `json:"partial"`
+		Code      string                    `json:"code"`
 		Total     int                       `json:"total"`
 		Created   int                       `json:"created"`
 		Failed    int                       `json:"failed"`
@@ -5393,7 +7917,7 @@ func TestSyncICloudMailboxesIsolatesSlowAccounts(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
 		t.Fatal(err)
 	}
-	if !data.Success || data.Total != 1 || data.Created != 1 || data.Failed != 1 {
+	if data.Success || !data.Partial || data.Code != "icloud_sync_partial" || data.Total != 1 || data.Created != 1 || data.Failed != 1 {
 		t.Fatalf("response = %+v", data)
 	}
 	if len(data.Mailboxes) != 1 || data.Mailboxes[0].Email != "fast.sync@icloud.com" {
@@ -5416,6 +7940,777 @@ func TestSyncICloudMailboxesIsolatesSlowAccounts(t *testing.T) {
 	}
 	if !sawTimeout || !sawFast {
 		t.Fatalf("results = %+v, want timeout and fast success", data.Results)
+	}
+}
+
+func TestSyncICloudMailboxesUsesSessionAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-icloud-list-fresh"
+	accountID := "account-icloud-list-fresh"
+	requestSeen := make(chan string, 1)
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Header.Get("Cookie")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"timestamp":1,"result":{"hmeEmails":[]}}`))
+	}))
+	defer remoteServer.Close()
+
+	initial := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          accountID,
+		AppleID:            "icloud-list-fresh@example.com",
+		DSID:               "icloud-list-fresh-dsid",
+		PremiumMailBaseURL: remoteServer.URL,
+		Cookies: []SessionCookie{{
+			Name:   "session",
+			Value:  "stale-cookie",
+			Domain: "127.0.0.1",
+			Path:   "/",
+		}},
+		LoginStates: []LoginState{{
+			Kind: LoginStateICloudWeb,
+			Cookies: []SessionCookie{{
+				Name:   "session",
+				Value:  "stale-cookie",
+				Domain: "127.0.0.1",
+				Path:   "/",
+			}},
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, syncErr := handler.syncICloudMailboxesForSession(
+			context.Background(),
+			httptest.NewRequest(http.MethodGet, "/", nil),
+			ownerID,
+			initial,
+		)
+		done <- syncErr
+	}()
+
+	select {
+	case <-requestSeen:
+		releaseAccountOperation()
+		t.Fatal("iCloud mailbox list ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.Cookies[0].Value = "fresh-cookie"
+	fresh.LoginStates[0].Cookies[0].Value = "fresh-cookie"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case cookie := <-requestSeen:
+		if !strings.Contains(cookie, "session=fresh-cookie") {
+			t.Fatalf("iCloud mailbox list cookie = %q, want fresh-cookie", cookie)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("iCloud mailbox list request was not sent")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("iCloud mailbox sync error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("iCloud mailbox sync did not finish")
+	}
+}
+
+func TestCleanRemoteMailboxUsesSessionAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-clean-fresh-session"
+	accountID := "account-clean-fresh-session"
+	requestSeen := make(chan string, 2)
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Header.Get("Cookie")
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"trash","name":"Deleted Messages","messageCount":0}]}`))
+		case "/mailws2/v1/message/list":
+			_, _ = w.Write([]byte(`{"domainObjects":[]}`))
+		default:
+			t.Fatalf("unexpected cleanup request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer remoteServer.Close()
+
+	initial := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          accountID,
+		AppleID:            "clean-fresh-session@example.com",
+		DSID:               "clean-fresh-session-dsid",
+		MailGatewayBaseURL: remoteServer.URL,
+		Cookies: []SessionCookie{{
+			Name:   "session",
+			Value:  "stale-cookie",
+			Domain: "127.0.0.1",
+			Path:   "/",
+		}},
+		LoginStates: []LoginState{{
+			Kind: LoginStateICloudWeb,
+			Cookies: []SessionCookie{{
+				Name:   "session",
+				Value:  "stale-cookie",
+				Domain: "127.0.0.1",
+				Path:   "/",
+			}},
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwner(ownerID, accountID, "clean-fresh", "clean-fresh.alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/mailboxes/"+mailbox.ID+"/remote-clean", strings.NewReader(`{"move_synced":false,"empty_trash":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", mailbox.ID)
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCleanRemoteMailbox(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-requestSeen:
+		releaseAccountOperation()
+		t.Fatal("remote cleanup ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.Cookies[0].Value = "fresh-cookie"
+	fresh.LoginStates[0].Cookies[0].Value = "fresh-cookie"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case cookie := <-requestSeen:
+		if !strings.Contains(cookie, "session=fresh-cookie") {
+			t.Fatalf("remote cleanup cookie = %q, want fresh-cookie", cookie)
+		}
+	case <-time.After(time.Second):
+		select {
+		case <-done:
+			t.Fatalf("remote cleanup request was not sent; response=%d body=%s", rr.Code, rr.Body.String())
+		default:
+			t.Fatal("remote cleanup request was not sent")
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("remote cleanup did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("remote cleanup status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCleanRemoteMailboxesUsesSessionAfterGateWait(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-clean-bulk-fresh-session"
+	account, err := store.AddAccountForOwner(ownerID, "Clean bulk fresh", "clean-bulk-fresh-session@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID := account.ID
+	requestSeen := make(chan string, 2)
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestSeen <- r.Header.Get("Cookie")
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"trash","name":"Deleted Messages","messageCount":0}]}`))
+		case "/mailws2/v1/message/list":
+			_, _ = w.Write([]byte(`{"domainObjects":[]}`))
+		default:
+			t.Fatalf("unexpected bulk cleanup request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer remoteServer.Close()
+
+	initial := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          accountID,
+		AppleID:            "clean-bulk-fresh-session@example.com",
+		DSID:               "clean-bulk-fresh-session-dsid",
+		MailGatewayBaseURL: remoteServer.URL,
+		Cookies: []SessionCookie{{
+			Name:   "session",
+			Value:  "stale-cookie",
+			Domain: "127.0.0.1",
+			Path:   "/",
+		}},
+		LoginStates: []LoginState{{
+			Kind: LoginStateICloudWeb,
+			Cookies: []SessionCookie{{
+				Name:   "session",
+				Value:  "stale-cookie",
+				Domain: "127.0.0.1",
+				Path:   "/",
+			}},
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddMailboxForOwner(ownerID, accountID, "clean-bulk-fresh", "clean-bulk-fresh.alias@icloud.com"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+
+	releaseAccountOperation, err := handler.acquireMailboxAccountOperationSlot(
+		context.Background(),
+		mailboxAccountOperationKey(ownerID, accountID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/mailboxes/remote-clean", strings.NewReader(
+		fmt.Sprintf(`{"account_id":%q,"move_synced":false,"empty_trash":true}`, accountID),
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.handleCleanRemoteMailboxes(rr, req)
+		close(done)
+	}()
+
+	select {
+	case <-requestSeen:
+		releaseAccountOperation()
+		t.Fatal("bulk remote cleanup ran before the account gate was released")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fresh := cloneICloudSession(initial)
+	fresh.Cookies[0].Value = "fresh-cookie"
+	fresh.LoginStates[0].Cookies[0].Value = "fresh-cookie"
+	if err := store.SaveICloudSessionForOwner(ownerID, fresh); err != nil {
+		releaseAccountOperation()
+		t.Fatal(err)
+	}
+	releaseAccountOperation()
+
+	select {
+	case cookie := <-requestSeen:
+		if !strings.Contains(cookie, "session=fresh-cookie") {
+			t.Fatalf("bulk remote cleanup cookie = %q, want fresh-cookie", cookie)
+		}
+	case <-time.After(time.Second):
+		select {
+		case <-done:
+			t.Fatalf("bulk remote cleanup request was not sent; response=%d body=%s", rr.Code, rr.Body.String())
+		default:
+			t.Fatal("bulk remote cleanup request was not sent")
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bulk remote cleanup did not finish")
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("bulk remote cleanup status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSyncICloudMailboxesReturnsFailureWhenAllAccountsFail(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger())
+	cookie, user := registerTestUser(t, handler, "sync-all-failed", "sync123")
+
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "provider unavailable", http.StatusBadGateway)
+	}))
+	defer remoteServer.Close()
+
+	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
+		OwnerID:            user.ID,
+		AppleID:            "failed@example.com",
+		DSID:               "failed-dsid",
+		ClientID:           "failed-client",
+		PremiumMailBaseURL: remoteServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "failed", Domain: "127.0.0.1", Path: "/"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("sync status = %d body=%s, want %d", rr.Code, rr.Body.String(), http.StatusBadGateway)
+	}
+	var data struct {
+		Success bool                      `json:"success"`
+		Code    string                    `json:"code"`
+		Message string                    `json:"message"`
+		Failed  int                       `json:"failed"`
+		Results []syncICloudMailboxResult `json:"results"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Success || data.Code != "icloud_sync_failed" || data.Failed != 1 || len(data.Results) != 1 {
+		t.Fatalf("response = %+v, want failed response with per-account result", data)
+	}
+	if !strings.Contains(data.Message, "全部") {
+		t.Fatalf("message = %q, want all-failed detail", data.Message)
+	}
+}
+
+func TestSyncICloudMailboxesIncludesAppleAccountOnlySessions(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	cookie, user := registerTestUser(t, handler, "sync-apple-only", "sync123")
+
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/account/manage/email/private" {
+			t.Fatalf("Apple Account list path = %q, want /account/manage/email/private", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"result": {
+				"hmeEmails": [
+					{"id":"apple-only-remote","emailAddress":"apple-only@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"timestamp": 1,
+			"result": {
+				"forwardToEmails": [],
+				"hmeEmails": [
+					{"anonymousId":"web-only-remote","hme":"web-only@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer webServer.Close()
+
+	sessions := []ICloudSession{
+		{
+			OwnerID:            user.ID,
+			AppleID:            "apple-only@example.com",
+			DSID:               "apple-only-dsid",
+			PremiumMailBaseURL: "https://apple-account-only.invalid",
+			Cookies:            []SessionCookie{{Name: "session", Value: "apple-account-cookie"}},
+			LoginStates: []LoginState{{
+				Kind:    LoginStateAppleAccount,
+				Scnt:    "scnt",
+				APIKey:  "api-key",
+				Cookies: []SessionCookie{{Name: "session", Value: "apple-account-cookie"}},
+			}},
+		},
+		{
+			OwnerID:            user.ID,
+			AppleID:            "icloud-web@example.com",
+			DSID:               "icloud-web-dsid",
+			PremiumMailBaseURL: webServer.URL,
+			Cookies:            []SessionCookie{{Name: "session", Value: "icloud-web-cookie"}},
+		},
+	}
+	for _, session := range sessions {
+		if err := store.SaveICloudSessionForOwner(user.ID, session); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sync = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var data struct {
+		Success   bool                      `json:"success"`
+		Total     int                       `json:"total"`
+		Created   int                       `json:"created"`
+		Failed    int                       `json:"failed"`
+		Results   []syncICloudMailboxResult `json:"results"`
+		Mailboxes []publicMailbox           `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.Success || data.Total != 2 || data.Created != 2 || data.Failed != 0 {
+		t.Fatalf("response = %+v, want Apple Account-only session included", data)
+	}
+	if len(data.Results) != 2 || len(data.Mailboxes) != 2 {
+		t.Fatalf("results/mailboxes = %d/%d, want two sessions and two mailboxes", len(data.Results), len(data.Mailboxes))
+	}
+	var sawApple, sawWeb bool
+	for _, result := range data.Results {
+		switch result.AppleID {
+		case "apple-only@example.com":
+			sawApple = result.Source == string(mailboxCreateChannelAppleAccount)
+		case "icloud-web@example.com":
+			sawWeb = result.Source == string(mailboxCreateChannelICloudWeb)
+		}
+	}
+	if !sawApple || !sawWeb {
+		t.Fatalf("results = %+v, want Apple Account and iCloud Web sessions", data.Results)
+	}
+}
+
+func TestAdminSyncICloudMailboxesCoversAllOwnedSessions(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, admin := registerTestUser(t, handler, "sync-all-admin", "sync123")
+	_, normal := registerTestUser(t, handler, "sync-all-user", "sync123")
+
+	adminServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"timestamp": 1,
+			"result": {
+				"forwardToEmails": [],
+				"hmeEmails": [
+					{"anonymousId":"admin-sync-remote","hme":"admin-sync@example.com","label":"ADMIN","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer adminServer.Close()
+	normalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"timestamp": 1,
+			"result": {
+				"forwardToEmails": [],
+				"hmeEmails": [
+					{"anonymousId":"user-sync-remote","hme":"user-sync@example.com","label":"USER","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer normalServer.Close()
+
+	for _, session := range []ICloudSession{
+		{
+			OwnerID:            admin.ID,
+			AppleID:            "sync-all-admin@example.com",
+			DSID:               "sync-all-admin-dsid",
+			PremiumMailBaseURL: adminServer.URL,
+			Host:               "www.icloud.com",
+			Cookies:            []SessionCookie{{Name: "session", Value: "sync-all-admin-cookie", Domain: "127.0.0.1", Path: "/"}},
+		},
+		{
+			OwnerID:            normal.ID,
+			AppleID:            "sync-all-user@example.com",
+			DSID:               "sync-all-user-dsid",
+			PremiumMailBaseURL: normalServer.URL,
+			Host:               "www.icloud.com",
+			Cookies:            []SessionCookie{{Name: "session", Value: "sync-all-user-cookie", Domain: "127.0.0.1", Path: "/"}},
+		},
+	} {
+		if err := store.SaveICloudSessionForOwner(session.OwnerID, session); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync?owner_id=all", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("admin sync = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var data struct {
+		Success   bool                      `json:"success"`
+		Total     int                       `json:"total"`
+		Created   int                       `json:"created"`
+		Failed    int                       `json:"failed"`
+		Results   []syncICloudMailboxResult `json:"results"`
+		Mailboxes []publicMailbox           `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if !data.Success || data.Total != 2 || data.Created != 2 || data.Failed != 0 {
+		t.Fatalf("admin sync response = %+v, want both owned sessions synchronized", data)
+	}
+	if len(data.Results) != 2 || len(data.Mailboxes) != 2 {
+		t.Fatalf("admin sync response sizes = results:%d mailboxes:%d, want 2 each", len(data.Results), len(data.Mailboxes))
+	}
+	owners := map[string]bool{}
+	for _, mailbox := range data.Mailboxes {
+		owners[mailbox.OwnerID] = true
+	}
+	if !owners[admin.ID] || !owners[normal.ID] {
+		t.Fatalf("admin sync mailbox owners = %+v, want admin and normal user", owners)
+	}
+}
+
+func TestSyncICloudMailboxesDoesNotMarkOtherProviderMailboxesMissing(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	cookie, user := registerTestUser(t, handler, "sync-mixed-origin", "sync123")
+	account, err := store.AddAccountForOwner(user.ID, "Mixed Origin", "mixed-origin@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+	appleCalled := false
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/account/manage/email/private" {
+			t.Fatalf("Apple Account list path = %q, want /account/manage/email/private", r.URL.Path)
+		}
+		appleCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"result": {
+				"hmeEmails": [
+					{"id":"mixed-apple-missing","emailAddress":"mixed-apple-missing@example.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"timestamp": 1,
+			"result": {
+				"forwardToEmails": [],
+				"hmeEmails": [
+					{"anonymousId":"mixed-web-listed","hme":"mixed-web-listed@example.com","label":"WEB","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer remoteServer.Close()
+
+	session := ICloudSession{
+		OwnerID:            user.ID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "mixed-origin-dsid",
+		PremiumMailBaseURL: remoteServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "mixed-origin-cookie", Domain: "127.0.0.1", Path: "/"}},
+		LoginStates: []LoginState{
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "mixed-origin-cookie", Domain: "127.0.0.1", Path: "/"}},
+			},
+			{
+				Kind:   LoginStateAppleAccount,
+				Scnt:   "mixed-origin-scnt",
+				APIKey: "mixed-origin-api-key",
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(user.ID, session); err != nil {
+		t.Fatal(err)
+	}
+	webMailbox, err := store.AddMailboxForOwnerWithRemote(user.ID, account.ID, ICloudRemoteMailbox{
+		AnonymousID: "mixed-web-listed",
+		Origin:      "ICLOUD_WEB",
+		Email:       "mixed-web-listed@example.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appleMailbox, err := store.AddMailboxForOwnerWithRemote(user.ID, account.ID, ICloudRemoteMailbox{
+		AnonymousID: "mixed-apple-missing",
+		Origin:      "APPLE_ACCOUNT",
+		Email:       "mixed-apple-missing@example.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("mixed-origin sync = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var data struct {
+		RemoteMissing int `json:"remote_missing"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.RemoteMissing != 0 {
+		t.Fatalf("remote_missing = %d, want no cross-provider missing mark", data.RemoteMissing)
+	}
+	if !appleCalled {
+		t.Fatal("Apple Account provider was not synchronized when both login states were present")
+	}
+	currentWeb, ok := store.FindMailboxByID(webMailbox.ID)
+	if !ok {
+		t.Fatal("listed iCloud Web mailbox disappeared")
+	}
+	if !currentWeb.ICloudActive || currentWeb.Status == StatusDisabled {
+		t.Fatalf("listed iCloud Web mailbox = %+v, want active state", currentWeb)
+	}
+	currentApple, ok := store.FindMailboxByID(appleMailbox.ID)
+	if !ok {
+		t.Fatal("Apple Account mailbox disappeared")
+	}
+	if !currentApple.ICloudActive || currentApple.Status == StatusDisabled || !currentApple.RemoteMissingAt.IsZero() {
+		t.Fatalf("Apple Account mailbox = %+v, want unchanged active state", currentApple)
+	}
+}
+
+func TestSyncICloudMailboxesReportsPartialProviderSourceFailure(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	cookie, user := registerTestUser(t, handler, "sync-partial-source", "sync123")
+	account, err := store.AddAccountForOwner(user.ID, "Partial Source", "partial-source@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/account/manage/email/private" {
+			t.Fatalf("Apple Account list path = %q, want /account/manage/email/private", r.URL.Path)
+		}
+		http.Error(w, "Apple Account provider unavailable", http.StatusBadGateway)
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"timestamp": 1,
+			"result": {
+				"forwardToEmails": [],
+				"hmeEmails": [
+					{"anonymousId":"partial-web-listed","hme":"partial-web-listed@example.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer remoteServer.Close()
+
+	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
+		OwnerID:            user.ID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "partial-source-dsid",
+		PremiumMailBaseURL: remoteServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "partial-source-cookie", Domain: "127.0.0.1", Path: "/"}},
+		LoginStates: []LoginState{
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "partial-source-cookie", Domain: "127.0.0.1", Path: "/"}},
+			},
+			{
+				Kind:   LoginStateAppleAccount,
+				Scnt:   "partial-source-scnt",
+				APIKey: "partial-source-api-key",
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusMultiStatus {
+		t.Fatalf("partial-source sync status = %d body=%s, want 207", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Success bool   `json:"success"`
+		Partial bool   `json:"partial"`
+		Code    string `json:"code"`
+		Failed  int    `json:"failed"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Success || !response.Partial || response.Code != "icloud_sync_partial" || response.Failed != 1 {
+		t.Fatalf("partial-source sync response = %+v, want success=false partial=true code=icloud_sync_partial failed=1", response)
 	}
 }
 
@@ -5452,6 +8747,7 @@ func TestCreateICloudMailboxCreatesForEachSavedSession(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(`{"label":"LAB"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create = %d body=%s", rr.Code, rr.Body.String())
@@ -5517,6 +8813,7 @@ func TestCreateICloudMailboxUsesSelectedSavedSessions(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(bodyJSON))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create = %d body=%s", rr.Code, rr.Body.String())
@@ -5571,6 +8868,7 @@ func TestCreateICloudMailboxResponseIncludesCreateChannel(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(`{"label":"SOURCE"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create = %d body=%s", rr.Code, rr.Body.String())
@@ -5638,6 +8936,7 @@ func TestCreateICloudMailboxUsesRequestedCreateChannel(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(fmt.Sprintf(`{"account_id":%q,"label":"REQ","create_channel":"icloud_web"}`, accountID)))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create = %d body=%s", rr.Code, rr.Body.String())
@@ -5668,6 +8967,7 @@ func TestCreateSettingsAreSavedServerSide(t *testing.T) {
 	}`, account.ID)))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("save settings = %d body=%s", rr.Code, rr.Body.String())
@@ -5676,6 +8976,7 @@ func TestCreateSettingsAreSavedServerSide(t *testing.T) {
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/create-settings", nil)
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("get settings = %d body=%s", rr.Code, rr.Body.String())
@@ -5751,19 +9052,21 @@ func TestCreateICloudMailboxReturnsAccountFailuresWhenAllSelectedSessionsFail(t 
 	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(`{"label":"FAIL"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusMultiStatus {
 		t.Fatalf("create = %d body=%s", rr.Code, rr.Body.String())
 	}
 	var body struct {
 		Success  bool                   `json:"success"`
+		Message  string                 `json:"message"`
 		Created  int                    `json:"created"`
 		Failures []createMailboxFailure `json:"failures"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if !body.Success || body.Created != 0 || len(body.Failures) != 2 {
+	if body.Success || strings.TrimSpace(body.Message) == "" || body.Created != 0 || len(body.Failures) != 2 {
 		t.Fatalf("body = %+v, want two account failures", body)
 	}
 }
@@ -5829,6 +9132,48 @@ func newTestStore(t *testing.T) *FileStore {
 	return store
 }
 
+func saveTestAppleAccountSession(t *testing.T, store *FileStore, ownerID, accountID, appleID string) {
+	t.Helper()
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: accountID,
+		AppleID:   appleID,
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			APIKey:          "test-api-key",
+			Scnt:            "scnt",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(10 * time.Minute),
+			LastCheckOK:     true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveTestICloudWebSession(t *testing.T, store *FileStore, ownerID, accountID, appleID string) {
+	t.Helper()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          accountID,
+		AppleID:            appleID,
+		DSID:               "test-dsid",
+		ClientID:           "cid",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		PremiumMailBaseURL: "https://p123-mailws.icloud.com",
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "cookie"}},
+		LoginStates: []LoginState{{
+			Kind:    LoginStateICloudWeb,
+			Cookies: []SessionCookie{{Name: "session", Value: "cookie"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func registerTestUser(t *testing.T, handler http.Handler, username, password string) (*http.Cookie, publicUser) {
 	t.Helper()
 	rr := httptest.NewRecorder()
@@ -5859,6 +9204,7 @@ func createTestMailboxWithCookie(t *testing.T, handler http.Handler, cookie *htt
 	req := httptest.NewRequest(http.MethodPost, "/api/mailboxes", strings.NewReader(`{"label":"`+label+`","email":"`+email+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("create mailbox %s = %d body=%s", email, rr.Code, rr.Body.String())

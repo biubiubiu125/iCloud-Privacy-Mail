@@ -117,7 +117,7 @@ func TestLiveAppleAccountCreateMailboxAndSave(t *testing.T) {
 	if err := store.SaveICloudSessionForOwner(ownerID, updatedSession); err != nil {
 		t.Fatalf("save updated Apple Account state: %v", err)
 	}
-	mailbox, err := store.AddMailboxForOwner(ownerID, updatedSession.AccountID, remote.Label, remote.Email)
+	mailbox, err := store.AddMailboxForOwnerWithRemote(ownerID, updatedSession.AccountID, remote, "live Apple Account private email create test")
 	if err != nil {
 		t.Fatalf("save created mailbox record: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestLiveAppleAccountCheckSavedManageState(t *testing.T) {
 	}
 	ownerID := liveOwnerID(store)
 	if ownerID == "" {
-		t.Fatalf("set IPM_LIVE_OWNER_ID or keep exactly one local user before live check")
+		t.Skip("set IPM_LIVE_OWNER_ID or keep exactly one local user before live check")
 	}
 	session, ok := liveAppleAccountSession(store, ownerID)
 	if !ok {

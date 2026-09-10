@@ -156,6 +156,16 @@ func TestIMAPSearchCommandUsesUIDCursorWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestFirstIntValuesKeepsOldestUIDs(t *testing.T) {
+	got := firstIntValues([]int{100, 101, 102, 193, 200}, 3)
+	if len(got) != 3 || got[0] != 100 || got[1] != 101 || got[2] != 102 {
+		t.Fatalf("firstIntValues = %v, want oldest 3 UIDs", got)
+	}
+	if got := firstIntValues([]int{1, 2}, 8); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("firstIntValues short list = %v", got)
+	}
+}
+
 func TestIMAPSearchCommandPrefersAccountCursor(t *testing.T) {
 	command := imapSearchCommand(LoginState{IMAPLastSyncUID: "100"}, []Mailbox{
 		{Email: "one@icloud.com"},

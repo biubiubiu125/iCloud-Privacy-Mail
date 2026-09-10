@@ -237,14 +237,14 @@ Authorization: Bearer <api_key>
 }
 ```
 
-失败：
+仅 iCloud 不可用时：
 
 ```json
 {
-  "success": false,
-  "code": "icloud_inactive",
-  "message": "iCloud 登录态失效",
-  "retryable": false
+  "success": true,
+  "api_active": true,
+  "icloud_active": false,
+  "time": "2026-06-21T12:00:00+08:00"
 }
 ```
 
@@ -275,6 +275,7 @@ Content-Type: application/json
     "email": "demo_alias@icloud.com",
     "label": "UPI-70-13",
     "api_url": "https://example.local/api/v1/mailboxes/demo_alias%40icloud.com/code",
+    "api_token": "...",
     "api_active": true,
     "icloud_active": true
   }
@@ -303,9 +304,9 @@ Authorization: Bearer <api_key>
 
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
-| `project` | 否 | 项目标识，默认 `openai` |
+| `project` | 否 | 项目标识；未传 `keyword` 时会映射为验证码匹配关键词，默认 `openai` |
 | `after` | 是 | 触发 OTP 之后的时间，只接受这个时间之后的新邮件 |
-| `keyword` | 否 | 邮件关键词，默认 `OpenAI` |
+| `keyword` | 否 | 邮件关键词；优先级高于 `project`，默认 `OpenAI` |
 
 成功：
 
@@ -337,7 +338,7 @@ Authorization: Bearer <api_key>
 {
   "success": false,
   "code": "icloud_inactive",
-  "message": "iCloud 登录态失效",
+  "message": "邮箱已停用或 iCloud 状态不可用",
   "retryable": false
 }
 ```
@@ -781,14 +782,20 @@ CREATE TABLE mail_messages (
 ### 15.3 自建平台 API
 
 ```http
-GET /api/v1/mailboxes
-POST /api/v1/mailboxes
-POST /api/v1/mailboxes/{id}/verify
-GET /api/v1/mailboxes/{id}/messages
-GET /api/v1/mailboxes/{id}/code
-POST /api/v1/mailboxes/{id}/disable
-DELETE /api/v1/mailboxes/{id}
+GET /api/mailboxes
+POST /api/mailboxes
+POST /api/mailboxes/{id}/verify
+GET /api/mailboxes/{id}/messages
+GET /api/mailboxes/{id}/code
+POST /api/mailboxes/{id}/disable
+POST /api/mailboxes/{id}/bind
+POST /api/mailboxes/{id}/sync
+POST /api/mailboxes/{id}/remote-clean
+POST /api/mailboxes/bulk-delete
+DELETE /api/mailboxes/{id}
 ```
+
+`POST /api/icloud/mailboxes/sync` 执行多账号或混合来源同步时，部分来源失败返回 HTTP `207`，响应包含 `"success": false`、`"partial": true`、`"code": "icloud_sync_partial"` 和逐账号 `results`；成功来源已经写入的邮箱不会回滚。全部来源失败时返回 HTTP `502` 和 `icloud_sync_failed`。
 
 ### 15.4 自建平台前提
 
@@ -888,8 +895,8 @@ DELETE /api/v1/mailboxes/{id}
 5. 支持 `POST /api/mailboxes/{id}/sync` 手动同步邮件。
 6. 支持 `GET /api/v1/health` 和 `POST /api/v1/mailboxes/claim` 给外部系统检查/自动取号。
 7. 管理面板改为账号密码登录；第一个注册账号自动成为管理员，普通账号只能访问自己的数据。
-8. 已移除旧版 Admin Key 管理入口；对外取码仍保留单邮箱 key，全局 `api_key` 只用于健康检查和自动取号。
-9. 支持从前端导出当前账号有权访问的数据，服务器数据目录不再由前端修改。
+8. 已移除旧版 Admin Key 管理入口；对外取码仍保留单邮箱 key，也接受请求头中的全局 `api_key`；全局 key 可用于健康检查、自动取号、批量查询和按邮箱取码，不接受放在 URL 查询参数中。
+9. 完整运行时状态导出仅管理员可用；普通用户只可导出自己有权访问的邮箱 API 和邮箱地址，服务器数据目录不再由前端修改。
 10. 支持同一平台账号保存多个 Apple/iCloud 登录态，每个登录态都有独立 `account_id`。
 11. 首页登录态和邮箱池按 Apple 账号 TAB 展示；创建、同步、导出都可以按指定 Apple 登录态隔离。
 12. 同步 iCloud 已有邮箱时，会把邮箱写入当前登录态对应的 `account_id`，避免落入“未绑定 Apple 账号”分组。
@@ -916,14 +923,15 @@ DELETE /api/v1/mailboxes/{id}
 | `account_id` | Apple 登录态、邮箱 | 区分同一平台账号下的多个 Apple/iCloud 登录态 |
 | `email` | 隐私邮箱 | 邮箱唯一键；导出、取码、合并数据时按它定位 |
 
-创建和同步邮箱时必须写入当前 Apple 登录态的 `account_id`。如果老数据没有 `account_id`，前端会显示为“未绑定 Apple 账号”，需要通过同步或迁移脚本补齐。
+创建和同步邮箱时必须写入当前 Apple 登录态的 `account_id`。如果老数据没有 `account_id`，前端会显示为“未绑定 Apple 账号”，
+可以通过 `POST /api/mailboxes/{id}/bind` 补绑定到同一平台用户的账号；绑定接口拒绝跨用户账号，也不允许覆盖已有的其他账号绑定。
 
 ### 20.2 API token 稳定性
 
 邮箱 API token 只由邮箱记录里的 `api_token` 决定：
 
 - 服务重启、二进制替换、模板更新、systemd 重启不会改变 token。
-- `public_base_url` 改动只影响复制出来的 URL 前缀，不影响 `key=`。
+- `public_base_url` 改动只影响复制出来的 API URL 前缀，不影响独立 API token。
 - 删除/重建邮箱、手动改 `state.json`、或把另一份状态文件覆盖到服务器，才会改变已有邮箱 token。
 
 ### 20.3 服务器合并规则
