@@ -1225,6 +1225,426 @@ func TestPublicViewsExposeFullAppleID(t *testing.T) {
 	}
 }
 
+func TestPublicAccountExposesFullProxyAndApplePassword(t *testing.T) {
+	store := newTestStore(t)
+	server := &Server{cfg: Config{PublicBaseURL: "https://mail.example"}, store: store, logger: discardLogger()}
+	account, err := store.AddAccountForOwnerWithProxy("owner-full-proxy", "Main", "proxy.user@example.com", "", "http://user:pass@127.0.0.1:7890")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccountApplePasswordForOwner("owner-full-proxy", account.ID, account.AppleID, "apple-secret"); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account missing after password save")
+	}
+
+	gotAccount := server.publicAccount(account)
+	if gotAccount.ProxyURL != "http://user:pass@127.0.0.1:7890" {
+		t.Fatalf("public account proxy = %q, want full proxy with credentials", gotAccount.ProxyURL)
+	}
+	if gotAccount.ApplePassword != "" {
+		t.Fatalf("default public account password = %q, want omitted", gotAccount.ApplePassword)
+	}
+	gotSecret := server.publicAccountWithSecrets(account)
+	if gotSecret.ApplePassword != "apple-secret" {
+		t.Fatalf("secret public account password = %q, want stored Apple password", gotSecret.ApplePassword)
+	}
+	if gotSecret.ProxyURL != "http://user:pass@127.0.0.1:7890" {
+		t.Fatalf("secret public account proxy = %q, want full proxy with credentials", gotSecret.ProxyURL)
+	}
+
+	gotSession := publicSession(&ICloudSession{
+		SavedAt:   time.Now(),
+		AccountID: account.ID,
+		AppleID:   account.AppleID,
+		ProxyURL:  "socks5://user:pass@127.0.0.1:1080",
+	})
+	if gotSession.ProxyURL != "socks5://user:pass@127.0.0.1:1080" {
+		t.Fatalf("public session proxy = %q, want full proxy with credentials", gotSession.ProxyURL)
+	}
+}
+
+func TestSaveAccountApplePasswordForOwner(t *testing.T) {
+	store := newTestStore(t)
+	account, err := store.AddAccountForOwner("owner-password", "Main", "password.user@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccountApplePasswordForOwner("owner-password", "", account.AppleID, "first-secret"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := store.FindAccountByID(account.ID)
+	if !ok || got.ApplePassword != "first-secret" {
+		t.Fatalf("password by apple id = %+v ok=%t", got, ok)
+	}
+	if err := store.SaveAccountApplePasswordForOwner("owner-password", account.ID, "", "second-secret"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok = store.FindAccountByID(account.ID)
+	if !ok || got.ApplePassword != "second-secret" {
+		t.Fatalf("password by account id = %+v ok=%t", got, ok)
+	}
+	if err := store.SaveAccountApplePasswordForOwner("other-owner", account.ID, "", "third-secret"); !isCodedError(err, "account_forbidden") {
+		t.Fatalf("other owner error = %#v, want account_forbidden", err)
+	}
+}
+
+func TestAppleAccountLoginStartPersistsApplePassword(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	cookie, user := registerTestUser(t, handler, "login-save-password", "panel-pass")
+	account, err := store.AddAccountForOwnerWithProxy(user.ID, "Save password", "save-pass@example.com", "", "http://user:pass@10.0.0.8:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.startAppleAccountLogin = func(
+		ctx context.Context,
+		appleID, password string,
+		pendingStore *appleAuthPendingStore,
+		twoFactorMethod, proxyURL, ownerID string,
+	) (appleAuthStartResult, error) {
+		return appleAuthStartResult{
+			Needs2FA:  true,
+			PendingID: "pending-save-password",
+			AppleID:   account.AppleID,
+			ExpiresAt: time.Now().Add(time.Minute),
+			Message:   "need 2fa",
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/start", strings.NewReader(fmt.Sprintf(
+		`{"apple_id":%q,"password":"apple-login-secret","account_id":%q,"proxy_url":"http://user:pass@10.0.0.8:1080"}`,
+		account.AppleID,
+		account.ID,
+	)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("login start status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, ok := store.FindAccountByID(account.ID)
+	if !ok || updated.ApplePassword != "apple-login-secret" {
+		t.Fatalf("account after login start = %+v ok=%t", updated, ok)
+	}
+	got := handler.publicAccount(updated)
+	if got.ProxyURL != "http://user:pass@10.0.0.8:1080" {
+		t.Fatalf("public proxy after login start = %q", got.ProxyURL)
+	}
+	if got.ApplePassword != "" {
+		t.Fatalf("manage-style public account leaked password = %q", got.ApplePassword)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	listReq.AddCookie(cookie)
+	listRR := httptest.NewRecorder()
+	handler.ServeHTTP(listRR, listReq)
+	if listRR.Code != http.StatusOK {
+		t.Fatalf("list accounts status = %d body=%s", listRR.Code, listRR.Body.String())
+	}
+	var listed struct {
+		Success  bool            `json:"success"`
+		Accounts []publicAccount `json:"accounts"`
+	}
+	if err := json.NewDecoder(listRR.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if !listed.Success || len(listed.Accounts) != 1 {
+		t.Fatalf("list accounts = %+v", listed)
+	}
+	if listed.Accounts[0].ApplePassword != "apple-login-secret" {
+		t.Fatalf("GET /api/accounts password = %q", listed.Accounts[0].ApplePassword)
+	}
+	if listed.Accounts[0].ProxyURL != "http://user:pass@10.0.0.8:1080" {
+		t.Fatalf("GET /api/accounts proxy = %q", listed.Accounts[0].ProxyURL)
+	}
+
+	manageReq := httptest.NewRequest(http.MethodGet, "/api/manage/data", nil)
+	manageReq.AddCookie(cookie)
+	manageRR := httptest.NewRecorder()
+	handler.ServeHTTP(manageRR, manageReq)
+	if manageRR.Code != http.StatusOK {
+		t.Fatalf("manage data status = %d body=%s", manageRR.Code, manageRR.Body.String())
+	}
+	var manage struct {
+		Success  bool            `json:"success"`
+		Accounts []publicAccount `json:"accounts"`
+	}
+	if err := json.NewDecoder(manageRR.Body).Decode(&manage); err != nil {
+		t.Fatal(err)
+	}
+	if !manage.Success || len(manage.Accounts) != 1 {
+		t.Fatalf("manage data = %+v", manage)
+	}
+	if manage.Accounts[0].ApplePassword != "" {
+		t.Fatalf("manage data leaked apple password = %q", manage.Accounts[0].ApplePassword)
+	}
+	if manage.Accounts[0].ProxyURL != "http://user:pass@10.0.0.8:1080" {
+		t.Fatalf("manage data proxy = %q", manage.Accounts[0].ProxyURL)
+	}
+}
+
+func TestICloudProtocolLoginStartPersistsApplePassword(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	cookie, user := registerTestUser(t, handler, "protocol-save-password", "panel-pass")
+	account, err := store.AddAccountForOwnerWithProxy(user.ID, "Protocol password", "protocol-pass@example.com", "", "socks5://user:pass@127.0.0.1:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.startICloudProtocolLogin = func(
+		ctx context.Context,
+		appleID, password, defaultHost, clientID string,
+		pendingStore *appleAuthPendingStore,
+		twoFactorMethod, proxyURL, ownerID string,
+	) (appleAuthStartResult, error) {
+		return appleAuthStartResult{
+			Session: ICloudSession{
+				AppleID:  account.AppleID,
+				ProxyURL: "socks5://user:pass@127.0.0.1:1080",
+			},
+			AppleID: account.AppleID,
+			Message: "login started",
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/protocol-login/start", strings.NewReader(fmt.Sprintf(
+		`{"apple_id":%q,"password":"protocol-login-secret","account_id":%q}`,
+		account.AppleID,
+		account.ID,
+	)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("protocol login start status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, ok := store.FindAccountByID(account.ID)
+	if !ok || updated.ApplePassword != "protocol-login-secret" {
+		t.Fatalf("account after protocol login start = %+v ok=%t", updated, ok)
+	}
+}
+
+func TestSavePendingICloudSessionPersistsApplePassword(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	_, user := registerTestUser(t, handler, "pending-save-password", "user123")
+	account, err := store.AddAccountForOwner(user.ID, "Apple", "pending-pass@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = handler.savePendingICloudSession(appleAuthPending{
+		OwnerID:       user.ID,
+		TargetOwnerID: user.ID,
+		AccountID:     account.ID,
+		Password:      "pending-apple-secret",
+		ProxyExplicit: false,
+	}, ICloudSession{AppleID: account.AppleID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, ok := store.FindAccountByID(account.ID)
+	if !ok || updated.ApplePassword != "pending-apple-secret" {
+		t.Fatalf("account after pending session save = %+v ok=%t", updated, ok)
+	}
+}
+
+func TestSavePendingICloudSessionPersistsApplePasswordForNewAccount(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	_, user := registerTestUser(t, handler, "pending-new-password", "user123")
+
+	err := handler.savePendingICloudSession(appleAuthPending{
+		OwnerID:        user.ID,
+		TargetOwnerID:  user.ID,
+		TargetOwnerSet: true,
+		Password:       "brand-new-secret",
+		ProxyExplicit:  false,
+	}, ICloudSession{AppleID: "brand-new@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, ok := store.FindAccountForOwnerAppleID(user.ID, "brand-new@example.com")
+	if !ok || created.ApplePassword != "brand-new-secret" {
+		t.Fatalf("new account after pending session save = %+v ok=%t", created, ok)
+	}
+}
+
+func TestAppleAccountLoginStartKeepsPendingWhenPasswordPersistFails(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	cookie, user := registerTestUser(t, handler, "login-password-persist-fail", "panel-pass")
+	account, err := store.AddAccountForOwner(user.ID, "Persist fail", "persist-fail@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.startAppleAccountLogin = func(
+		ctx context.Context,
+		appleID, password string,
+		pendingStore *appleAuthPendingStore,
+		twoFactorMethod, proxyURL, ownerID string,
+	) (appleAuthStartResult, error) {
+		pending, err := pendingStore.putForOwnerWithProxy(&appleAuthSession{AppleID: appleID, ProxyURL: proxyURL}, ownerID, strings.TrimSpace(proxyURL) != "")
+		if err != nil {
+			return appleAuthStartResult{}, err
+		}
+		return appleAuthStartResult{
+			Needs2FA:  true,
+			PendingID: pending.ID,
+			AppleID:   appleID,
+			ExpiresAt: pending.ExpiresAt,
+			Message:   "need 2fa",
+		}, nil
+	}
+	badPath := filepath.Join(t.TempDir(), "state-dir")
+	if err := os.MkdirAll(badPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store.path = badPath
+
+	req := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/start", strings.NewReader(fmt.Sprintf(
+		`{"apple_id":%q,"password":"persist-fail-secret","account_id":%q}`,
+		account.AppleID,
+		account.ID,
+	)))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("login start status = %d body=%s, want 200 when password persist fails", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Success   bool   `json:"success"`
+		Needs2FA  bool   `json:"needs_2fa"`
+		PendingID string `json:"pending_id"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Success || !payload.Needs2FA || strings.TrimSpace(payload.PendingID) == "" {
+		t.Fatalf("login start payload = %+v, want pending_id after password persist failure", payload)
+	}
+}
+
+func TestAppleAccount2FAHTTPPersistsPasswordAndExplicitProxy(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	cookie, user := registerTestUser(t, handler, "login-2fa-http", "panel-pass")
+	account, err := store.AddAccountForOwnerWithProxy(user.ID, "HTTP 2FA", "http-2fa@example.com", "", "http://old-user:old-pass@10.0.0.8:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.startAppleAccountLogin = func(
+		ctx context.Context,
+		appleID, password string,
+		pendingStore *appleAuthPendingStore,
+		twoFactorMethod, proxyURL, ownerID string,
+	) (appleAuthStartResult, error) {
+		pending, err := pendingStore.putForOwnerWithProxy(&appleAuthSession{AppleID: appleID, ProxyURL: proxyURL}, ownerID, strings.TrimSpace(proxyURL) != "")
+		if err != nil {
+			return appleAuthStartResult{}, err
+		}
+		return appleAuthStartResult{
+			Needs2FA:  true,
+			PendingID: pending.ID,
+			AppleID:   appleID,
+			ExpiresAt: pending.ExpiresAt,
+			Message:   "need 2fa",
+		}, nil
+	}
+	handler.submitAppleAccount2FA = func(ctx context.Context, pending appleAuthPending, code string, phoneNumber json.RawMessage) (ICloudSession, error) {
+		if pending.Password != "http-2fa-secret" {
+			t.Fatalf("pending password = %q, want http-2fa-secret", pending.Password)
+		}
+		if code != "123456" {
+			t.Fatalf("2fa code = %q", code)
+		}
+		proxyURL := ""
+		if pending.Session != nil {
+			proxyURL = pending.Session.ProxyURL
+		}
+		return ICloudSession{AppleID: account.AppleID, ProxyURL: proxyURL}, nil
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/start", strings.NewReader(fmt.Sprintf(
+		`{"apple_id":%q,"password":"http-2fa-secret","account_id":%q,"proxy_url":"socks5://user:pass@127.0.0.1:1080"}`,
+		account.AppleID,
+		account.ID,
+	)))
+	startReq.Header.Set("Content-Type", "application/json")
+	startReq.AddCookie(cookie)
+	addClosureTestCSRF(startReq, cookie)
+	startRR := httptest.NewRecorder()
+	handler.ServeHTTP(startRR, startReq)
+	if startRR.Code != http.StatusOK {
+		t.Fatalf("login start status = %d body=%s", startRR.Code, startRR.Body.String())
+	}
+	var startPayload struct {
+		Success   bool   `json:"success"`
+		Needs2FA  bool   `json:"needs_2fa"`
+		PendingID string `json:"pending_id"`
+	}
+	if err := json.NewDecoder(startRR.Body).Decode(&startPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !startPayload.Success || !startPayload.Needs2FA || startPayload.PendingID == "" {
+		t.Fatalf("login start payload = %+v", startPayload)
+	}
+	afterStart, ok := store.FindAccountByID(account.ID)
+	if !ok || afterStart.ApplePassword != "http-2fa-secret" {
+		t.Fatalf("account after 2FA start = %+v ok=%t", afterStart, ok)
+	}
+	if afterStart.ProxyURL != "socks5://user:pass@127.0.0.1:1080" {
+		t.Fatalf("account proxy after 2FA start = %q", afterStart.ProxyURL)
+	}
+
+	twoFAReq := httptest.NewRequest(http.MethodPost, "/api/apple-account/login/2fa", strings.NewReader(fmt.Sprintf(
+		`{"pending_id":%q,"code":"123456"}`,
+		startPayload.PendingID,
+	)))
+	twoFAReq.Header.Set("Content-Type", "application/json")
+	twoFAReq.AddCookie(cookie)
+	addClosureTestCSRF(twoFAReq, cookie)
+	twoFARR := httptest.NewRecorder()
+	handler.ServeHTTP(twoFARR, twoFAReq)
+	if twoFARR.Code != http.StatusOK {
+		t.Fatalf("2FA status = %d body=%s", twoFARR.Code, twoFARR.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/accounts", nil)
+	listReq.AddCookie(cookie)
+	listRR := httptest.NewRecorder()
+	handler.ServeHTTP(listRR, listReq)
+	if listRR.Code != http.StatusOK {
+		t.Fatalf("list accounts status = %d body=%s", listRR.Code, listRR.Body.String())
+	}
+	var listed struct {
+		Success  bool            `json:"success"`
+		Accounts []publicAccount `json:"accounts"`
+	}
+	if err := json.NewDecoder(listRR.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if !listed.Success || len(listed.Accounts) != 1 {
+		t.Fatalf("list accounts = %+v", listed)
+	}
+	if listed.Accounts[0].ApplePassword != "http-2fa-secret" {
+		t.Fatalf("GET /api/accounts password = %q", listed.Accounts[0].ApplePassword)
+	}
+	if listed.Accounts[0].ProxyURL != "socks5://user:pass@127.0.0.1:1080" {
+		t.Fatalf("GET /api/accounts proxy = %q", listed.Accounts[0].ProxyURL)
+	}
+}
+
 func TestPublicMailboxClearsAPIActiveAfterRemoteDeleteSucceeded(t *testing.T) {
 	server := &Server{cfg: Config{PublicBaseURL: "https://mail.example"}, logger: discardLogger()}
 	got := server.publicMailbox(httptest.NewRequest(http.MethodGet, "https://panel.example/", nil), Mailbox{

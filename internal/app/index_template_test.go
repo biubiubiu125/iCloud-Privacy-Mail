@@ -713,6 +713,145 @@ func TestIndexTemplateLoginStartFailuresAreVisible(t *testing.T) {
 	}
 }
 
+func TestIndexTemplateFillsLoginFormOnSessionTab(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		"function fillLoginFormFromActiveSession(force)",
+		"fillLoginFormFromActiveSession(true)",
+		"function handleSessionCardKey(event, key)",
+		"function showSessionLoginNotice(message)",
+		"account.apple_password",
+		"account.proxy_url",
+		"$('icloudProxyURL')",
+		"$('protocolPassword')",
+		"$('protocolAppleId')",
+		`onclick="setICloudSessionTab(${jsArg(sessionKey(active))})"`,
+		"onkeydown=\"handleSessionCardKey(event,",
+		"else if (switching)",
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing login autofill marker %q", marker)
+		}
+	}
+	block := scriptFunctionBlock(t, html, "function setICloudSessionTab(key)", "function handleSessionCardKey(event, key)")
+	if !strings.Contains(block, "fillLoginFormFromActiveSession(true)") {
+		t.Fatalf("clicking a saved account must fill the login form, block=%s", block)
+	}
+	fillBlock := scriptFunctionBlock(t, html, "function fillLoginFormFromActiveSession(force)", "function sessionLoginNoticeBanner()")
+	if !strings.Contains(fillBlock, "if (password)") || !strings.Contains(fillBlock, "else if (switching)") {
+		t.Fatalf("empty stored password must not overwrite typed password, block=%s", fillBlock)
+	}
+	refreshBlock := scriptFunctionBlock(t, html, "async function refresh()", "function ensureSchedulerPolling()")
+	if strings.Contains(refreshBlock, "fillLoginFormFromActiveSession(") {
+		t.Fatal("refresh must not auto-fill the login form; filling is click-driven")
+	}
+	if strings.Contains(refreshBlock, "lastAccounts = [];") {
+		t.Fatal("refresh must not clear lastAccounts when GET /api/accounts fails")
+	}
+	if strings.Contains(refreshBlock, "sessionLoginNotice = ''") || strings.Contains(refreshBlock, "clearSessionLoginNotice(") {
+		t.Fatal("refresh must not clear a pending 2FA login notice")
+	}
+}
+
+func TestIndexTemplateKeepsTwoFactorNoticeAfterRefresh(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		"let sessionLoginNotice = '';",
+		"function sessionLoginNoticeBanner()",
+		`id="sessionLoginNoticeBanner"`,
+		"if (sessionLoginNotice)",
+		"sessionLoginNoticeBanner() +",
+		"function clearSessionLoginNotice()",
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing 2FA notice persistence marker %q", marker)
+		}
+	}
+	renderBlock := scriptFunctionBlock(t, html, "function renderICloudSessions(sessions)", "function sessionKey(session)")
+	if !strings.Contains(renderBlock, "sessionLoginNoticeBanner()") {
+		t.Fatalf("renderICloudSessions must keep the 2FA banner after refresh, block=%s", renderBlock)
+	}
+	emptyAt := strings.Index(renderBlock, "if (displaySessions.length === 0)")
+	if emptyAt < 0 || !strings.Contains(renderBlock[emptyAt:], "sessionLoginNoticeBanner()") {
+		t.Fatal("empty session list must still show the pending 2FA notice")
+	}
+	for _, tc := range []struct {
+		name        string
+		startMarker string
+		endMarker   string
+	}{
+		{"iCloud Web login", "async function startProtocolLogin", "async function submitProtocol2FA"},
+		{"Apple Account login", "async function startAppleAccountLogin", "async function submitAppleAccount2FA"},
+	} {
+		block := scriptFunctionBlock(t, html, tc.startMarker, tc.endMarker)
+		noticeAt := strings.Index(block, "showSessionLoginNotice(")
+		refreshAt := strings.Index(block, "await refresh();")
+		if noticeAt < 0 || refreshAt < 0 || noticeAt > refreshAt {
+			t.Fatalf("%s must show the 2FA notice before refresh, block=%s", tc.name, block)
+		}
+	}
+}
+
+func TestIndexTemplateKeepsSessionTabsOnLoginNotice(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	if !strings.Contains(html, "function showSessionLoginNotice(message)") {
+		t.Fatal("index template is missing showSessionLoginNotice")
+	}
+	for _, tc := range []struct {
+		name        string
+		startMarker string
+		endMarker   string
+	}{
+		{"iCloud Web login", "async function startProtocolLogin", "async function submitProtocol2FA"},
+		{"Apple Account login", "async function startAppleAccountLogin", "async function submitAppleAccount2FA"},
+		{"iCloud Web 2FA", "async function submitProtocol2FA", "async function startAppleAccountLogin"},
+		{"Apple Account 2FA", "async function submitAppleAccount2FA", "async function createICloudMailbox"},
+	} {
+		block := scriptFunctionBlock(t, html, tc.startMarker, tc.endMarker)
+		if strings.Contains(block, "$('icloudSessionInfo').textContent =") {
+			t.Errorf("%s still overwrites session tabs via icloudSessionInfo.textContent", tc.name)
+		}
+		if !strings.Contains(block, "showSessionLoginNotice(") {
+			t.Errorf("%s must keep session tabs through showSessionLoginNotice", tc.name)
+		}
+	}
+}
+
+func TestIndexTemplateDisablesBrowserAutofillOnAppleLoginFields(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		`id="protocolAppleId" name="ipm-apple-id" autocomplete="off"`,
+		`id="protocolPassword" name="ipm-apple-password" type="password" autocomplete="new-password"`,
+		`id="icloudProxyURL" name="ipm-account-proxy" autocomplete="off"`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing browser autofill shield %q", marker)
+		}
+	}
+	if strings.Contains(html, `id="protocolAppleId" autocomplete="username"`) {
+		t.Fatal("Apple ID field still allows browser username autofill")
+	}
+	if strings.Contains(html, `id="protocolPassword" type="password" autocomplete="current-password"`) {
+		t.Fatal("Apple password field still allows browser password autofill")
+	}
+}
+
 func TestIndexTemplateClearsProxyInputAfterLoginStart(t *testing.T) {
 	data, err := webFS.ReadFile("templates/index.html")
 	if err != nil {
@@ -735,6 +874,10 @@ func TestIndexTemplateClearsProxyInputAfterLoginStart(t *testing.T) {
 		}
 		if clearAt < 0 || clearAt < requestAt {
 			t.Fatalf("%s must clear the proxy input after reading it into the login request, block=%s", tc.name, block)
+		}
+		needsAt := strings.Index(block, "if (data.needs_2fa)")
+		if needsAt < 0 || needsAt > clearAt {
+			t.Fatalf("%s must keep the typed proxy when 2FA is required, block=%s", tc.name, block)
 		}
 	}
 }

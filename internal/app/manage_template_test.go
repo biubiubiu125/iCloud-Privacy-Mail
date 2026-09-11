@@ -341,3 +341,23 @@ func TestManageTemplateShowsStructuredExportFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestManageTemplatePrefillsFullAccountProxy(t *testing.T) {
+	data, err := webFS.ReadFile("templates/manage.html")
+	if err != nil {
+		t.Fatalf("read manage template: %v", err)
+	}
+	html := string(data)
+	block := scriptFunctionBlock(t, html, "async function updateAccountProxy", "function mailboxBindAccounts")
+	for _, marker := range []string{
+		"window.prompt(promptText, account.proxy_url || '')",
+		"会按填写内容原样保存（含账号密码）",
+	} {
+		if !strings.Contains(block, marker) {
+			t.Errorf("manage proxy editor missing full-proxy marker %q in %s", marker, block)
+		}
+	}
+	if strings.Contains(block, "出于安全原因不会回显") {
+		t.Fatal("manage proxy editor still hides the saved proxy")
+	}
+}

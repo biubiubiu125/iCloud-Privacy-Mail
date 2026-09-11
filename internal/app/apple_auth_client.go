@@ -128,6 +128,7 @@ type appleAuthPending struct {
 	TargetOwnerID  string
 	TargetOwnerSet bool
 	AccountID      string
+	Password       string
 	ProxyExplicit  bool
 	CreatedAt      time.Time
 	ExpiresAt      time.Time
@@ -223,6 +224,18 @@ func (s *appleAuthPendingStore) setProxyExplicit(id string, proxyExplicit bool) 
 		return
 	}
 	pending.ProxyExplicit = proxyExplicit
+	s.items[id] = pending
+}
+
+func (s *appleAuthPendingStore) setPassword(id, password string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id = strings.TrimSpace(id)
+	pending, ok := s.items[id]
+	if !ok {
+		return
+	}
+	pending.Password = password
 	s.items[id] = pending
 }
 

@@ -550,6 +550,62 @@ func (s *FileStore) UpdateAccountProxyForOwner(ownerID, accountID, proxyURL stri
 	return s.state.Accounts[accountIndex], nil
 }
 
+func (s *FileStore) SaveAccountApplePasswordForOwner(ownerID, accountID, appleID, password string) error {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return nil
+	}
+	ownerID = strings.TrimSpace(ownerID)
+	accountID = strings.TrimSpace(accountID)
+	appleID = strings.TrimSpace(appleID)
+	if accountID == "" && appleID == "" {
+		return errCode("account_not_found", "Apple 账号不存在", false)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	index := -1
+	if accountID != "" {
+		for i, account := range s.state.Accounts {
+			if account.ID != accountID {
+				continue
+			}
+			if ownerID != "" && !constantTimeEqual(ownerID, account.OwnerID) {
+				return errCode("account_forbidden", "无权操作该 Apple 账号", false)
+			}
+			index = i
+			break
+		}
+	}
+	if index < 0 && appleID != "" {
+		for i, account := range s.state.Accounts {
+			if ownerID != "" && !constantTimeEqual(ownerID, account.OwnerID) {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(account.AppleID), appleID) {
+				continue
+			}
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return errCode("account_not_found", "Apple 账号不存在", false)
+	}
+	if s.state.Accounts[index].ApplePassword == password {
+		return nil
+	}
+	previous := s.state.Accounts[index]
+	s.state.Accounts[index].ApplePassword = password
+	s.state.Accounts[index].UpdatedAt = time.Now()
+	if err := s.saveLocked(); err != nil {
+		s.state.Accounts[index] = previous
+		return errCode("account_password_persist_failed", "Apple ID 密码写入失败："+err.Error(), true)
+	}
+	return nil
+}
+
 func (s *FileStore) MarkAccountMailboxCreateReconciliationRequired(ownerID, accountID, message string, at time.Time) error {
 	return s.MarkAccountMailboxCreateReconciliationRequiredForOrigin(ownerID, accountID, "", message, at)
 }
@@ -1685,6 +1741,27 @@ func (s *FileStore) FindAccountByID(id string) (Account, bool) {
 		if account.ID == id {
 			return account, true
 		}
+	}
+	return Account{}, false
+}
+
+func (s *FileStore) FindAccountForOwnerAppleID(ownerID, appleID string) (Account, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ownerID = strings.TrimSpace(ownerID)
+	appleID = strings.TrimSpace(appleID)
+	if appleID == "" {
+		return Account{}, false
+	}
+	for _, account := range s.state.Accounts {
+		if ownerID != "" && !constantTimeEqual(ownerID, account.OwnerID) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(account.AppleID), appleID) {
+			continue
+		}
+		return account, true
 	}
 	return Account{}, false
 }

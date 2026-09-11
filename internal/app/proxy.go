@@ -357,16 +357,3 @@ func httpClientWithoutProxy(base *http.Client) (*http.Client, error) {
 	client.Transport = transport
 	return &client, nil
 }
-
-func proxyDisplayURL(raw string) string {
-	normalized, err := normalizeProxyURL(raw)
-	if err != nil || normalized == "" {
-		return ""
-	}
-	parsed, err := url.Parse(normalized)
-	if err != nil {
-		return ""
-	}
-	parsed.User = nil
-	return parsed.String()
-}

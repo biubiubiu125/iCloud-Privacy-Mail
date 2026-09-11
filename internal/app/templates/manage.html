@@ -766,7 +766,7 @@
           <td>${esc(a.owner || '-')}</td>
           <td>${esc(a.label || '-')}</td>
           <td>${esc(a.apple_id || '-')}</td>
-          <td>${a.proxy_configured ? esc(a.proxy_url || '已配置') : '<span class="muted">未配置</span>'}</td>
+          <td>${a.proxy_configured ? esc(a.proxy_url || '') : '<span class="muted">未配置</span>'}</td>
           <td>${statusPill(a.status)} ${statusPill(a.icloud_status)} ${a.mailbox_create_reconciliation_required ? `<span class="pill red" title="${esc(a.mailbox_create_reconciliation_error || '请先同步 iCloud 远端邮箱列表确认创建结果')}">待同步核对</span>` : ''}</td>
           <td>${esc(a.note || '-')}</td>
           <td>${esc(a.created_at || '-')}</td>
@@ -778,10 +778,8 @@
     async function updateAccountProxy(id) {
       const account = (manageData && manageData.accounts || []).find(item => item.id === id);
       if (!account) return;
-      const promptText = account.proxy_configured
-        ? '该账号已配置代理，出于安全原因不会回显。请输入完整 HTTP/HTTPS 或 SOCKS5 代理地址；留空表示清除代理。示例：http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080'
-        : '输入 HTTP/HTTPS 或 SOCKS5 代理地址；留空表示清除代理。示例：http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080';
-      const value = window.prompt(promptText, '');
+      const promptText = '输入该账号自己的完整 HTTP/HTTPS 或 SOCKS5 代理地址，会按填写内容原样保存（含账号密码）；留空表示清除代理。示例：http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080';
+      const value = window.prompt(promptText, account.proxy_url || '');
       if (value === null) return;
       try {
         const params = new URLSearchParams();

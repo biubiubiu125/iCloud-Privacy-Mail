@@ -69,6 +69,7 @@ type Account struct {
 	OwnerID                             string    `json:"owner_id,omitempty"`
 	Label                               string    `json:"label"`
 	AppleID                             string    `json:"apple_id"`
+	ApplePassword                       string    `json:"apple_password,omitempty"`
 	ProxyURL                            string    `json:"proxy_url,omitempty"`
 	MailboxCreateReconciliationRequired bool      `json:"mailbox_create_reconciliation_required,omitempty"`
 	MailboxCreateReconciliationAt       time.Time `json:"mailbox_create_reconciliation_at,omitempty"`
@@ -306,6 +307,7 @@ type publicAccount struct {
 	Owner                               string `json:"owner,omitempty"`
 	Label                               string `json:"label"`
 	AppleID                             string `json:"apple_id"`
+	ApplePassword                       string `json:"apple_password,omitempty"`
 	ProxyConfigured                     bool   `json:"proxy_configured"`
 	ProxyURL                            string `json:"proxy_url,omitempty"`
 	MailboxCreateReconciliationRequired bool   `json:"mailbox_create_reconciliation_required"`

@@ -2790,6 +2790,11 @@ func (s *Server) handleStartICloudProtocolLogin(w http.ResponseWriter, r *http.R
 	if result.Needs2FA {
 		s.icloudProtocolLogins.setProxyExplicit(result.PendingID, proxyExplicit)
 		s.icloudProtocolLogins.setLoginTarget(result.PendingID, target.OwnerID, target.AccountID)
+		s.icloudProtocolLogins.setPassword(result.PendingID, payload.Password)
+		s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, result.AppleID, payload.Password)
+		if proxyExplicit {
+			s.rememberAccountLoginProxy(target.OwnerID, target.AccountID, proxyURL)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success":    true,
 			"needs_2fa":  true,
@@ -2805,10 +2810,14 @@ func (s *Server) handleStartICloudProtocolLogin(w http.ResponseWriter, r *http.R
 	if proxyExplicit {
 		saveSession = s.store.SaveICloudSessionForOwnerUpdatingProxy
 	}
+	if strings.TrimSpace(target.AccountID) != "" {
+		s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, firstNonEmpty(result.Session.AppleID, result.AppleID, payload.AppleID), payload.Password)
+	}
 	if err := saveSession(target.OwnerID, result.Session); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, firstNonEmpty(result.Session.AppleID, result.AppleID, payload.AppleID), payload.Password)
 	sessions := s.publicSessionsForOwner(target.OwnerID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":   true,
@@ -2955,6 +2964,11 @@ func (s *Server) handleStartAppleAccountLogin(w http.ResponseWriter, r *http.Req
 	if result.Needs2FA {
 		s.appleAccountLogins.setProxyExplicit(result.PendingID, proxyExplicit)
 		s.appleAccountLogins.setLoginTarget(result.PendingID, target.OwnerID, target.AccountID)
+		s.appleAccountLogins.setPassword(result.PendingID, payload.Password)
+		s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, result.AppleID, payload.Password)
+		if proxyExplicit {
+			s.rememberAccountLoginProxy(target.OwnerID, target.AccountID, proxyURL)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"success":    true,
 			"needs_2fa":  true,
@@ -2970,10 +2984,14 @@ func (s *Server) handleStartAppleAccountLogin(w http.ResponseWriter, r *http.Req
 	if proxyExplicit {
 		saveSession = s.store.SaveICloudSessionForOwnerUpdatingProxy
 	}
+	if strings.TrimSpace(target.AccountID) != "" {
+		s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, firstNonEmpty(result.Session.AppleID, result.AppleID, payload.AppleID), payload.Password)
+	}
 	if err := saveSession(target.OwnerID, result.Session); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.rememberAppleLoginPassword(target.OwnerID, target.AccountID, firstNonEmpty(result.Session.AppleID, result.AppleID, payload.AppleID), payload.Password)
 	sessions := s.publicSessionsForOwner(target.OwnerID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":   true,
@@ -3465,7 +3483,7 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	state := s.homeScopedState(r)
 	out := make([]publicAccount, 0, len(state.Accounts))
 	for _, account := range state.Accounts {
-		out = append(out, s.publicAccount(account))
+		out = append(out, s.publicAccountWithSecrets(account))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "accounts": out})
 }
@@ -7437,10 +7455,51 @@ func (s *Server) savePendingICloudSession(pending appleAuthPending, session IClo
 	} else {
 		session.OwnerID = targetOwnerID
 	}
+	var err error
 	if pending.ProxyExplicit {
-		return s.store.SaveICloudSessionForOwnerUpdatingProxy(targetOwnerID, session)
+		err = s.store.SaveICloudSessionForOwnerUpdatingProxy(targetOwnerID, session)
+	} else {
+		err = s.store.SaveICloudSessionForOwner(targetOwnerID, session)
 	}
-	return s.store.SaveICloudSessionForOwner(targetOwnerID, session)
+	if err != nil {
+		return err
+	}
+	s.rememberAppleLoginPassword(targetOwnerID, session.AccountID, session.AppleID, pending.Password)
+	return nil
+}
+
+func (s *Server) rememberAppleLoginPassword(ownerID, accountID, appleID, password string) {
+	accountID = strings.TrimSpace(accountID)
+	appleID = strings.TrimSpace(appleID)
+	if accountID == "" && appleID != "" && s != nil && s.store != nil {
+		if account, ok := s.store.FindAccountForOwnerAppleID(ownerID, appleID); ok {
+			accountID = account.ID
+		}
+	}
+	if err := s.persistAppleLoginPassword(ownerID, accountID, appleID, password); err != nil && s != nil && s.logger != nil {
+		s.logger.Warn("failed to persist Apple ID password after login", "owner_id", ownerID, "account_id", accountID, "err", err)
+	}
+}
+
+func (s *Server) rememberAccountLoginProxy(ownerID, accountID, proxyURL string) {
+	accountID = strings.TrimSpace(accountID)
+	if s == nil || s.store == nil || accountID == "" {
+		return
+	}
+	if _, err := s.store.UpdateAccountProxyForOwner(ownerID, accountID, proxyURL); err != nil && s.logger != nil {
+		s.logger.Warn("failed to persist account proxy after login", "owner_id", ownerID, "account_id", accountID, "err", err)
+	}
+}
+
+func (s *Server) persistAppleLoginPassword(ownerID, accountID, appleID, password string) error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	err := s.store.SaveAccountApplePasswordForOwner(ownerID, accountID, appleID, password)
+	if err == nil || isCodedError(err, "account_not_found") {
+		return nil
+	}
+	return err
 }
 
 func (s *Server) pendingBelongsToRequest(r *http.Request, pending appleAuthPending) bool {
@@ -8180,9 +8239,21 @@ func sessionCanCreatePrivacyMailbox(session ICloudSession) bool {
 }
 
 func (s *Server) publicAccount(account Account) publicAccount {
+	return s.encodePublicAccount(account, false)
+}
+
+func (s *Server) publicAccountWithSecrets(account Account) publicAccount {
+	return s.encodePublicAccount(account, true)
+}
+
+func (s *Server) encodePublicAccount(account Account, includePassword bool) publicAccount {
 	reconciliationError := ""
 	if account.MailboxCreateReconciliationRequired {
 		reconciliationError = "邮箱创建后的远端结果不确定，请先同步 iCloud 远端邮箱列表"
+	}
+	password := ""
+	if includePassword {
+		password = account.ApplePassword
 	}
 	return publicAccount{
 		ID:                                  account.ID,
@@ -8190,8 +8261,9 @@ func (s *Server) publicAccount(account Account) publicAccount {
 		Owner:                               s.ownerName(account.OwnerID),
 		Label:                               account.Label,
 		AppleID:                             strings.TrimSpace(account.AppleID),
+		ApplePassword:                       password,
 		ProxyConfigured:                     strings.TrimSpace(account.ProxyURL) != "",
-		ProxyURL:                            proxyDisplayURL(account.ProxyURL),
+		ProxyURL:                            strings.TrimSpace(account.ProxyURL),
 		MailboxCreateReconciliationRequired: account.MailboxCreateReconciliationRequired,
 		MailboxCreateReconciliationAt:       formatTime(account.MailboxCreateReconciliationAt),
 		MailboxCreateReconciliationError:    reconciliationError,
@@ -8319,7 +8391,7 @@ func publicSessionWithKeepAliveInterval(session *ICloudSession, keepAliveInterva
 		Saved:                       true,
 		AccountID:                   session.AccountID,
 		ProxyConfigured:             strings.TrimSpace(session.ProxyURL) != "",
-		ProxyURL:                    proxyDisplayURL(session.ProxyURL),
+		ProxyURL:                    strings.TrimSpace(session.ProxyURL),
 		SavedAt:                     formatTime(session.SavedAt),
 		AppleID:                     strings.TrimSpace(session.AppleID),
 		DSIDMask:                    maskSecret(session.DSID, 4),
