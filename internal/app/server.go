@@ -344,7 +344,7 @@ func NewServer(cfg Config, store *FileStore, logger *slog.Logger) http.Handler {
 		return NewAppleAuthClient().SubmitAppleAccountManage2FA(ctx, pending, code, phoneNumber)
 	}
 	s.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
-		return NewICloudClient().keepAliveAppleAccountManageStateUnlocked(ctx, state)
+		return newICloudKeepAliveClient().keepAliveAppleAccountManageStateUnlocked(ctx, state)
 	}
 	s.syncMailboxMessages = func(ctx context.Context, session ICloudSession, mailbox Mailbox, after time.Time, keyword string, maxThreads int) ([]ICloudSyncedMessage, error) {
 		return NewICloudClient().SyncMailboxMessages(ctx, session, mailbox, after, keyword, maxThreads)
@@ -2176,7 +2176,7 @@ func (s *Server) handleCheckICloudSession(w http.ResponseWriter, r *http.Request
 	}
 
 	checkedAt := time.Now()
-	client := NewICloudClient()
+	client := newICloudKeepAliveClient()
 	failed := 0
 	var lastErr error
 	for _, session := range sessions {
@@ -2202,7 +2202,7 @@ func (s *Server) handleCheckICloudSession(w http.ResponseWriter, r *http.Request
 			continue
 		}
 		session = currentSession
-		checkedSession, ok, err := checkSavedLoginStatesWithIMAPProxy(r.Context(), client, session, checkedAt, s.checkSavedIMAPLoginWithProxy)
+		checkedSession, ok, err := checkSavedLoginStatesWithKeepAliveInterval(r.Context(), client, session, checkedAt, s.checkSavedIMAPLoginWithProxy, s.appleAccountKeepAliveInterval)
 		if !ok {
 			failed++
 			lastErr = err
@@ -2234,10 +2234,7 @@ func (s *Server) handleCheckICloudSession(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadGateway, errCode("icloud_session_check_failed", message, true))
 		return
 	}
-	message := "登录态检测正常"
-	if failed > 0 {
-		message = fmt.Sprintf("登录态部分检测成功：成功 %d，失败 %d", len(sessions)-failed, failed)
-	}
+	message := icloudSessionCheckOKMessage(failed, len(sessions), publicSessions)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":       true,
 		"checked_at":    formatTime(checkedAt),
@@ -2247,6 +2244,46 @@ func (s *Server) handleCheckICloudSession(w http.ResponseWriter, r *http.Request
 		"checked_count": len(sessions),
 		"failed_count":  failed,
 	})
+}
+
+func icloudSessionCheckOKMessage(failed, total int, sessions []publicICloudSession) string {
+	retrying := 0
+	deferred := 0
+	for _, session := range sessions {
+		if session.AppleAccountKeepAliveRetrying && !session.AppleAccountLoginOK {
+			retrying++
+		}
+		if strings.Contains(session.LastStatusMessage, "暂时失败") {
+			deferred++
+		}
+	}
+	if failed > 0 {
+		msg := fmt.Sprintf("登录态部分检测成功：成功 %d，失败 %d", total-failed, failed)
+		if retrying > 0 {
+			msg += fmt.Sprintf("，新接口保活重试中 %d 个", retrying)
+		}
+		if deferred > 0 {
+			msg += fmt.Sprintf("，检测暂时失败 %d 个", deferred)
+		}
+		return msg
+	}
+	switch {
+	case deferred > 0 && retrying > 0:
+		return fmt.Sprintf("登录态部分正常：新接口保活重试中 %d 个，检测暂时失败 %d 个", retrying, deferred)
+	case deferred > 0:
+		for _, session := range sessions {
+			if strings.Contains(session.LastStatusMessage, "部分正常") {
+				return "登录态部分正常：新接口检测暂时失败，已推迟保活"
+			}
+		}
+		return "新接口检测暂时失败，已推迟保活"
+	case retrying == 0:
+		return "登录态检测正常"
+	case retrying == total:
+		return "新接口保活重试中"
+	default:
+		return fmt.Sprintf("登录态部分正常：新接口保活重试中 %d 个", retrying)
+	}
 }
 
 func (s *Server) handleSaveICloudIMAPLogin(w http.ResponseWriter, r *http.Request) {
@@ -2617,19 +2654,23 @@ func sameICloudSessionPublicIdentity(a, b ICloudSession) bool {
 }
 
 func checkSavedLoginStates(ctx context.Context, client *ICloudClient, session ICloudSession, checkedAt time.Time) (ICloudSession, bool, error) {
-	return checkSavedLoginStatesWithIMAPProxy(ctx, client, session, checkedAt, CheckICloudIMAPLoginWithProxy)
+	return checkSavedLoginStatesWithKeepAliveInterval(ctx, client, session, checkedAt, CheckICloudIMAPLoginWithProxy, 0)
 }
 
 func checkSavedLoginStatesWithIMAP(ctx context.Context, client *ICloudClient, session ICloudSession, checkedAt time.Time, imapChecker func(context.Context, string, string) error) (ICloudSession, bool, error) {
-	return checkSavedLoginStatesWithIMAPProxy(ctx, client, session, checkedAt, func(ctx context.Context, email, appPassword, _ string) error {
+	return checkSavedLoginStatesWithKeepAliveInterval(ctx, client, session, checkedAt, func(ctx context.Context, email, appPassword, _ string) error {
 		if imapChecker == nil {
 			return CheckICloudIMAPLogin(ctx, email, appPassword)
 		}
 		return imapChecker(ctx, email, appPassword)
-	})
+	}, 0)
 }
 
 func checkSavedLoginStatesWithIMAPProxy(ctx context.Context, client *ICloudClient, session ICloudSession, checkedAt time.Time, imapChecker func(context.Context, string, string, string) error) (ICloudSession, bool, error) {
+	return checkSavedLoginStatesWithKeepAliveInterval(ctx, client, session, checkedAt, imapChecker, 0)
+}
+
+func checkSavedLoginStatesWithKeepAliveInterval(ctx context.Context, client *ICloudClient, session ICloudSession, checkedAt time.Time, imapChecker func(context.Context, string, string, string) error, keepAliveInterval time.Duration) (ICloudSession, bool, error) {
 	var parts []string
 	checks := 0
 	successes := 0
@@ -2637,21 +2678,38 @@ func checkSavedLoginStatesWithIMAPProxy(ctx context.Context, client *ICloudClien
 
 	if appleAccountLoginSaved(session) {
 		checks++
-		updated, err := client.CheckAppleAccountManageSession(ctx, session)
+		previousApple, _ := appleAccountLoginState(session)
+		updated, err := client.checkAppleAccountManageSession(ctx, session, keepAliveInterval)
+		session = updated
 		state, _ := appleAccountLoginState(session)
 		if err != nil {
 			lastErr = err
-			state.LastCheckedAt = checkedAt
-			state.LastCheckOK = false
-			state.LastStatusMessage = "新接口登录态异常：" + publicErrorMessage(err)
-			session = withAppleAccountLoginState(session, state)
-			parts = append(parts, "新接口异常")
+			if isCodedError(err, "apple_account_keepalive_retrying") {
+				state.LastCheckedAt = checkedAt
+				state.LastCheckOK = false
+				if strings.TrimSpace(state.LastStatusMessage) == "" {
+					state.LastStatusMessage = "新接口保活：重试中"
+				}
+				session = withAppleAccountLoginState(session, state)
+				parts = append(parts, "新接口重试中")
+			} else if appleAccountKeepAliveTransientError(err) {
+				state = appleAccountKeepAlivePersistTransient(previousApple, state)
+				state.LastStatusMessage = "新接口检测暂时失败，已推迟保活"
+				session = withAppleAccountLoginState(session, state)
+				parts = append(parts, "新接口暂时失败")
+			} else {
+				state.LastCheckedAt = checkedAt
+				state.LastCheckOK = false
+				state.LastStatusMessage = "新接口登录态异常：" + publicErrorMessage(err)
+				session = withAppleAccountLoginState(session, state)
+				parts = append(parts, "新接口异常")
+			}
 		} else {
-			session = updated
-			state, _ = appleAccountLoginState(session)
 			state.LastCheckedAt = checkedAt
 			state.LastCheckOK = true
 			state.LastStatusMessage = "新接口登录态正常"
+			state.KeepAliveFailCount = 0
+			state.KeepAliveStopped = false
 			session = withAppleAccountLoginState(session, state)
 			successes++
 			parts = append(parts, "新接口正常")
@@ -2661,7 +2719,10 @@ func checkSavedLoginStatesWithIMAPProxy(ctx context.Context, client *ICloudClien
 	if iCloudWebLoginSaved(session) {
 		checks++
 		state, _ := iCloudWebLoginState(session)
-		if err := client.CheckMailSession(ctx, session); err != nil {
+		webCtx, cancelWeb := context.WithTimeout(ctx, icloudWebCheckTimeout)
+		err := client.CheckMailSession(webCtx, session)
+		cancelWeb()
+		if err != nil {
 			lastErr = err
 			state.LastCheckedAt = checkedAt
 			state.LastCheckOK = false
@@ -2684,7 +2745,10 @@ func checkSavedLoginStatesWithIMAPProxy(ctx context.Context, client *ICloudClien
 		if imapChecker == nil {
 			imapChecker = CheckICloudIMAPLoginWithProxy
 		}
-		if err := imapChecker(ctx, state.IMAPEmail, state.IMAPAppPassword, state.ProxyURL); err != nil {
+		imapCtx, cancelIMAP := context.WithTimeout(ctx, icloudIMAPCheckTimeout)
+		err := imapChecker(imapCtx, state.IMAPEmail, state.IMAPAppPassword, state.ProxyURL)
+		cancelIMAP()
+		if err != nil {
 			lastErr = err
 			state.LastCheckedAt = checkedAt
 			state.LastCheckOK = false
@@ -2717,6 +2781,9 @@ func checkSavedLoginStatesWithIMAPProxy(ctx context.Context, client *ICloudClien
 		session.LastStatusMessage = "登录态异常：" + strings.Join(parts, "；")
 	}
 	if session.LastCheckOK {
+		return session, true, nil
+	}
+	if successes == 0 && (isCodedError(lastErr, "apple_account_keepalive_retrying") || appleAccountKeepAliveTransientError(lastErr)) {
 		return session, true, nil
 	}
 	if lastErr == nil {
@@ -3330,6 +3397,14 @@ func mailboxSyncRemoteOrigin(source string) string {
 	}
 }
 
+func appleAccountListClientAndContext(ctx context.Context, source string) (*ICloudClient, context.Context, context.CancelFunc) {
+	if strings.EqualFold(strings.TrimSpace(source), string(mailboxCreateChannelAppleAccount)) {
+		listCtx, cancel := context.WithTimeout(ctx, appleAccountManageOperationTimeout)
+		return newICloudKeepAliveClient(), listCtx, cancel
+	}
+	return NewICloudClient(), ctx, func() {}
+}
+
 func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Request, ownerID string, session ICloudSession) (syncICloudMailboxResult, []publicMailbox, error) {
 	ownerID = s.dataOwnerIDForSession(ownerID, session)
 	result := syncICloudMailboxResult{
@@ -3376,12 +3451,14 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 	successfulSources := 0
 	successfulRemoteCount := 0
 	for _, source := range sources {
-		remotes, updatedSession, listErr := NewICloudClient().ListPrivacyMailboxesForOriginWithSessionAndAPIKey(
-			ctx,
+		client, listCtx, cancelList := appleAccountListClientAndContext(ctx, source)
+		remotes, updatedSession, listErr := client.ListPrivacyMailboxesForOriginWithSessionAndAPIKey(
+			listCtx,
 			session,
 			source,
 			s.cfg.AppleAccountAPIKey,
 		)
+		cancelList()
 		if listErr != nil {
 			if firstErr == nil {
 				firstErr = listErr
@@ -5051,7 +5128,9 @@ func (s *Server) deleteICloudMailboxRemote(ctx context.Context, mailbox Mailbox)
 		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先保存旧接口登录态", true)
 	}
 	if remoteOrigin == "APPLE_ACCOUNT" {
-		updatedSession, err := NewICloudClient().DeletePrivacyMailboxWithAppleAccount(ctx, session, s.cfg.AppleAccountAPIKey, remoteID)
+		opCtx, cancel := context.WithTimeout(ctx, appleAccountManageOperationTimeout)
+		defer cancel()
+		updatedSession, err := newICloudKeepAliveClient().DeletePrivacyMailboxWithAppleAccount(opCtx, session, s.cfg.AppleAccountAPIKey, remoteID)
 		if _, hasUpdatedState := appleAccountLoginState(updatedSession); hasUpdatedState {
 			if saveErr := s.store.SaveICloudSessionForOwner(session.OwnerID, updatedSession); saveErr != nil {
 				if s.logger != nil {
@@ -5739,7 +5818,7 @@ func (s *Server) keepAliveAppleAccountRound(ctx context.Context) {
 	keepAliveFn := s.keepAliveAppleAccountState
 	if keepAliveFn == nil {
 		keepAliveFn = func(ctx context.Context, state LoginState) (LoginState, error) {
-			return NewICloudClient().keepAliveAppleAccountManageStateUnlocked(ctx, state)
+			return newICloudKeepAliveClient().keepAliveAppleAccountManageStateUnlocked(ctx, state)
 		}
 	}
 	baseInterval := s.appleAccountKeepAliveInterval
@@ -5759,13 +5838,11 @@ func (s *Server) keepAliveAppleAccountRound(ctx context.Context) {
 		if !appleAccountKeepAliveDue(state, now, interval) {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, appleAccountKeepAliveTimeout)
 		releaseAccountOperation, accountGateErr := s.acquireMailboxAccountOperationSlot(
-			callCtx,
+			ctx,
 			mailboxAccountOperationKey(session.OwnerID, session.AccountID),
 		)
 		if accountGateErr != nil {
-			cancel()
 			if s.logger != nil {
 				s.logger.Warn("apple account keepalive mailbox account gate failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", accountGateErr)
 			}
@@ -5774,12 +5851,10 @@ func (s *Server) keepAliveAppleAccountRound(ctx context.Context) {
 		currentSession, ok := s.sessionForOwnerAccount(session.OwnerID, session.AccountID)
 		if !ok {
 			releaseAccountOperation()
-			cancel()
 			continue
 		}
 		if err := s.ensureOwnerNotDeleting(currentSession.OwnerID); err != nil {
 			releaseAccountOperation()
-			cancel()
 			continue
 		}
 		currentState, ok := appleAccountLoginState(currentSession)
@@ -5787,37 +5862,45 @@ func (s *Server) keepAliveAppleAccountRound(ctx context.Context) {
 			!appleAccountKeepAliveEligible(currentSession) ||
 			!appleAccountKeepAliveDue(currentState, now, appleAccountKeepAliveIntervalForSession(currentSession, baseInterval)) {
 			releaseAccountOperation()
-			cancel()
 			continue
 		}
 		session = currentSession
 		state = currentState
-		release, gateErr := acquireAppleAccountOperationGate(callCtx, appleAccountOperationKey(session, state))
+		release, gateErr := acquireAppleAccountOperationGate(ctx, appleAccountOperationKey(session, state))
 		if gateErr != nil {
 			releaseAccountOperation()
-			cancel()
 			if s.logger != nil {
 				s.logger.Warn("apple account keepalive gate failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", gateErr)
 			}
 			continue
 		}
+		callCtx, cancel := context.WithTimeout(ctx, appleAccountKeepAliveTimeout)
 		next, err := keepAliveFn(callCtx, state)
 		release()
 		if err != nil {
-			if isCodedError(err, "apple_account_auth_failed") {
-				state.LastCheckedAt = time.Now()
-				state.LastCheckOK = false
-				state.LastStatusMessage = "新接口登录态异常：" + publicErrorMessage(err)
-				session = withAppleAccountLoginState(session, state)
+			if isCodedError(err, "apple_account_keepalive_retrying") || isCodedError(err, "apple_account_auth_failed") {
+				session = withAppleAccountLoginState(session, next)
 				if saveErr := s.store.SaveICloudSessionForOwner(session.OwnerID, session); saveErr != nil && s.logger != nil {
 					s.logger.Warn("apple account keepalive save failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "err", saveErr)
+				}
+				if s.logger != nil {
+					if isCodedError(err, "apple_account_keepalive_retrying") {
+						s.logger.Warn("apple account keepalive retry", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", err)
+					} else {
+						s.logger.Warn("apple account keepalive stopped", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", err)
+					}
+				}
+			} else {
+				session = withAppleAccountLoginState(session, appleAccountKeepAlivePersistTransient(state, next))
+				if saveErr := s.store.SaveICloudSessionForOwner(session.OwnerID, session); saveErr != nil && s.logger != nil {
+					s.logger.Warn("apple account keepalive save failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "err", saveErr)
+				}
+				if s.logger != nil {
+					s.logger.Warn("apple account keepalive failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", err)
 				}
 			}
 			releaseAccountOperation()
 			cancel()
-			if s.logger != nil {
-				s.logger.Warn("apple account keepalive failed", "owner", s.ownerName(session.OwnerID), "account_id", session.AccountID, "apple_id", session.AppleID, "err", err)
-			}
 			continue
 		}
 		session = withAppleAccountLoginState(session, next)
@@ -5857,7 +5940,10 @@ func appleAccountKeepAliveEligible(session ICloudSession) bool {
 	if !ok || strings.TrimSpace(state.APIKey) == "" {
 		return false
 	}
-	if !state.LastCheckedAt.IsZero() && !state.LastCheckOK {
+	if state.KeepAliveStopped {
+		return false
+	}
+	if !state.LastCheckOK && state.KeepAliveFailCount == 0 && !state.LastCheckedAt.IsZero() {
 		return false
 	}
 	return true
@@ -7012,7 +7098,9 @@ func (s *Server) createICloudMailboxRemoteAppleAccount(ctx context.Context, owne
 		return ICloudRemoteMailbox{}, errCode("apple_account_session_missing", "未保存新接口登录态，请先完成新接口登录", true)
 	}
 	cooldownKey := mailboxCreateChannelCooldownKey(key, mailboxCreateChannelAppleAccount)
-	remote, updatedSession, err := NewICloudClient().CreatePrivacyMailboxWithAppleAccount(ctx, session, s.cfg.AppleAccountAPIKey, label, note)
+	opCtx, cancel := context.WithTimeout(ctx, appleAccountManageOperationTimeout)
+	defer cancel()
+	remote, updatedSession, err := newICloudKeepAliveClient().CreatePrivacyMailboxWithAppleAccount(opCtx, session, s.cfg.AppleAccountAPIKey, label, note)
 	s.markMailboxCreateFinished(key)
 	if isCodedError(err, "apple_account_hme_limit") {
 		s.markMailboxCreateCooldown(cooldownKey, mailboxCreateLimitCooldown)
@@ -8388,44 +8476,46 @@ func publicSessionWithKeepAliveInterval(session *ICloudSession, keepAliveInterva
 		appleAccountNextRefreshAt = appleAccountState.LastCheckedAt.Add(appleAccountKeepAliveIntervalForSession(*session, keepAliveInterval))
 	}
 	return publicICloudSession{
-		Saved:                       true,
-		AccountID:                   session.AccountID,
-		ProxyConfigured:             strings.TrimSpace(session.ProxyURL) != "",
-		ProxyURL:                    strings.TrimSpace(session.ProxyURL),
-		SavedAt:                     formatTime(session.SavedAt),
-		AppleID:                     strings.TrimSpace(session.AppleID),
-		DSIDMask:                    maskSecret(session.DSID, 4),
-		ClientBuildNumber:           session.ClientBuildNumber,
-		MasteringNumber:             session.MasteringNumber,
-		PremiumMailBaseURL:          session.PremiumMailBaseURL,
-		MailGatewayBaseURL:          session.MailGatewayBaseURL,
-		MailBaseURL:                 session.MailBaseURL,
-		Host:                        session.Host,
-		IsICloudPlus:                session.IsICloudPlus,
-		CanCreateHME:                session.CanCreateHME,
-		CookieCount:                 cookieCount,
-		ICloudWebLoginSaved:         icloudWebLoginSaved,
-		ICloudWebLoginChecked:       !icloudWebState.LastCheckedAt.IsZero(),
-		ICloudWebLoginOK:            icloudWebState.LastCheckOK,
-		ICloudWebLoginStatus:        loginStatePublicStatus(icloudWebLoginSaved, icloudWebState),
-		AppleAccountLoginSaved:      appleAccountLoginSaved,
-		AppleAccountLoginChecked:    !appleAccountState.LastCheckedAt.IsZero(),
-		AppleAccountLoginOK:         appleAccountState.LastCheckOK,
-		AppleAccountLoginStatus:     loginStatePublicStatus(appleAccountLoginSaved, appleAccountState),
-		AppleAccountNextRefreshAt:   formatTime(appleAccountNextRefreshAt),
-		AppleAccountManageExpiresAt: formatTime(appleAccountState.ManageExpiresAt),
-		AppleAccountManageReady:     appleAccountManageReady(*session),
-		ICloudIMAPLoginSaved:        icloudIMAPLoginSaved,
-		ICloudIMAPLoginChecked:      !icloudIMAPState.LastCheckedAt.IsZero(),
-		ICloudIMAPLoginOK:           icloudIMAPState.LastCheckOK,
-		ICloudIMAPLoginStatus:       loginStatePublicStatus(icloudIMAPLoginSaved, icloudIMAPState),
-		ICloudIMAPEmail:             normalizeICloudIMAPEmail(icloudIMAPState.IMAPEmail),
-		ICloudIMAPHost:              firstNonEmpty(strings.TrimSpace(icloudIMAPState.IMAPHost), strings.TrimSpace(icloudIMAPState.Host)),
-		ProviderConfigured:          sessionCanCreatePrivacyMailbox(*session),
-		NeedsManualLogin:            !icloudWebLoginSaved && !appleAccountLoginSaved && !icloudIMAPLoginSaved,
-		LastCheckedAt:               formatTime(session.LastCheckedAt),
-		LastCheckOK:                 session.LastCheckOK,
-		LastStatusMessage:           message,
+		Saved:                         true,
+		AccountID:                     session.AccountID,
+		ProxyConfigured:               strings.TrimSpace(session.ProxyURL) != "",
+		ProxyURL:                      strings.TrimSpace(session.ProxyURL),
+		SavedAt:                       formatTime(session.SavedAt),
+		AppleID:                       strings.TrimSpace(session.AppleID),
+		DSIDMask:                      maskSecret(session.DSID, 4),
+		ClientBuildNumber:             session.ClientBuildNumber,
+		MasteringNumber:               session.MasteringNumber,
+		PremiumMailBaseURL:            session.PremiumMailBaseURL,
+		MailGatewayBaseURL:            session.MailGatewayBaseURL,
+		MailBaseURL:                   session.MailBaseURL,
+		Host:                          session.Host,
+		IsICloudPlus:                  session.IsICloudPlus,
+		CanCreateHME:                  session.CanCreateHME,
+		CookieCount:                   cookieCount,
+		ICloudWebLoginSaved:           icloudWebLoginSaved,
+		ICloudWebLoginChecked:         !icloudWebState.LastCheckedAt.IsZero(),
+		ICloudWebLoginOK:              icloudWebState.LastCheckOK,
+		ICloudWebLoginStatus:          loginStatePublicStatus(icloudWebLoginSaved, icloudWebState),
+		AppleAccountLoginSaved:        appleAccountLoginSaved,
+		AppleAccountLoginChecked:      !appleAccountState.LastCheckedAt.IsZero(),
+		AppleAccountLoginOK:           appleAccountPublicLoginOK(appleAccountState),
+		AppleAccountLoginStatus:       loginStatePublicStatus(appleAccountLoginSaved, appleAccountState),
+		AppleAccountNextRefreshAt:     formatTime(appleAccountNextRefreshAt),
+		AppleAccountManageExpiresAt:   formatTime(appleAccountState.ManageExpiresAt),
+		AppleAccountKeepAliveStopped:  appleAccountState.KeepAliveStopped,
+		AppleAccountKeepAliveRetrying: appleAccountKeepAliveRetrying(appleAccountState),
+		AppleAccountManageReady:       appleAccountManageReady(*session),
+		ICloudIMAPLoginSaved:          icloudIMAPLoginSaved,
+		ICloudIMAPLoginChecked:        !icloudIMAPState.LastCheckedAt.IsZero(),
+		ICloudIMAPLoginOK:             icloudIMAPState.LastCheckOK,
+		ICloudIMAPLoginStatus:         loginStatePublicStatus(icloudIMAPLoginSaved, icloudIMAPState),
+		ICloudIMAPEmail:               normalizeICloudIMAPEmail(icloudIMAPState.IMAPEmail),
+		ICloudIMAPHost:                firstNonEmpty(strings.TrimSpace(icloudIMAPState.IMAPHost), strings.TrimSpace(icloudIMAPState.Host)),
+		ProviderConfigured:            sessionCanCreatePrivacyMailbox(*session),
+		NeedsManualLogin:              !icloudWebLoginSaved && !appleAccountLoginSaved && !icloudIMAPLoginSaved,
+		LastCheckedAt:                 formatTime(session.LastCheckedAt),
+		LastCheckOK:                   session.LastCheckOK,
+		LastStatusMessage:             message,
 	}
 }
 
@@ -8435,6 +8525,9 @@ func loginStatePublicStatus(saved bool, state LoginState) string {
 	}
 	if state.LastCheckedAt.IsZero() {
 		return "已登录"
+	}
+	if appleAccountKeepAliveDeferred(state) {
+		return strings.TrimSpace(state.LastStatusMessage)
 	}
 	if state.LastCheckOK {
 		return "登录态正常"

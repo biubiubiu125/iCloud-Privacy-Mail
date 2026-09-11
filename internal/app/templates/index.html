@@ -771,6 +771,11 @@
       border-color: var(--line);
       background: var(--soft-glass);
     }
+    .manage-refresh-clock.retrying {
+      color: var(--warn);
+      border-color: var(--warn-line);
+      background: var(--warn-soft);
+    }
     .session-card-line {
       display: flex;
       flex-wrap: wrap;
@@ -1942,6 +1947,11 @@
           node.classList.remove('due');
           return;
         }
+        if (node.classList.contains('retrying')) {
+          node.textContent = '新接口保活：重试中';
+          node.classList.remove('due');
+          return;
+        }
         const refreshAt = node.dataset.refreshAt || '';
         const text = manageRefreshText(refreshAt);
         node.textContent = `新接口保活：${text}`;
@@ -1957,9 +1967,14 @@
 
     function sessionManageRefreshBadge(session) {
       if (!appleAccountLoginSaved(session)) return '';
-      if (session.apple_account_login_checked && !session.apple_account_login_ok) {
+      if (session.apple_account_keep_alive_stopped) {
         const title = session.apple_account_login_status || '新接口登录态异常，请重新检测或重新登录后再保活';
         return `<span class="manage-refresh-clock stopped" data-account-id="${esc(session.account_id || '')}" data-login-ok="0" data-refresh-at="" title="${esc(title)}">新接口保活：已停止</span>`;
+      }
+      if (session.apple_account_keep_alive_retrying) {
+        const title = session.apple_account_login_status || '新接口保活重试中';
+        const refreshAt = session.apple_account_next_refresh_at || '';
+        return `<span class="manage-refresh-clock retrying" data-account-id="${esc(session.account_id || '')}" data-login-ok="0" data-refresh-at="${esc(refreshAt)}" title="${esc(title)}">新接口保活：重试中</span>`;
       }
       const refreshAt = session.apple_account_next_refresh_at || '';
       const expiresAt = session.apple_account_manage_expires_at || '';

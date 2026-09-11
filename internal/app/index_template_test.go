@@ -882,6 +882,29 @@ func TestIndexTemplateClearsProxyInputAfterLoginStart(t *testing.T) {
 	}
 }
 
+func TestIndexTemplateShowsAppleAccountKeepAliveRetrying(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	block := scriptFunctionBlock(t, html, "function sessionManageRefreshBadge(session)", "function loginStateChipMode")
+	for _, marker := range []string{
+		"session.apple_account_keep_alive_stopped",
+		"新接口保活：已停止",
+		"session.apple_account_keep_alive_retrying",
+		"新接口保活：重试中",
+	} {
+		if !strings.Contains(block, marker) {
+			t.Errorf("keepalive badge missing marker %q", marker)
+		}
+	}
+	clockBlock := scriptFunctionBlock(t, html, "function updateManageRefreshClocks()", "function ensureManageRefreshClockTimer")
+	if !strings.Contains(clockBlock, "node.classList.contains('retrying')") || !strings.Contains(clockBlock, "新接口保活：重试中") {
+		t.Fatalf("keepalive clock updater must keep retrying text stable, block=%s", clockBlock)
+	}
+}
+
 func scriptFunctionBlock(t *testing.T, html, startMarker, endMarker string) string {
 	t.Helper()
 	start := strings.Index(html, startMarker)

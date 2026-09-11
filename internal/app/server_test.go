@@ -261,15 +261,31 @@ func TestAppleAccountManageFingerprintUsesCapturedLocale(t *testing.T) {
 func TestAppleAccountAPIErrorDoesNotTreatGenericHTTPAsAuthExpired(t *testing.T) {
 	generic := appleAccountAPIError(http.StatusUnauthorized, []byte(`<html><body>401 Unauthorized</body></html>`), "测试阶段")
 	if isCodedError(generic, "apple_account_auth_failed") {
-		t.Fatalf("generic 401 classified as auth failed: %v", generic)
+		t.Fatalf("HTML 401 classified as auth failed: %v", generic)
 	}
 	if !isCodedError(generic, "apple_account_api_failed") {
-		t.Fatalf("generic 401 code = %v, want apple_account_api_failed", generic)
+		t.Fatalf("HTML 401 = %v, want apple_account_api_failed so WAF pages do not fill keepalive strikes", generic)
 	}
 
 	expired := appleAccountAPIError(http.StatusUnauthorized, []byte(`{"service_errors":[{"message":"authentication_failed"}]}`), "测试阶段")
 	if !isCodedError(expired, "apple_account_auth_failed") {
 		t.Fatalf("explicit auth error = %v, want apple_account_auth_failed", expired)
+	}
+
+	serverErr := appleAccountAPIError(http.StatusInternalServerError, []byte(`<html><body>temporary</body></html>`), "测试阶段")
+	if !isCodedError(serverErr, "apple_account_api_failed") {
+		t.Fatalf("generic 500 = %v, want apple_account_api_failed", serverErr)
+	}
+}
+
+func TestAppleAccountAPIErrorTreatsEmptyAndJSONUnauthorizedAsAuthExpired(t *testing.T) {
+	empty := appleAccountAPIError(http.StatusUnauthorized, nil, "读取转发邮箱")
+	if !isCodedError(empty, "apple_account_auth_failed") {
+		t.Fatalf("empty 401 = %v, want apple_account_auth_failed", empty)
+	}
+	coded := appleAccountAPIError(http.StatusForbidden, []byte(`{"service_errors":[{"code":"-20101"}]}`), "刷新管理 token")
+	if !isCodedError(coded, "apple_account_auth_failed") {
+		t.Fatalf("json 403 without message = %v, want apple_account_auth_failed", coded)
 	}
 }
 
@@ -541,14 +557,43 @@ func TestPublicSessionHidesAppleKeepAliveTimeWhenLoginStateFailed(t *testing.T) 
 			APIKey:            "api-key",
 			LastCheckedAt:     checkedAt,
 			LastCheckOK:       false,
+			KeepAliveStopped:  true,
 			LastStatusMessage: "新接口登录态异常",
 		}},
 	})
 	if !got.AppleAccountLoginSaved || !got.AppleAccountLoginChecked || got.AppleAccountLoginOK {
 		t.Fatalf("apple account failed state not exposed correctly: %+v", got)
 	}
+	if !got.AppleAccountKeepAliveStopped || got.AppleAccountKeepAliveRetrying {
+		t.Fatalf("stopped keepalive flags = stopped:%t retrying:%t", got.AppleAccountKeepAliveStopped, got.AppleAccountKeepAliveRetrying)
+	}
 	if got.AppleAccountNextRefreshAt != "" {
 		t.Fatalf("failed apple account state should not expose keepalive time: %+v", got)
+	}
+}
+
+func TestPublicSessionExposesAppleKeepAliveRetrying(t *testing.T) {
+	checkedAt := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	session := ICloudSession{
+		SavedAt: time.Now(),
+		AppleID: "retry@example.com",
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Scnt:               "scnt",
+			APIKey:             "api-key",
+			LastCheckedAt:      checkedAt,
+			LastCheckOK:        false,
+			KeepAliveFailCount: 1,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}
+	got := publicSession(&session)
+	if got.AppleAccountLoginOK || !got.AppleAccountKeepAliveRetrying || got.AppleAccountKeepAliveStopped {
+		t.Fatalf("retrying keepalive flags = ok:%t retrying:%t stopped:%t", got.AppleAccountLoginOK, got.AppleAccountKeepAliveRetrying, got.AppleAccountKeepAliveStopped)
+	}
+	wantNext := checkedAt.Add(appleAccountKeepAliveIntervalForSession(session, appleAccountKeepAliveDefaultInterval))
+	if got.AppleAccountNextRefreshAt != formatTime(wantNext) {
+		t.Fatalf("retrying keepalive next refresh = %q, want %q", got.AppleAccountNextRefreshAt, formatTime(wantNext))
 	}
 }
 
@@ -1160,6 +1205,7 @@ func TestAppleAccountKeepAliveRoundSkipsFailedLoginState(t *testing.T) {
 			APIKey:            "api-key",
 			LastCheckedAt:     time.Now().Add(-time.Hour),
 			LastCheckOK:       false,
+			KeepAliveStopped:  true,
 			LastStatusMessage: "新接口登录态异常",
 		}},
 	}
@@ -1172,11 +1218,300 @@ func TestAppleAccountKeepAliveRoundSkipsFailedLoginState(t *testing.T) {
 		t.Fatalf("handler type = %T, want *Server", handler)
 	}
 	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
-		t.Fatal("failed login state should not be kept alive")
+		t.Fatal("stopped login state should not be kept alive")
 		return state, nil
 	}
 
 	server.keepAliveAppleAccountRound(context.Background())
+}
+
+func TestAppleAccountKeepAliveRoundSkipsLegacyFailedLoginStateWithoutRetryStreak(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-legacy"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAliveLegacy", "legacy@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "legacy@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:              LoginStateAppleAccount,
+			Scnt:              "scnt",
+			APIKey:            "api-key",
+			LastCheckedAt:     time.Now().Add(-time.Hour),
+			LastCheckOK:       false,
+			LastStatusMessage: "新接口登录态异常",
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger())
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		t.Fatal("legacy failed login state without retry streak should not be kept alive")
+		return state, nil
+	}
+
+	server.keepAliveAppleAccountRound(context.Background())
+}
+
+func TestAppleAccountKeepAliveRoundRetriesFailedButNotStoppedState(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-retry"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAliveRetry", "retry@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "retry@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Scnt:               "old-scnt",
+			APIKey:             "old-key",
+			LastCheckedAt:      time.Now().Add(-time.Hour),
+			LastCheckOK:        false,
+			KeepAliveFailCount: 1,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger())
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	var calls int
+	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		calls++
+		state.Scnt = "retry-scnt"
+		state.APIKey = "retry-key"
+		state.LastCheckOK = false
+		state.KeepAliveFailCount = 2
+		state.LastStatusMessage = "新接口保活：重试中"
+		return state, errCode("apple_account_keepalive_retrying", "新接口保活重试中", true)
+	}
+
+	server.keepAliveAppleAccountRound(context.Background())
+
+	if calls != 1 {
+		t.Fatalf("keepalive calls = %d, want 1", calls)
+	}
+	got, ok := store.ICloudSessionForOwnerAccount(ownerID, account.ID)
+	if !ok {
+		t.Fatal("updated session not found")
+	}
+	state, ok := appleAccountLoginState(got)
+	if !ok || state.Scnt != "retry-scnt" || state.APIKey != "retry-key" || state.KeepAliveFailCount != 2 || state.KeepAliveStopped || state.LastCheckOK {
+		t.Fatalf("saved retrying apple account state = %+v ok=%v", state, ok)
+	}
+}
+
+func TestAppleAccountKeepAliveRoundStopsAfterMaxAuthFails(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-stop"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAliveStop", "stop@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "stop@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Scnt:               "old-scnt",
+			APIKey:             "old-key",
+			LastCheckedAt:      time.Now().Add(-time.Hour),
+			LastCheckOK:        false,
+			KeepAliveFailCount: 2,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger())
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		state.Scnt = "dead-scnt"
+		state.LastCheckOK = false
+		state.KeepAliveFailCount = 3
+		state.KeepAliveStopped = true
+		state.LastStatusMessage = "新接口登录态异常：管理态已失效"
+		return state, errCode("apple_account_auth_failed", "Apple Account 管理态已失效，请重新协议登录", true)
+	}
+
+	server.keepAliveAppleAccountRound(context.Background())
+
+	got, ok := store.ICloudSessionForOwnerAccount(ownerID, account.ID)
+	if !ok {
+		t.Fatal("updated session not found")
+	}
+	state, ok := appleAccountLoginState(got)
+	if !ok || state.Scnt != "dead-scnt" || !state.KeepAliveStopped || state.KeepAliveFailCount != 3 || state.LastCheckOK {
+		t.Fatalf("saved stopped apple account state = %+v ok=%v", state, ok)
+	}
+	if appleAccountKeepAliveEligible(got) {
+		t.Fatal("stopped login state should leave the keepalive queue")
+	}
+}
+
+func TestAppleAccountKeepAliveRoundIgnoresNetworkError(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-net"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAliveNet", "net@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "net@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:          LoginStateAppleAccount,
+			Scnt:          "live-scnt",
+			APIKey:        "live-key",
+			LastCheckedAt: time.Now().Add(-time.Hour),
+			LastCheckOK:   true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger())
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		return state, context.DeadlineExceeded
+	}
+
+	server.keepAliveAppleAccountRound(context.Background())
+
+	got, ok := store.ICloudSessionForOwnerAccount(ownerID, account.ID)
+	if !ok {
+		t.Fatal("session not found")
+	}
+	state, ok := appleAccountLoginState(got)
+	if !ok || state.Scnt != "live-scnt" || !state.LastCheckOK || state.KeepAliveFailCount != 0 || state.KeepAliveStopped {
+		t.Fatalf("network error should not mark apple account dead: %+v ok=%v", state, ok)
+	}
+	if !state.LastCheckedAt.After(session.LoginStates[0].LastCheckedAt) {
+		t.Fatalf("network error should still postpone the next keepalive: last=%v previous=%v", state.LastCheckedAt, session.LoginStates[0].LastCheckedAt)
+	}
+}
+
+func TestAppleAccountKeepAliveRoundSavesRefreshedCookiesOnTransientError(t *testing.T) {
+	store := newTestStore(t)
+	ownerID := "owner-keepalive-transient"
+	account, err := store.AddAccountForOwner(ownerID, "KeepAliveTransient", "transient@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousCheck := time.Now().Add(-time.Hour)
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   "transient@example.com",
+		SavedAt:   time.Now(),
+		LoginStates: []LoginState{{
+			Kind:          LoginStateAppleAccount,
+			Scnt:          "live-scnt",
+			APIKey:        "live-key",
+			LastCheckedAt: previousCheck,
+			LastCheckOK:   true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{AppleAccountKeepAliveEnabled: true, AppleAccountKeepAliveMS: 1000}, store, discardLogger())
+	server, ok := handler.(*Server)
+	if !ok {
+		t.Fatalf("handler type = %T, want *Server", handler)
+	}
+	server.keepAliveAppleAccountState = func(ctx context.Context, state LoginState) (LoginState, error) {
+		state.Scnt = "refreshed-scnt"
+		state.APIKey = "refreshed-key"
+		return state, errCode("apple_account_api_failed", "Apple Account 接口失败；阶段：读取转发邮箱；HTTP 500", true)
+	}
+
+	server.keepAliveAppleAccountRound(context.Background())
+
+	got, ok := store.ICloudSessionForOwnerAccount(ownerID, account.ID)
+	if !ok {
+		t.Fatal("session not found")
+	}
+	state, ok := appleAccountLoginState(got)
+	if !ok || state.Scnt != "refreshed-scnt" || state.APIKey != "refreshed-key" || !state.LastCheckOK || state.KeepAliveFailCount != 0 || state.KeepAliveStopped {
+		t.Fatalf("transient keepalive should keep health flags and write refreshed credentials: %+v ok=%v", state, ok)
+	}
+	if !state.LastCheckedAt.After(previousCheck) {
+		t.Fatalf("transient keepalive should postpone the next round: last=%v previous=%v", state.LastCheckedAt, previousCheck)
+	}
+}
+
+func TestAppleAccountKeepAliveTimeoutAllowsRescuePath(t *testing.T) {
+	if appleAccountKeepAliveTimeout != 60*time.Second {
+		t.Fatalf("keepalive timeout = %s, want 60s", appleAccountKeepAliveTimeout)
+	}
+}
+
+func TestNewICloudKeepAliveClientDefersTimeoutToContext(t *testing.T) {
+	general := NewICloudClient()
+	if general.client == nil || general.client.Timeout != 30*time.Second {
+		t.Fatalf("general iCloud client timeout = %v, want 30s", general.client)
+	}
+	keepAlive := newICloudKeepAliveClient()
+	if keepAlive.client == nil || keepAlive.client.Timeout != 0 {
+		t.Fatalf("keepalive client timeout = %v, want 0 so the 60s context bounds the whole rescue round", keepAlive.client)
+	}
+}
+
+func TestLoginCheckTimeoutsAreIndependent(t *testing.T) {
+	if appleAccountKeepAliveTimeout != 60*time.Second {
+		t.Fatalf("apple check timeout = %s, want 60s", appleAccountKeepAliveTimeout)
+	}
+	if icloudWebCheckTimeout != 30*time.Second {
+		t.Fatalf("old-interface check timeout = %s, want 30s", icloudWebCheckTimeout)
+	}
+	if icloudIMAPCheckTimeout != 25*time.Second {
+		t.Fatalf("IMAP check timeout = %s, want 25s", icloudIMAPCheckTimeout)
+	}
+	if appleAccountManageOperationTimeout != 2*appleAccountKeepAliveTimeout {
+		t.Fatalf("manage operation timeout = %s, want 2x keepalive", appleAccountManageOperationTimeout)
+	}
+}
+
+func TestAppleAccountListClientUsesKeepAliveHTTPTimeout(t *testing.T) {
+	client, _, cancel := appleAccountListClientAndContext(t.Context(), string(mailboxCreateChannelAppleAccount))
+	defer cancel()
+	if client == nil || client.client == nil || client.client.Timeout != 0 {
+		t.Fatalf("apple account list client timeout = %v, want 0", client)
+	}
+	webClient, _, webCancel := appleAccountListClientAndContext(t.Context(), string(mailboxCreateChannelICloudWeb))
+	defer webCancel()
+	if webClient == nil || webClient.client == nil || webClient.client.Timeout != 30*time.Second {
+		t.Fatalf("icloud web list client timeout = %v, want 30s", webClient)
+	}
 }
 
 func TestAppleAccountKeepAliveScanIntervalPollsBeforeBaseInterval(t *testing.T) {
@@ -2262,8 +2597,11 @@ func TestICloudClientRefreshAppleAccountManageStateUsesBootstrapTTLWhenInitialTo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.APIKey != "account-key" || state.Scnt != "manage-scnt" || !state.LastCheckOK || !state.ManageExpiresAt.After(now) {
-		t.Fatalf("state = %+v, want api key, updated scnt, ok and bootstrap TTL", state)
+	if state.APIKey != "account-key" || state.Scnt != "manage-scnt" || !state.ManageExpiresAt.After(now) {
+		t.Fatalf("state = %+v, want api key, updated scnt and bootstrap TTL", state)
+	}
+	if state.LastCheckOK || state.KeepAliveFailCount != 0 {
+		t.Fatalf("token refresh must not mark manage state healthy: %+v", state)
 	}
 	wantPaths := []string{
 		"GET /account/manage/gs/ws/token",
@@ -2347,6 +2685,249 @@ func TestICloudClientKeepAliveAppleAccountManageStateTouchesRealManageAPI(t *tes
 	if state.APIKey != "fresh-key" || state.Scnt != "touch-scnt" || state.SessionID != "jslog-session" || !state.LastCheckOK || state.LastCheckedAt.Before(now) {
 		t.Fatalf("state = %+v, want touched real manage API state", state)
 	}
+	if state.KeepAliveFailCount != 0 || state.KeepAliveStopped {
+		t.Fatalf("successful keepalive should clear retry flags: %+v", state)
+	}
+}
+
+func TestICloudClientKeepAliveRecoversAfterForwardemailAuthFailure(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var paths []string
+	forwardCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			if r.Header.Get("scnt") == "start-scnt" {
+				w.Header().Set("scnt", "token-scnt")
+			} else if r.Header.Get("scnt") == "" {
+				w.Header().Set("scnt", "recover-token-scnt")
+			} else {
+				t.Fatalf("unexpected token scnt header = %q", r.Header.Get("scnt"))
+			}
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			if r.Header.Get("scnt") == "token-scnt" {
+				w.Header().Set("scnt", "manage-scnt")
+				_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+				return
+			}
+			if r.Header.Get("scnt") == "recover-token-scnt" {
+				w.Header().Set("scnt", "recover-manage-scnt")
+				_, _ = w.Write([]byte(`{"apiKey":"recover-key"}`))
+				return
+			}
+			t.Fatalf("unexpected manage scnt header = %q", r.Header.Get("scnt"))
+		case "GET /account/manage/forwardemail":
+			forwardCalls++
+			if forwardCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+				return
+			}
+			if r.Header.Get("X-Apple-Api-Key") != "recover-key" {
+				t.Fatalf("recovered forwardemail api key = %q, want recover-key", r.Header.Get("X-Apple-Api-Key"))
+			}
+			if r.Header.Get("scnt") != "recover-manage-scnt" {
+				t.Fatalf("recovered forwardemail scnt = %q, want recover-manage-scnt", r.Header.Get("scnt"))
+			}
+			w.Header().Set("scnt", "recover-touch-scnt")
+			_, _ = w.Write([]byte(`{"forwardToEmail":"receiver@icloud.com"}`))
+		case "GET /account/manage/section/privacy":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html></html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "POST /v2/jslogs":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	client := &ICloudClient{client: ts.Client()}
+	state, err := client.KeepAliveAppleAccountManageState(t.Context(), LoginState{
+		Kind:   LoginStateAppleAccount,
+		Origin: ts.URL,
+		Scnt:   "start-scnt",
+		APIKey: "old-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{
+		"GET /account/manage/gs/ws/token",
+		"GET /account/manage",
+		"GET /account/manage/forwardemail",
+		"GET /account/manage/section/privacy",
+		"GET /bootstrap/portal",
+		"GET /account/manage/gs/ws/token",
+		"GET /account/manage",
+		"GET /account/manage/forwardemail",
+		"POST /v2/jslogs",
+	}
+	if strings.Join(paths, "\n") != strings.Join(wantPaths, "\n") {
+		t.Fatalf("paths = %#v, want %#v", paths, wantPaths)
+	}
+	if state.APIKey != "recover-key" || state.Scnt != "recover-touch-scnt" || !state.LastCheckOK || state.KeepAliveFailCount != 0 || state.KeepAliveStopped {
+		t.Fatalf("recovered keepalive state = %+v", state)
+	}
+}
+
+func TestICloudClientKeepAliveMarksRetryingAfterRescueStillFails(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/section/privacy":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html></html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	client := &ICloudClient{client: ts.Client()}
+	state, err := client.keepAliveAppleAccountManageStateUnlocked(t.Context(), LoginState{
+		Kind:   LoginStateAppleAccount,
+		Origin: ts.URL,
+		Scnt:   "start-scnt",
+		APIKey: "old-key",
+	})
+	if !isCodedError(err, "apple_account_keepalive_retrying") {
+		t.Fatalf("err = %v, want apple_account_keepalive_retrying", err)
+	}
+	if state.LastCheckOK || state.KeepAliveFailCount != 1 || state.KeepAliveStopped || state.LastStatusMessage != "新接口保活：重试中" {
+		t.Fatalf("retrying keepalive state = %+v", state)
+	}
+
+	state, err = client.keepAliveAppleAccountManageStateUnlocked(t.Context(), state)
+	if !isCodedError(err, "apple_account_keepalive_retrying") {
+		t.Fatalf("second err = %v, want apple_account_keepalive_retrying", err)
+	}
+	if state.KeepAliveFailCount != 2 || state.KeepAliveStopped {
+		t.Fatalf("second retrying state = %+v", state)
+	}
+
+	state, err = client.keepAliveAppleAccountManageStateUnlocked(t.Context(), state)
+	if !isCodedError(err, "apple_account_auth_failed") {
+		t.Fatalf("third err = %v, want apple_account_auth_failed", err)
+	}
+	if !state.KeepAliveStopped || state.KeepAliveFailCount != 3 || state.LastCheckOK {
+		t.Fatalf("stopped keepalive state = %+v", state)
+	}
+}
+
+func TestICloudClientKeepAliveCountsForwardemailAuthFailuresAcrossRounds(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html></html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage/forwardemail":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	client := &ICloudClient{client: ts.Client()}
+	state := LoginState{
+		Kind:               LoginStateAppleAccount,
+		Origin:             ts.URL,
+		Scnt:               "start-scnt",
+		APIKey:             "old-key",
+		KeepAliveFailCount: 1,
+		LastCheckOK:        false,
+		LastStatusMessage:  "新接口保活：重试中",
+	}
+	state, err := client.keepAliveAppleAccountManageStateUnlocked(t.Context(), state)
+	if !isCodedError(err, "apple_account_keepalive_retrying") {
+		t.Fatalf("err = %v, want apple_account_keepalive_retrying", err)
+	}
+	if state.KeepAliveFailCount != 2 || state.KeepAliveStopped || state.LastCheckOK {
+		t.Fatalf("token-ok forwardemail-401 should accumulate fail count, got %+v", state)
+	}
+
+	state, err = client.keepAliveAppleAccountManageStateUnlocked(t.Context(), state)
+	if !isCodedError(err, "apple_account_auth_failed") {
+		t.Fatalf("second err = %v, want apple_account_auth_failed", err)
+	}
+	if !state.KeepAliveStopped || state.KeepAliveFailCount != 3 || state.LastCheckOK {
+		t.Fatalf("third consecutive manage-api auth failure should stop keepalive, got %+v", state)
+	}
+}
+
+func TestICloudClientKeepAliveCountsHTMLUnauthorizedAfterRescue(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html></html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage/forwardemail":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`<html><body>401 Unauthorized</body></html>`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	client := &ICloudClient{client: ts.Client()}
+	state, err := client.keepAliveAppleAccountManageStateUnlocked(t.Context(), LoginState{
+		Kind:   LoginStateAppleAccount,
+		Origin: ts.URL,
+		Scnt:   "start-scnt",
+		APIKey: "old-key",
+	})
+	if !isCodedError(err, "apple_account_keepalive_retrying") {
+		t.Fatalf("err = %v, want apple_account_keepalive_retrying", err)
+	}
+	if state.LastCheckOK || state.KeepAliveFailCount != 1 || state.KeepAliveStopped {
+		t.Fatalf("HTML 401 after rescue should count as keepalive failure, got %+v", state)
+	}
 }
 
 func TestICloudClientCreatePrivacyMailboxWithAppleAccountReusesFreshStateAfterFailedCheck(t *testing.T) {
@@ -2424,6 +3005,323 @@ func TestICloudClientCreatePrivacyMailboxWithAppleAccountReusesFreshStateAfterFa
 	updatedState, ok := appleAccountLoginState(updatedSession)
 	if !ok || updatedState.Scnt != "scnt-after-confirm" || updatedState.APIKey != "recent-key" || !updatedState.LastCheckOK || updatedState.LastCheckedAt.IsZero() || updatedState.LastCheckedAt.Before(checkedAt) {
 		t.Fatalf("updated apple account state = %+v ok=%v, want reused state marked ok", updatedState, ok)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxWithAppleAccountRetriesHTMLUnauthorized(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	addCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			addCalls++
+			if addCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`<html><body>401 Unauthorized</body></html>`))
+				return
+			}
+			w.Header().Set("scnt", "scnt-after-add")
+			_, _ = w.Write([]byte(`{"emailAddress":"Html.Retry@icloud.com","active":false}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "PUT /account/manage/email/private/add/complete":
+			w.Header().Set("scnt", "scnt-after-complete")
+			_, _ = w.Write([]byte(`{"emailAddress":"Html.Retry@icloud.com","id":"htmlretry1","active":true}`))
+		case "GET /account/manage/email/private/htmlretry1.em":
+			w.Header().Set("scnt", "scnt-after-confirm")
+			_, _ = w.Write([]byte(`{"emailAddress":"Html.Retry@icloud.com","id":"htmlretry1","active":true}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	remote, _, err := client.CreatePrivacyMailboxWithAppleAccount(t.Context(), ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Origin:          ts.URL,
+			Scnt:            "fresh-scnt",
+			APIKey:          "fresh-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(15 * time.Minute),
+			LastCheckOK:     true,
+		}},
+	}, "", "LAB", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addCalls != 2 {
+		t.Fatalf("add calls = %d, want 2 after HTML 401 retry", addCalls)
+	}
+	if remote.Email != "html.retry@icloud.com" {
+		t.Fatalf("remote email = %q, want html.retry@icloud.com", remote.Email)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxWithAppleAccountRefreshesWhenKeepAliveRetrying(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "POST /account/manage/email/private/add":
+			if r.Header.Get("X-Apple-Api-Key") != "fresh-key" {
+				t.Fatalf("add api key header = %q, want fresh-key after keepalive retry refresh", r.Header.Get("X-Apple-Api-Key"))
+			}
+			w.Header().Set("scnt", "scnt-after-add")
+			_, _ = w.Write([]byte(`{"emailAddress":"Retry.Keepalive@icloud.com","active":false}`))
+		case "PUT /account/manage/email/private/add/complete":
+			w.Header().Set("scnt", "scnt-after-complete")
+			_, _ = w.Write([]byte(`{"emailAddress":"Retry.Keepalive@icloud.com","id":"retryka123","active":true}`))
+		case "GET /account/manage/email/private/retryka123.em":
+			w.Header().Set("scnt", "scnt-after-confirm")
+			_, _ = w.Write([]byte(`{"emailAddress":"Retry.Keepalive@icloud.com","id":"retryka123","active":true}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	remote, _, err := client.CreatePrivacyMailboxWithAppleAccount(t.Context(), ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Origin:             ts.URL,
+			Scnt:               "stale-scnt",
+			APIKey:             "stale-key",
+			LastCheckedAt:      now,
+			ManageExpiresAt:    now.Add(15 * time.Minute),
+			LastCheckOK:        false,
+			KeepAliveFailCount: 1,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}, "", "LAB", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.Email != "retry.keepalive@icloud.com" {
+		t.Fatalf("remote email = %q, want retry.keepalive@icloud.com", remote.Email)
+	}
+	if paths[0] != "GET /account/manage/gs/ws/token" {
+		t.Fatalf("create during keepalive retry must refresh first, paths=%#v", paths)
+	}
+}
+
+func TestICloudClientCreatePrivacyMailboxWithAppleAccountKeepsKeepAliveFailureAfterAddAuthError(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "POST /account/manage/email/private/add":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	_, updated, err := client.CreatePrivacyMailboxWithAppleAccount(t.Context(), ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Origin:             ts.URL,
+			Scnt:               "stale-scnt",
+			APIKey:             "stale-key",
+			LastCheckedAt:      now,
+			ManageExpiresAt:    now.Add(15 * time.Minute),
+			LastCheckOK:        false,
+			KeepAliveFailCount: 2,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}, "", "LAB", "")
+	if !isCodedError(err, "apple_account_auth_failed") {
+		t.Fatalf("err = %v, want apple_account_auth_failed", err)
+	}
+	state, ok := appleAccountLoginState(updated)
+	if !ok || state.LastCheckOK || state.KeepAliveFailCount != 2 || state.KeepAliveStopped {
+		t.Fatalf("failed create must not clear keepalive failure streak: %+v ok=%v", state, ok)
+	}
+	if state.Scnt != "manage-scnt" || state.APIKey != "fresh-key" {
+		t.Fatalf("failed create should still keep refreshed credentials: %+v", state)
+	}
+}
+
+func TestICloudClientDeletePrivacyMailboxWithAppleAccountKeepsKeepAliveFailureAfterAuthError(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "DELETE /account/manage/email/private/anon-1/remove":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	updated, err := client.DeletePrivacyMailboxWithAppleAccount(t.Context(), ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Origin:             ts.URL,
+			Scnt:               "stale-scnt",
+			APIKey:             "stale-key",
+			LastCheckedAt:      now,
+			ManageExpiresAt:    now.Add(15 * time.Minute),
+			LastCheckOK:        false,
+			KeepAliveFailCount: 1,
+			LastStatusMessage:  "新接口保活：重试中",
+		}},
+	}, "", "anon-1")
+	if !isCodedError(err, "apple_account_auth_failed") {
+		t.Fatalf("err = %v, want apple_account_auth_failed", err)
+	}
+	state, ok := appleAccountLoginState(updated)
+	if !ok || state.LastCheckOK || state.KeepAliveFailCount != 1 || state.KeepAliveStopped {
+		t.Fatalf("failed delete must not clear keepalive failure streak: %+v ok=%v", state, ok)
+	}
+}
+
+func TestICloudClientListAppleAccountMailboxesDoesNotClearKeepAliveFailure(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/account/manage/email/private" {
+			t.Fatalf("list path = %q, want /account/manage/email/private", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("scnt", "list-scnt")
+		_, _ = w.Write([]byte(`{"success":true,"result":{"hmeEmails":[{"anonymousId":"list-1","hme":"list-keep@icloud.com","isActive":true}]}}`))
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	remotes, updated, err := (&ICloudClient{client: ts.Client()}).ListPrivacyMailboxesForOriginWithSession(
+		t.Context(),
+		ICloudSession{LoginStates: []LoginState{{
+			Kind:               LoginStateAppleAccount,
+			Origin:             ts.URL,
+			Scnt:               "retry-scnt",
+			APIKey:             "retry-key",
+			LastCheckOK:        false,
+			KeepAliveFailCount: 2,
+			LastStatusMessage:  "新接口保活：重试中",
+		}}},
+		mailboxRemoteOriginAppleAccount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remotes) != 1 || remotes[0].Email != "list-keep@icloud.com" {
+		t.Fatalf("remotes = %+v, want one listed mailbox", remotes)
+	}
+	state, ok := appleAccountLoginState(updated)
+	if !ok || state.LastCheckOK || state.KeepAliveFailCount != 2 || state.KeepAliveStopped {
+		t.Fatalf("successful list must not clear keepalive failure streak: %+v ok=%v", state, ok)
+	}
+	if state.Scnt != "list-scnt" {
+		t.Fatalf("list should still keep refreshed scnt, got %+v", state)
+	}
+}
+
+func TestICloudClientListAppleAccountMailboxesRetriesHTMLUnauthorized(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	listCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls++
+			if listCalls == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`<html><body>401 Unauthorized</body></html>`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "list-retry-scnt")
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hmeEmails":[{"anonymousId":"list-2","hme":"list-retry@icloud.com","isActive":true}]}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	remotes, _, err := (&ICloudClient{client: ts.Client()}).ListPrivacyMailboxesForOriginWithSession(
+		t.Context(),
+		ICloudSession{LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Origin:          ts.URL,
+			Scnt:            "fresh-scnt",
+			APIKey:          "fresh-key",
+			LastCheckOK:     true,
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(15 * time.Minute),
+		}}},
+		mailboxRemoteOriginAppleAccount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listCalls != 2 {
+		t.Fatalf("list calls = %d, want 2 after HTML 401 retry", listCalls)
+	}
+	if len(remotes) != 1 || remotes[0].Email != "list-retry@icloud.com" {
+		t.Fatalf("remotes = %+v, want retried mailbox", remotes)
 	}
 }
 
@@ -2717,6 +3615,211 @@ func TestCheckSavedLoginStatesKeepsRecentlyHealthyAppleAccountState(t *testing.T
 	state, found := appleAccountLoginState(session)
 	if !found || !state.LastCheckOK || state.LastStatusMessage != "新接口登录态正常" || !state.LastCheckedAt.Equal(now) {
 		t.Fatalf("state = %+v found=%t, want healthy state updated at check time", state, found)
+	}
+}
+
+func TestCheckSavedLoginStatesTreatsKeepAliveRetryingAsCompletedCheck(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/section/privacy":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<html></html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))
+		}
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	checkedAt := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	session, ok, err := checkSavedLoginStates(context.Background(), client, ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:   LoginStateAppleAccount,
+			Origin: ts.URL,
+			Scnt:   "start-scnt",
+			APIKey: "old-key",
+		}},
+	}, checkedAt)
+	if err != nil || !ok {
+		t.Fatalf("retrying-only check should complete without hard error, err=%v ok=%t", err, ok)
+	}
+	if session.LastCheckOK || !strings.Contains(session.LastStatusMessage, "新接口重试中") {
+		t.Fatalf("session check status = ok:%t message:%q", session.LastCheckOK, session.LastStatusMessage)
+	}
+	state, found := appleAccountLoginState(session)
+	if !found || state.LastCheckOK || state.KeepAliveFailCount != 1 || state.KeepAliveStopped {
+		t.Fatalf("apple account retrying state = %+v found=%t", state, found)
+	}
+}
+
+func TestICloudSessionCheckOKMessageReportsKeepAliveRetrying(t *testing.T) {
+	got := icloudSessionCheckOKMessage(0, 1, []publicICloudSession{{
+		AppleAccountKeepAliveRetrying: true,
+		AppleAccountLoginOK:           false,
+	}})
+	if got != "新接口保活重试中" {
+		t.Fatalf("message = %q, want 新接口保活重试中", got)
+	}
+	if got := icloudSessionCheckOKMessage(0, 1, []publicICloudSession{{LastCheckOK: true}}); got != "登录态检测正常" {
+		t.Fatalf("healthy message = %q, want 登录态检测正常", got)
+	}
+	if got := icloudSessionCheckOKMessage(1, 2, []publicICloudSession{{}, {}}); got != "登录态部分检测成功：成功 1，失败 1" {
+		t.Fatalf("partial message = %q", got)
+	}
+	mixed := icloudSessionCheckOKMessage(0, 2, []publicICloudSession{
+		{AppleAccountLoginOK: true, LastCheckOK: true},
+		{AppleAccountKeepAliveRetrying: true, AppleAccountLoginOK: false},
+	})
+	if mixed != "登录态部分正常：新接口保活重试中 1 个" {
+		t.Fatalf("mixed message = %q, want partial retrying summary", mixed)
+	}
+	failedAndRetrying := icloudSessionCheckOKMessage(1, 2, []publicICloudSession{
+		{},
+		{AppleAccountKeepAliveRetrying: true, AppleAccountLoginOK: false},
+	})
+	if failedAndRetrying != "登录态部分检测成功：成功 1，失败 1，新接口保活重试中 1 个" {
+		t.Fatalf("failed+retrying message = %q", failedAndRetrying)
+	}
+	failedAndDeferred := icloudSessionCheckOKMessage(1, 2, []publicICloudSession{
+		{},
+		{LastStatusMessage: "登录态异常：新接口暂时失败"},
+	})
+	if failedAndDeferred != "登录态部分检测成功：成功 1，失败 1，检测暂时失败 1 个" {
+		t.Fatalf("failed+deferred message = %q", failedAndDeferred)
+	}
+	deferredAndRetrying := icloudSessionCheckOKMessage(0, 2, []publicICloudSession{
+		{LastStatusMessage: "登录态异常：新接口暂时失败"},
+		{AppleAccountKeepAliveRetrying: true, AppleAccountLoginOK: false},
+	})
+	if deferredAndRetrying != "登录态部分正常：新接口保活重试中 1 个，检测暂时失败 1 个" {
+		t.Fatalf("deferred+retrying message = %q", deferredAndRetrying)
+	}
+	partialDeferred := icloudSessionCheckOKMessage(0, 1, []publicICloudSession{{
+		LastStatusMessage: "登录态部分正常：新接口暂时失败；取码登录正常",
+		ICloudIMAPLoginOK: true,
+	}})
+	if partialDeferred != "登录态部分正常：新接口检测暂时失败，已推迟保活" {
+		t.Fatalf("partial deferred message = %q", partialDeferred)
+	}
+}
+
+func TestCheckSavedLoginStatesUsesConfiguredKeepAliveInterval(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "probe", http.StatusTeapot)
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	_, _, _ = checkSavedLoginStatesWithKeepAliveInterval(context.Background(), client, ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Host:            "appleid.apple.com",
+			Origin:          ts.URL,
+			Scnt:            "fresh-scnt",
+			APIKey:          "fresh-key",
+			LastCheckOK:     true,
+			LastCheckedAt:   now.Add(-time.Minute),
+			ManageExpiresAt: now.Add(14 * time.Minute),
+		}},
+	}, now, CheckICloudIMAPLoginWithProxy, 30*time.Second)
+	if !called {
+		t.Fatal("configured 30s keepalive interval must probe a session last checked 1 minute ago")
+	}
+}
+
+func TestCheckSavedLoginStatesKeepsHealthyAppleAccountOnTransientError(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html><body>bad gateway</body></html>`))
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	session, ok, err := checkSavedLoginStates(context.Background(), client, ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Origin:          ts.URL,
+			Scnt:            "live-scnt",
+			APIKey:          "live-key",
+			LastCheckOK:     true,
+			LastCheckedAt:   now.Add(-time.Hour),
+			ManageExpiresAt: now.Add(10 * time.Minute),
+		}},
+	}, now)
+	if err != nil || !ok {
+		t.Fatalf("transient check should complete without kicking keepalive, err=%v ok=%t", err, ok)
+	}
+	state, found := appleAccountLoginState(session)
+	if !found || !state.LastCheckOK || state.KeepAliveFailCount != 0 || state.KeepAliveStopped {
+		t.Fatalf("transient check must keep healthy keepalive flags: %+v found=%t", state, found)
+	}
+	if !appleAccountKeepAliveEligible(session) {
+		t.Fatal("transient check must not remove a healthy session from the keepalive queue")
+	}
+	if !strings.Contains(session.LastStatusMessage, "暂时失败") {
+		t.Fatalf("session message = %q, want 暂时失败", session.LastStatusMessage)
+	}
+	pub := publicSession(&session)
+	if pub.AppleAccountLoginOK {
+		t.Fatal("transient check must not show the new-interface chip as healthy")
+	}
+	if !strings.Contains(pub.AppleAccountLoginStatus, "暂时失败") {
+		t.Fatalf("public apple status = %q, want 暂时失败", pub.AppleAccountLoginStatus)
+	}
+}
+
+func TestCheckSavedLoginStatesProbesDeferredAppleAccountEvenIfRecentlyChecked(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`<html><body>bad gateway</body></html>`))
+	}))
+	defer ts.Close()
+	appleAccountManageBaseURL = ts.URL
+
+	now := time.Now()
+	client := &ICloudClient{client: ts.Client()}
+	_, _, err := checkSavedLoginStates(context.Background(), client, ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:              LoginStateAppleAccount,
+			Origin:            ts.URL,
+			Scnt:              "live-scnt",
+			APIKey:            "live-key",
+			LastCheckOK:       true,
+			LastCheckedAt:     now.Add(-time.Minute),
+			ManageExpiresAt:   now.Add(10 * time.Minute),
+			LastStatusMessage: "新接口检测暂时失败，已推迟保活",
+		}},
+	}, now)
+	if err != nil {
+		t.Fatalf("deferred recheck err=%v", err)
+	}
+	if !called {
+		t.Fatal("deferred keepalive state must not skip a real Apple probe")
 	}
 }
 

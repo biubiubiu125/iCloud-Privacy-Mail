@@ -88,10 +88,18 @@ func NewICloudClient() *ICloudClient {
 	return &ICloudClient{client: &http.Client{Timeout: 30 * time.Second}}
 }
 
+func newICloudKeepAliveClient() *ICloudClient {
+	return &ICloudClient{client: &http.Client{}}
+}
+
 const mailboxSyncCursorOverlap = 2 * time.Minute
 const appleAccountManageRefreshSkew = 0 * time.Second
 const appleAccountKeepAliveDefaultInterval = 4 * time.Minute
-const appleAccountKeepAliveTimeout = 25 * time.Second
+const appleAccountKeepAliveTimeout = 60 * time.Second
+const appleAccountKeepAliveMaxAuthFails = 3
+const appleAccountManageOperationTimeout = 2 * appleAccountKeepAliveTimeout
+const icloudWebCheckTimeout = 30 * time.Second
+const icloudIMAPCheckTimeout = 25 * time.Second
 
 var appleAccountManageBaseURL = "https://appleid.apple.com"
 var appleAccountOperationMu sync.Mutex
@@ -175,6 +183,9 @@ func appleAccountManageReady(session ICloudSession) bool {
 }
 
 func appleAccountManageNeedsCreateRefresh(loginState LoginState, now time.Time) bool {
+	if loginState.KeepAliveStopped || loginState.KeepAliveFailCount > 0 {
+		return true
+	}
 	return !appleAccountManageRecentStateUsable(loginState, now)
 }
 
@@ -205,6 +216,75 @@ func markAppleAccountManageOK(loginState *LoginState) {
 	loginState.LastCheckedAt = time.Now()
 	loginState.LastCheckOK = true
 	loginState.LastStatusMessage = "新接口登录态正常"
+	loginState.KeepAliveFailCount = 0
+	loginState.KeepAliveStopped = false
+}
+
+func appleAccountKeepAliveRetrying(loginState LoginState) bool {
+	return !loginState.KeepAliveStopped && !loginState.LastCheckOK && loginState.KeepAliveFailCount > 0
+}
+
+func appleAccountKeepAliveDeferred(loginState LoginState) bool {
+	return strings.Contains(loginState.LastStatusMessage, "暂时失败")
+}
+
+func appleAccountPublicLoginOK(loginState LoginState) bool {
+	return loginState.LastCheckOK && !appleAccountKeepAliveDeferred(loginState)
+}
+
+func markAppleAccountKeepAliveAuthFailure(loginState LoginState, cause error) LoginState {
+	loginState.LastCheckedAt = time.Now()
+	loginState.LastCheckOK = false
+	loginState.KeepAliveFailCount++
+	if loginState.KeepAliveFailCount >= appleAccountKeepAliveMaxAuthFails {
+		loginState.KeepAliveStopped = true
+		loginState.LastStatusMessage = "新接口登录态异常：" + publicErrorMessage(cause)
+		return loginState
+	}
+	loginState.KeepAliveStopped = false
+	loginState.LastStatusMessage = "新接口保活：重试中"
+	return loginState
+}
+
+func appleAccountKeepAliveAuthError(loginState LoginState) error {
+	if loginState.KeepAliveStopped {
+		return errCode("apple_account_auth_failed", "Apple Account 管理态已失效，请重新协议登录", true)
+	}
+	return errCode("apple_account_keepalive_retrying", "新接口保活重试中", true)
+}
+
+func appleAccountKeepAliveShouldRescue(err error) bool {
+	if isCodedError(err, "apple_account_auth_failed") {
+		return true
+	}
+	if !isCodedError(err, "apple_account_api_failed") {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 401") || strings.Contains(msg, "http 403")
+}
+
+func appleAccountKeepAliveTransientError(err error) bool {
+	if err == nil || isCodedError(err, "apple_account_auth_failed") || isCodedError(err, "apple_account_keepalive_retrying") || isCodedError(err, "apple_account_session_missing") {
+		return false
+	}
+	if isCodedError(err, "apple_account_api_failed") || isCodedError(err, "apple_account_hme_limit") {
+		return !appleAccountKeepAliveShouldRescue(err)
+	}
+	return isAppleTransientNetworkError(err)
+}
+
+func appleAccountKeepAlivePersistTransient(previous, next LoginState) LoginState {
+	out := next
+	if strings.TrimSpace(out.Scnt) == "" {
+		out = previous
+	}
+	out.LastCheckOK = previous.LastCheckOK
+	out.KeepAliveFailCount = previous.KeepAliveFailCount
+	out.KeepAliveStopped = previous.KeepAliveStopped
+	out.LastStatusMessage = previous.LastStatusMessage
+	out.LastCheckedAt = time.Now()
+	return out
 }
 
 func markAppleAccountManageTokenTTL(loginState *LoginState, timeoutMinutes int, now time.Time) {
@@ -215,12 +295,19 @@ func markAppleAccountManageTokenTTL(loginState *LoginState, timeoutMinutes int, 
 }
 
 func (c *ICloudClient) CheckAppleAccountManageSession(ctx context.Context, session ICloudSession) (ICloudSession, error) {
+	return c.checkAppleAccountManageSession(ctx, session, appleAccountKeepAliveDefaultInterval)
+}
+
+func (c *ICloudClient) checkAppleAccountManageSession(ctx context.Context, session ICloudSession, interval time.Duration) (ICloudSession, error) {
 	loginState, ok := appleAccountLoginState(session)
 	if !ok {
 		return session, errCode("apple_account_session_missing", "未保存新接口登录态，请先完成新接口登录", true)
 	}
 	now := time.Now()
-	if appleAccountManageRecentlyOK(loginState, now) && !appleAccountKeepAliveDue(loginState, now, appleAccountKeepAliveDefaultInterval) {
+	if interval <= 0 {
+		interval = appleAccountKeepAliveDefaultInterval
+	}
+	if appleAccountManageRecentlyOK(loginState, now) && !appleAccountKeepAliveDue(loginState, now, interval) && !appleAccountKeepAliveDeferred(loginState) {
 		return withAppleAccountLoginState(session, loginState), nil
 	}
 	release, err := acquireAppleAccountOperationGate(ctx, appleAccountOperationKey(session, loginState))
@@ -228,11 +315,14 @@ func (c *ICloudClient) CheckAppleAccountManageSession(ctx context.Context, sessi
 		return session, err
 	}
 	defer release()
-	kept, err := c.keepAliveAppleAccountManageStateUnlocked(ctx, loginState)
+	keepAliveCtx, cancel := context.WithTimeout(ctx, appleAccountKeepAliveTimeout)
+	defer cancel()
+	kept, err := c.keepAliveAppleAccountManageStateUnlocked(keepAliveCtx, loginState)
+	session = withAppleAccountLoginState(session, kept)
 	if err != nil {
 		return session, err
 	}
-	return withAppleAccountLoginState(session, kept), nil
+	return session, nil
 }
 
 func withAppleAccountLoginState(session ICloudSession, next LoginState) ICloudSession {
@@ -291,7 +381,7 @@ func (c *ICloudClient) CreatePrivacyMailboxWithAppleAccount(ctx context.Context,
 	}
 
 	remote, updatedSession, err := c.createPrivacyMailboxWithAppleAccountState(ctx, session, loginState, fallbackAPIKey, label, note)
-	if err == nil || !isCodedError(err, "apple_account_auth_failed") || refreshedBeforeCreate {
+	if err == nil || !appleAccountKeepAliveShouldRescue(err) || refreshedBeforeCreate {
 		return remote, updatedSession, err
 	}
 
@@ -332,7 +422,7 @@ func (c *ICloudClient) DeletePrivacyMailboxWithAppleAccount(ctx context.Context,
 	}
 
 	updatedSession, err := c.deletePrivacyMailboxWithAppleAccountState(ctx, session, loginState, fallbackAPIKey, anonymousID)
-	if err == nil || !isCodedError(err, "apple_account_auth_failed") || refreshedBeforeDelete {
+	if err == nil || !appleAccountKeepAliveShouldRescue(err) || refreshedBeforeDelete {
 		return updatedSession, err
 	}
 
@@ -497,8 +587,59 @@ func (c *ICloudClient) keepAliveAppleAccountManageStateUnlocked(ctx context.Cont
 	if strings.TrimSpace(loginState.Scnt) == "" {
 		return loginState, errCode("apple_account_session_missing", "当前登录态缺少 Apple Account 管理态，请重新协议登录", true)
 	}
-	loginState, err := c.refreshAppleAccountManageStateUnlocked(ctx, loginState)
+	touched, err := c.touchAppleAccountManageStateUnlocked(ctx, loginState)
+	if err == nil {
+		markAppleAccountManageOK(&touched)
+		return touched, nil
+	}
+	if !appleAccountKeepAliveShouldRescue(err) {
+		return touched, err
+	}
+	recovered, recoverErr := c.recoverAppleAccountManageStateUnlocked(ctx, touched)
+	if recoverErr == nil {
+		markAppleAccountManageOK(&recovered)
+		return recovered, nil
+	}
+	if !appleAccountKeepAliveShouldRescue(recoverErr) {
+		return recovered, recoverErr
+	}
+	recovered.KeepAliveFailCount = loginState.KeepAliveFailCount
+	recovered.KeepAliveStopped = loginState.KeepAliveStopped
+	next := markAppleAccountKeepAliveAuthFailure(recovered, recoverErr)
+	return next, appleAccountKeepAliveAuthError(next)
+}
+
+func (c *ICloudClient) touchAppleAccountManageStateUnlocked(ctx context.Context, loginState LoginState) (LoginState, error) {
+	refreshed, err := c.refreshAppleAccountManageStateUnlocked(ctx, loginState)
 	if err != nil {
+		return loginState, err
+	}
+	if _, err := c.callAppleAccountRaw(ctx, &refreshed, refreshed.APIKey, http.MethodGet, "/account/manage/forwardemail", nil, nil); err != nil {
+		return refreshed, err
+	}
+	if _, err := c.callAppleAccountRaw(ctx, &refreshed, refreshed.APIKey, http.MethodPost, "/v2/jslogs", appleAccountJSLogBody(), nil); err != nil {
+		if os.Getenv("IPM_DEBUG_APPLE_ACCOUNT") == "1" {
+			fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_DEBUG keepalive jslogs ignored err=%v\n", err)
+		}
+	}
+	return refreshed, nil
+}
+
+func (c *ICloudClient) recoverAppleAccountManageStateUnlocked(ctx context.Context, loginState LoginState) (LoginState, error) {
+	if err := c.warmAppleAccountPortal(ctx, &loginState); err != nil {
+		return loginState, err
+	}
+	previousScnt := strings.TrimSpace(loginState.Scnt)
+	loginState.Scnt = ""
+	var token struct {
+		TimeOutInterval int `json:"timeOutInterval"`
+	}
+	if err := c.callAppleAccount(ctx, &loginState, "", http.MethodGet, "/account/manage/gs/ws/token", nil, &token); err != nil {
+		loginState.Scnt = previousScnt
+		return loginState, err
+	}
+	markAppleAccountManageTokenTTL(&loginState, token.TimeOutInterval, time.Now())
+	if err := c.loadAppleAccountManageAPIKey(ctx, &loginState); err != nil {
 		return loginState, err
 	}
 	if _, err := c.callAppleAccountRaw(ctx, &loginState, loginState.APIKey, http.MethodGet, "/account/manage/forwardemail", nil, nil); err != nil {
@@ -509,7 +650,6 @@ func (c *ICloudClient) keepAliveAppleAccountManageStateUnlocked(ctx context.Cont
 			fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_DEBUG keepalive jslogs ignored err=%v\n", err)
 		}
 	}
-	markAppleAccountManageOK(&loginState)
 	return loginState, nil
 }
 
@@ -573,7 +713,6 @@ func (c *ICloudClient) refreshAppleAccountManageStateUnlocked(ctx context.Contex
 	}
 	tokenScnt := strings.TrimSpace(loginState.Scnt)
 	if err := c.loadAppleAccountManageAPIKey(ctx, &loginState); err == nil {
-		markAppleAccountManageOK(&loginState)
 		return loginState, nil
 	}
 	if err := c.warmAppleAccountPortal(ctx, &loginState); err != nil {
@@ -599,7 +738,6 @@ func (c *ICloudClient) refreshAppleAccountManageStateUnlocked(ctx context.Contex
 	if err := c.loadAppleAccountManageAPIKey(ctx, &loginState); err != nil {
 		return loginState, err
 	}
-	markAppleAccountManageOK(&loginState)
 	return loginState, nil
 }
 
@@ -783,7 +921,7 @@ func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx con
 		fallbackAPIKey = strings.TrimSpace(fallbackAPIKey)
 		state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
 		remotes, err := c.listAppleAccountPrivacyMailboxes(ctx, &state)
-		if err != nil && (isCodedError(err, "apple_account_auth_failed") || isCodedError(err, "apple_account_api_key_missing")) {
+		if err != nil && (appleAccountKeepAliveShouldRescue(err) || isCodedError(err, "apple_account_api_key_missing")) {
 			refreshedState, refreshedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, session, state, fallbackAPIKey)
 			if refreshErr != nil {
 				return nil, refreshedSession, refreshErr
@@ -796,7 +934,6 @@ func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx con
 		if err != nil {
 			return nil, withAppleAccountLoginState(session, state), err
 		}
-		markAppleAccountManageOK(&state)
 		return remotes, withAppleAccountLoginState(session, state), nil
 	case mailboxRemoteOriginICloudWeb, strings.ToUpper(string(mailboxCreateChannelICloudWeb)):
 		remotes, err := c.listICloudWebPrivacyMailboxes(ctx, session)
@@ -1706,10 +1843,21 @@ func appleAccountAPIError(status int, data []byte, stage string) error {
 	if strings.Contains(lower, "limit") || strings.Contains(lower, "too many") || strings.Contains(lower, "rate") {
 		return errCode("apple_account_hme_limit", "Apple Account 已达到当前隐私邮箱创建上限，请稍后再试；"+detail, true)
 	}
-	if status == appleAccountHTTPStatusSessionTimeout || ((status == http.StatusUnauthorized || status == http.StatusForbidden) && appleAccountBodyLooksAuthExpired(lower)) {
+	if status == appleAccountHTTPStatusSessionTimeout || ((status == http.StatusUnauthorized || status == http.StatusForbidden) && appleAccountUnauthorizedLooksAuthFailed(data, lower)) {
 		return errCode("apple_account_auth_failed", "Apple Account 管理态已失效，请重新协议登录；"+detail, true)
 	}
 	return errCode("apple_account_api_failed", "Apple Account 接口失败；"+detail, true)
+}
+
+func appleAccountUnauthorizedLooksAuthFailed(data []byte, lower string) bool {
+	if appleAccountBodyLooksAuthExpired(lower) {
+		return true
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return true
+	}
+	return bytes.Contains(trimmed, []byte("service_errors")) || bytes.Contains(trimmed, []byte("serviceErrors"))
 }
 
 func appleAccountBodyLooksAuthExpired(lower string) bool {
