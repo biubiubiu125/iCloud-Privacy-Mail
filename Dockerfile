@@ -32,6 +32,8 @@ USER root
 
 EXPOSE 8787
 VOLUME ["/app/data"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -q -T 5 -O /dev/null http://127.0.0.1:8787/api/v1/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--host", "0.0.0.0", "--config", "/app/data/config.json"]

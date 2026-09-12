@@ -494,87 +494,54 @@ func (c *ICloudClient) createPrivacyMailboxWithAppleAccountState(ctx context.Con
 	}
 	note = strings.TrimSpace(note)
 
-	var generated struct {
-		EmailAddress string `json:"emailAddress"`
-		Email        string `json:"email"`
-	}
-	generatedRaw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPost, "/account/manage/email/private/add", map[string]any{}, &generated)
+	generatedRaw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPost, "/account/manage/email/private/add", map[string]any{}, nil)
 	if err != nil {
 		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), err
 	}
+	generated := parseAppleAccountPrivateEmailPayload(generatedRaw.Body)
 	generatedEmail := strings.TrimSpace(firstNonEmpty(generated.EmailAddress, generated.Email))
 	if generatedEmail == "" {
 		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), errCode("apple_account_generate_empty", "Apple Account 未返回候选隐私邮箱；"+appleAccountRawResponseDetail("生成候选隐私邮箱", generatedRaw), true)
 	}
 
-	var completed struct {
-		EmailAddress string `json:"emailAddress"`
-		Email        string `json:"email"`
-		Label        string `json:"label"`
-		Note         string `json:"note"`
-		ID           string `json:"id"`
-		AnonymousID  string `json:"anonymousId"`
-		Active       *bool  `json:"active"`
-		IsActive     *bool  `json:"isActive"`
-	}
-	completedRaw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPut, "/account/manage/email/private/add/complete", map[string]string{
+	completeBody := map[string]string{
 		"emailAddress": generatedEmail,
 		"label":        label,
 		"note":         note,
-	}, &completed)
-	if err != nil {
+	}
+	completedRaw, completeErr := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPut, "/account/manage/email/private/add/complete", completeBody, nil)
+	if completeErr != nil && appleAccountKeepAliveShouldRescue(completeErr) {
+		refreshed, refreshErr := c.refreshAppleAccountManageStateUnlocked(ctx, loginState)
+		loginState = refreshed
+		session = withAppleAccountLoginState(session, loginState)
+		if refreshErr == nil {
+			apiKey = strings.TrimSpace(firstNonEmpty(loginState.APIKey, apiKey))
+			completedRaw, completeErr = c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodPut, "/account/manage/email/private/add/complete", completeBody, nil)
+		}
+	}
+	remote := appleAccountRemoteMailboxFromCreate(parseAppleAccountPrivateEmailPayload(completedRaw.Body), generatedEmail, label, note)
+	if completeErr != nil {
+		if recovered, ok := c.lookupAppleAccountCreatedMailbox(ctx, &loginState, generatedEmail); ok {
+			if strings.TrimSpace(recovered.Label) == "" {
+				recovered.Label = label
+			}
+			if strings.TrimSpace(recovered.Note) == "" {
+				recovered.Note = strings.TrimSpace(firstNonEmpty(note, "created by Apple Account private email API"))
+			}
+			remote = recovered
+			completeErr = nil
+		}
+	}
+	if completeErr != nil {
 		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), errCode(
 			"apple_account_create_uncertain",
 			"Apple Account 已提交隐私邮箱确认请求，但未收到可确认的结果；请先同步远端隐私邮箱列表确认后再重试",
 			true,
 		)
 	}
-
-	active := true
-	if completed.Active != nil {
-		active = *completed.Active
-	} else if completed.IsActive != nil {
-		active = *completed.IsActive
-	}
-	remote := ICloudRemoteMailbox{
-		AnonymousID: appleAccountRemoteAnonymousID(completed.ID, completed.AnonymousID),
-		Email:       strings.ToLower(strings.TrimSpace(firstNonEmpty(completed.EmailAddress, completed.Email, generatedEmail))),
-		Label:       strings.TrimSpace(firstNonEmpty(completed.Label, label)),
-		Note:        strings.TrimSpace(firstNonEmpty(completed.Note, note, "created by Apple Account private email API")),
-		IsActive:    active,
-		Origin:      "APPLE_ACCOUNT",
-	}
-	if remote.AnonymousID != "" {
-		var confirmed struct {
-			EmailAddress   string `json:"emailAddress"`
-			Email          string `json:"email"`
-			Label          string `json:"label"`
-			Note           string `json:"note"`
-			ID             string `json:"id"`
-			AnonymousID    string `json:"anonymousId"`
-			ForwardToEmail string `json:"forwardToEmail"`
-			Active         *bool  `json:"active"`
-			IsActive       *bool  `json:"isActive"`
-		}
-		path := "/account/manage/email/private/" + url.PathEscape(remote.AnonymousID) + ".em"
-		if err := c.callAppleAccount(ctx, &loginState, apiKey, http.MethodGet, path, nil, &confirmed); err == nil {
-			remote.AnonymousID = firstNonEmpty(
-				appleAccountRemoteAnonymousID(confirmed.ID, confirmed.AnonymousID),
-				remote.AnonymousID,
-			)
-			remote.Email = strings.ToLower(strings.TrimSpace(firstNonEmpty(confirmed.EmailAddress, confirmed.Email, remote.Email)))
-			remote.Label = strings.TrimSpace(firstNonEmpty(confirmed.Label, remote.Label))
-			remote.Note = strings.TrimSpace(firstNonEmpty(confirmed.Note, remote.Note))
-			remote.ForwardToEmail = strings.TrimSpace(confirmed.ForwardToEmail)
-			if confirmed.Active != nil {
-				remote.IsActive = *confirmed.Active
-			} else if confirmed.IsActive != nil {
-				remote.IsActive = *confirmed.IsActive
-			}
-		}
-	}
+	remote = c.confirmAppleAccountCreatedMailbox(ctx, &loginState, apiKey, remote)
 	if remote.Email == "" {
-		return ICloudRemoteMailbox{}, session, errCode("apple_account_create_empty", "Apple Account 创建后未返回隐私邮箱；"+appleAccountRawResponseDetail("确认创建隐私邮箱", completedRaw), true)
+		return ICloudRemoteMailbox{}, withAppleAccountLoginState(session, loginState), errCode("apple_account_create_empty", "Apple Account 创建后未返回隐私邮箱；"+appleAccountRawResponseDetail("确认创建隐私邮箱", completedRaw), true)
 	}
 	markAppleAccountManageOK(&loginState)
 	session = withAppleAccountLoginState(session, loginState)
@@ -1110,6 +1077,142 @@ type appleAccountMailboxListItem struct {
 	Active         *bool  `json:"active"`
 	IsActive       *bool  `json:"isActive"`
 	Origin         string `json:"origin"`
+}
+
+type appleAccountPrivateEmailPayload struct {
+	EmailAddress   string `json:"emailAddress"`
+	Email          string `json:"email"`
+	Label          string `json:"label"`
+	Note           string `json:"note"`
+	ID             string `json:"id"`
+	AnonymousID    string `json:"anonymousId"`
+	ForwardToEmail string `json:"forwardToEmail"`
+	Active         *bool  `json:"active"`
+	IsActive       *bool  `json:"isActive"`
+}
+
+type appleAccountPrivateEmailResponse struct {
+	appleAccountPrivateEmailPayload
+	Result appleAccountPrivateEmailPayload `json:"result"`
+	Data   appleAccountPrivateEmailPayload `json:"data"`
+}
+
+func parseAppleAccountPrivateEmailPayload(raw []byte) appleAccountPrivateEmailPayload {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '{' {
+		return appleAccountPrivateEmailPayload{}
+	}
+	var response appleAccountPrivateEmailResponse
+	if err := json.Unmarshal(trimmed, &response); err != nil {
+		return appleAccountPrivateEmailPayload{}
+	}
+	return mergeAppleAccountPrivateEmailPayload(mergeAppleAccountPrivateEmailPayload(response.appleAccountPrivateEmailPayload, response.Result), response.Data)
+}
+
+func mergeAppleAccountPrivateEmailPayload(primary, nested appleAccountPrivateEmailPayload) appleAccountPrivateEmailPayload {
+	if strings.TrimSpace(primary.EmailAddress) == "" {
+		primary.EmailAddress = nested.EmailAddress
+	}
+	if strings.TrimSpace(primary.Email) == "" {
+		primary.Email = nested.Email
+	}
+	if strings.TrimSpace(primary.Label) == "" {
+		primary.Label = nested.Label
+	}
+	if strings.TrimSpace(primary.Note) == "" {
+		primary.Note = nested.Note
+	}
+	if strings.TrimSpace(primary.ID) == "" {
+		primary.ID = nested.ID
+	}
+	if strings.TrimSpace(primary.AnonymousID) == "" {
+		primary.AnonymousID = nested.AnonymousID
+	}
+	if strings.TrimSpace(primary.ForwardToEmail) == "" {
+		primary.ForwardToEmail = nested.ForwardToEmail
+	}
+	if primary.Active == nil {
+		primary.Active = nested.Active
+	}
+	if primary.IsActive == nil {
+		primary.IsActive = nested.IsActive
+	}
+	return primary
+}
+
+func appleAccountRemoteMailboxFromCreate(payload appleAccountPrivateEmailPayload, generatedEmail, label, note string) ICloudRemoteMailbox {
+	remote := ICloudRemoteMailbox{
+		AnonymousID:    appleAccountRemoteAnonymousID(payload.ID, payload.AnonymousID),
+		Email:          strings.ToLower(strings.TrimSpace(firstNonEmpty(payload.EmailAddress, payload.Email, generatedEmail))),
+		Label:          strings.TrimSpace(firstNonEmpty(payload.Label, label)),
+		Note:           strings.TrimSpace(firstNonEmpty(payload.Note, note, "created by Apple Account private email API")),
+		ForwardToEmail: strings.TrimSpace(payload.ForwardToEmail),
+		IsActive:       true,
+		Origin:         mailboxRemoteOriginAppleAccount,
+	}
+	if payload.Active != nil {
+		remote.IsActive = *payload.Active
+	} else if payload.IsActive != nil {
+		remote.IsActive = *payload.IsActive
+	}
+	return remote
+}
+
+func applyAppleAccountPrivateEmailPayload(remote *ICloudRemoteMailbox, payload appleAccountPrivateEmailPayload) {
+	if remote == nil {
+		return
+	}
+	if id := appleAccountRemoteAnonymousID(payload.ID, payload.AnonymousID); id != "" {
+		remote.AnonymousID = id
+	}
+	if email := strings.ToLower(strings.TrimSpace(firstNonEmpty(payload.EmailAddress, payload.Email))); email != "" {
+		remote.Email = email
+	}
+	if label := strings.TrimSpace(payload.Label); label != "" {
+		remote.Label = label
+	}
+	if note := strings.TrimSpace(payload.Note); note != "" {
+		remote.Note = note
+	}
+	if forward := strings.TrimSpace(payload.ForwardToEmail); forward != "" {
+		remote.ForwardToEmail = forward
+	}
+	if payload.Active != nil {
+		remote.IsActive = *payload.Active
+	} else if payload.IsActive != nil {
+		remote.IsActive = *payload.IsActive
+	}
+}
+
+func (c *ICloudClient) lookupAppleAccountCreatedMailbox(ctx context.Context, loginState *LoginState, generatedEmail string) (ICloudRemoteMailbox, bool) {
+	want := strings.ToLower(strings.TrimSpace(generatedEmail))
+	if loginState == nil || want == "" {
+		return ICloudRemoteMailbox{}, false
+	}
+	remotes, err := c.listAppleAccountPrivacyMailboxes(ctx, loginState)
+	if err != nil {
+		return ICloudRemoteMailbox{}, false
+	}
+	for _, remote := range remotes {
+		if strings.ToLower(strings.TrimSpace(remote.Email)) == want && strings.TrimSpace(remote.AnonymousID) != "" {
+			return remote, true
+		}
+	}
+	return ICloudRemoteMailbox{}, false
+}
+
+func (c *ICloudClient) confirmAppleAccountCreatedMailbox(ctx context.Context, loginState *LoginState, apiKey string, remote ICloudRemoteMailbox) ICloudRemoteMailbox {
+	anonymousID := strings.TrimSpace(remote.AnonymousID)
+	if loginState == nil || anonymousID == "" {
+		return remote
+	}
+	path := "/account/manage/email/private/" + url.PathEscape(anonymousID) + ".em"
+	raw, err := c.callAppleAccountRaw(ctx, loginState, apiKey, http.MethodGet, path, nil, nil)
+	if err != nil {
+		return remote
+	}
+	applyAppleAccountPrivateEmailPayload(&remote, parseAppleAccountPrivateEmailPayload(raw.Body))
+	return remote
 }
 
 func (c *ICloudClient) listAppleAccountPrivacyMailboxes(ctx context.Context, loginState *LoginState) ([]ICloudRemoteMailbox, error) {

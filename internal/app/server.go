@@ -1079,10 +1079,6 @@ func (s *Server) handleManageData(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(s.cfg.APIKey) != "" && !s.authorizedGlobalAPI(r) {
-		writeError(w, http.StatusUnauthorized, errCode("invalid_api_key", "API Key 错误", false))
-		return
-	}
 	session, ok := s.store.ICloudSession()
 	icloudActive := ok && sessionCanCreatePrivacyMailbox(session)
 	if !icloudActive {

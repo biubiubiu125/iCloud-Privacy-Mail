@@ -909,6 +909,8 @@ func TestAutoMailboxCreateDoesNotFallbackAfterAppleAccountTransportFailure(t *te
 				t.Fatal(err)
 			}
 			_ = conn.Close()
+		case "GET /account/manage/email/private":
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
 		default:
 			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
 		}
@@ -971,6 +973,175 @@ func TestAutoMailboxCreateDoesNotFallbackAfterAppleAccountTransportFailure(t *te
 	}
 	if remote.AnonymousID != "" || remote.Email != "" {
 		t.Fatalf("uncertain create returned a usable remote mailbox: %+v", remote)
+	}
+}
+
+func appleAccountReadyCreateSession() ICloudSession {
+	now := time.Now()
+	return ICloudSession{
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Host:            "appleid.apple.com",
+			Scnt:            "scnt",
+			APIKey:          "apple-api-key",
+			LastCheckedAt:   now,
+			LastCheckOK:     true,
+			ManageExpiresAt: now.Add(time.Hour),
+		}},
+	}
+}
+
+func TestAppleAccountCreateRecoversFromCompleteTransportFailureUsingMailboxList(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var completeAttempts atomic.Int32
+	var listAttempts atomic.Int32
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			_, _ = w.Write([]byte(`{"emailAddress":"recovered@icloud.com"}`))
+		case "PUT /account/manage/email/private/add/complete":
+			completeAttempts.Add(1)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+		case "GET /account/manage/email/private":
+			listAttempts.Add(1)
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"id":"recovered-id","emailAddress":"recovered@icloud.com","label":"LAB","isActive":true}
+					]
+				}
+			}`))
+		case "GET /account/manage/email/private/recovered-id.em":
+			_, _ = w.Write([]byte(`{"emailAddress":"recovered@icloud.com","id":"recovered-id","label":"LAB","isActive":true}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	remote, _, err := (&ICloudClient{client: appleServer.Client()}).CreatePrivacyMailboxWithAppleAccount(
+		context.Background(),
+		appleAccountReadyCreateSession(),
+		"",
+		"LAB",
+		"note",
+	)
+	if err != nil {
+		t.Fatalf("create after complete transport failure = %v, want recovered mailbox", err)
+	}
+	if completeAttempts.Load() == 0 {
+		t.Fatal("Apple Account completion request was not attempted")
+	}
+	if listAttempts.Load() == 0 {
+		t.Fatal("Apple Account mailbox list was not used to confirm the completed mailbox")
+	}
+	if remote.Email != "recovered@icloud.com" || remote.AnonymousID != "recovered-id" {
+		t.Fatalf("recovered mailbox = %+v, want recovered@icloud.com / recovered-id", remote)
+	}
+}
+
+func TestAppleAccountCreateParsesWrappedCompleteResult(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"emailAddress":"wrapped@icloud.com"}}`))
+		case "PUT /account/manage/email/private/add/complete":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"emailAddress":"wrapped@icloud.com","id":"wrapped-id","label":"LAB","note":"note","active":true}}`))
+		case "GET /account/manage/email/private/wrapped-id.em":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"emailAddress":"wrapped@icloud.com","id":"wrapped-id","forwardToEmail":"main@example.com","active":true}}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	remote, _, err := (&ICloudClient{client: appleServer.Client()}).CreatePrivacyMailboxWithAppleAccount(
+		context.Background(),
+		appleAccountReadyCreateSession(),
+		"",
+		"LAB",
+		"note",
+	)
+	if err != nil {
+		t.Fatalf("wrapped complete create = %v", err)
+	}
+	if remote.Email != "wrapped@icloud.com" || remote.AnonymousID != "wrapped-id" {
+		t.Fatalf("wrapped mailbox = %+v, want wrapped@icloud.com / wrapped-id", remote)
+	}
+	if remote.ForwardToEmail != "main@example.com" {
+		t.Fatalf("wrapped mailbox forward = %q, want main@example.com", remote.ForwardToEmail)
+	}
+}
+
+func TestAppleAccountCreateRetriesCompleteAfter401WithoutRegenerating(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var generateAttempts atomic.Int32
+	var completeAttempts atomic.Int32
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			generateAttempts.Add(1)
+			_, _ = w.Write([]byte(`{"emailAddress":"retry-complete@icloud.com"}`))
+		case "PUT /account/manage/email/private/add/complete":
+			if completeAttempts.Add(1) == 1 {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte("<html>unauthorized</html>"))
+				return
+			}
+			_, _ = w.Write([]byte(`{"emailAddress":"retry-complete@icloud.com","id":"retry-id","label":"LAB","note":"note","active":true}`))
+		case "GET /account/manage/gs/ws/token":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			_, _ = w.Write([]byte(`{"apiKey":"apple-api-key"}`))
+		case "GET /account/manage/email/private/retry-id.em":
+			_, _ = w.Write([]byte(`{"emailAddress":"retry-complete@icloud.com","id":"retry-id","active":true}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	remote, _, err := (&ICloudClient{client: appleServer.Client()}).CreatePrivacyMailboxWithAppleAccount(
+		context.Background(),
+		appleAccountReadyCreateSession(),
+		"",
+		"LAB",
+		"note",
+	)
+	if err != nil {
+		t.Fatalf("complete 401 retry create = %v", err)
+	}
+	if generateAttempts.Load() != 1 {
+		t.Fatalf("generate attempts = %d, want 1 so the first candidate is not discarded", generateAttempts.Load())
+	}
+	if completeAttempts.Load() != 2 {
+		t.Fatalf("complete attempts = %d, want 2 after a 401 rescue", completeAttempts.Load())
+	}
+	if remote.Email != "retry-complete@icloud.com" || remote.AnonymousID != "retry-id" {
+		t.Fatalf("retried mailbox = %+v, want retry-complete@icloud.com / retry-id", remote)
 	}
 }
 
@@ -4872,6 +5043,28 @@ func TestHealthReportsProviderUnavailableWithoutFailingService(t *testing.T) {
 	}
 }
 
+func TestHealthAllowsUnauthenticatedLivenessWhenAPIKeyConfigured(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{APIKey: "global-api-key"}, store, discardLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unauthenticated health status = %d body=%s, want 200 for container liveness", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Success   bool `json:"success"`
+		APIActive bool `json:"api_active"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Success || !body.APIActive {
+		t.Fatalf("unauthenticated health body = %s, want success with configured API key", rr.Body.String())
+	}
+}
+
 func TestICloudClientListPrivacyMailboxesAcceptsNestedWebCookies(t *testing.T) {
 	var gotCookie string
 	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6692,12 +6885,12 @@ func TestAppleAccountIncompleteListPersistsRefreshedManageStateWhenWebSucceeds(t
 		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
 		LoginStates: []LoginState{
 			{
-				Kind:            LoginStateAppleAccount,
-				Scnt:            "stale-scnt",
-				APIKey:          "api-key",
-				LastCheckedAt:   now,
-				ManageExpiresAt: now.Add(time.Hour),
-				LastCheckOK:     false,
+				Kind:               LoginStateAppleAccount,
+				Scnt:               "stale-scnt",
+				APIKey:             "api-key",
+				LastCheckedAt:      now,
+				ManageExpiresAt:    now.Add(time.Hour),
+				LastCheckOK:        false,
 				KeepAliveFailCount: 2,
 			},
 			{

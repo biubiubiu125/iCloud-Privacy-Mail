@@ -73,7 +73,7 @@ Copy-Item .\config.example.json .\config.json
 | `host` | 监听地址，本地默认 `127.0.0.1`；服务器建议仍监听 `127.0.0.1`，由 Nginx/Caddy 反代 |
 | `port` | 监听端口，默认 `8787` |
 | `data_path` | 服务器状态文件，默认 `data/state.json` |
-| `api_key` | 全局 API Key，用于健康检查、自动取号、批量查询和按邮箱取码的请求头；管理面板不使用它登录 |
+| `api_key` | 全局 API Key，用于自动取号、批量查询和按邮箱取码的请求头；健康检查不需要它。管理面板不使用它登录 |
 | `public_base_url` | 对外复制 API 地址用的公网地址，例如 `https://www.example.com` |
 | `icloud_default_host` | iCloud 登录态校验 Host，默认 `www.icloud.com.cn` |
 | `icloud_client_id` | iCloud Web 公共 Client ID，通常不用修改 |
@@ -362,11 +362,10 @@ Content-Type: application/json
 
 ```http
 GET /api/v1/health
-Authorization: Bearer <api_key>
 ```
 
-`success` 表示服务端 API 可访问；`icloud_active` 表示当前是否存在可用于隐私邮箱操作的登录态。服务可访问但 iCloud
-登录态不可用时，接口仍返回 HTTP 200 和 `success:true`，调用方应同时检查 `icloud_active`。
+配置了全局 `api_key` 时也可以带 `Authorization: Bearer <api_key>`，但不要求。`success` 表示进程可访问；`icloud_active` 表示当前是否存在可用于隐私邮箱操作的登录态。服务可访问但 iCloud
+登录态不可用时，接口仍返回 HTTP 200 和 `success:true`，调用方应同时检查 `icloud_active`。Docker 健康检查应探活此接口，不要因为没带 API Key 把存活的容器判成 `unhealthy`。
 
 ## 数据保存与导出
 
