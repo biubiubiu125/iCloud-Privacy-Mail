@@ -9332,6 +9332,8 @@ func TestCreateAppleAccountMailboxCleansRemoteWhenRefreshedStatePersistenceFails
 		paths = append(paths, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hmeEmails":[]}}`))
 		case "POST /account/manage/email/private/add":
 			_, _ = w.Write([]byte(`{"emailAddress":"generated-session-persist@icloud.com"}`))
 		case "PUT /account/manage/email/private/add/complete":
@@ -9368,6 +9370,7 @@ func TestCreateAppleAccountMailboxCleansRemoteWhenRefreshedStatePersistenceFails
 		t.Fatalf("local mailboxes after session persistence failure = %+v, want none", store.Snapshot().Mailboxes)
 	}
 	if strings.Join(paths, "\n") != strings.Join([]string{
+		"GET /account/manage/email/private",
 		"POST /account/manage/email/private/add",
 		"PUT /account/manage/email/private/add/complete",
 		"GET /account/manage/email/private/remote-session-persist.em",
@@ -10315,8 +10318,8 @@ func TestSyncICloudMailboxesReportsPartialProviderSourceFailure(t *testing.T) {
 		t.Fatalf("authoritative-web sync status = %d body=%s, want 200", rr.Code, rr.Body.String())
 	}
 	var response struct {
-		Success bool `json:"success"`
-		Partial bool `json:"partial"`
+		Success bool   `json:"success"`
+		Partial bool   `json:"partial"`
 		Code    string `json:"code"`
 		Failed  int    `json:"failed"`
 		Results []struct {

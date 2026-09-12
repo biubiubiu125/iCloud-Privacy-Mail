@@ -1258,14 +1258,14 @@
         <section class="view-section panel" data-view="create">
           <div class="panel-head">
             <h2>创建隐私邮箱</h2>
-            <p>优先用 Apple Account 新接口创建，达到上限后回落 iCloud 旧接口。</p>
+            <p>优先用 Apple Account 新接口创建，达到上限后回落 iCloud 旧接口。待核对时会先自动同步远端列表。</p>
           </div>
           <div class="field-grid">
             <label>标签<input id="protoLabel" placeholder="UPI-70-13"></label>
             <label>备注<input id="protoNote" placeholder="选填"></label>
             <label>普通创建接口
               <select id="createChannelSelect">
-                <option value="auto">自动接口：新接口优先，失败用旧接口</option>
+                <option value="auto">自动接口：新接口优先，待核对先自动同步，失败用旧接口</option>
                 <option value="apple_account">只用新接口</option>
                 <option value="icloud_web">只用旧接口</option>
               </select>
@@ -1292,7 +1292,7 @@
             <label>每轮创建间隔秒<input id="scheduleRoundIntervalSeconds" type="number" min="1" max="600" value="5" placeholder="默认 5"></label>
             <label>定时创建接口
               <select id="scheduleCreateChannelSelect">
-                <option value="auto">自动接口：新接口优先，失败用旧接口</option>
+                <option value="auto">自动接口：新接口优先，待核对先自动同步，失败用旧接口</option>
                 <option value="apple_account">只用新接口</option>
                 <option value="icloud_web">只用旧接口</option>
               </select>

@@ -168,6 +168,14 @@ func TestAccountMailboxCreateReconciliationStatePersistsAndClears(t *testing.T) 
 }
 
 func TestMailboxCreateBlocksAccountWithUncertainRemoteResult(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
 	store := newTestStore(t)
 	ownerID := "owner-reconciliation-gate"
 	account, err := store.AddAccountForOwner(ownerID, "Reconciliation gate", "reconciliation-gate@example.com", "")
@@ -217,6 +225,352 @@ func TestMailboxCreateBlocksAccountWithUncertainRemoteResult(t *testing.T) {
 	}
 	if len(failures) != 1 || failures[0].Code != "mailbox_create_reconciliation_required" {
 		t.Fatalf("failures = %+v, want reconciliation gate failure", failures)
+	}
+}
+
+func TestMailboxCreateAutoSyncsReconciliationAndCreatesViaWebWhenAppleListUnauthorized(t *testing.T) {
+	fixture := startAppleUnauthorizedWebCreateServers(t)
+	defer fixture.cleanup()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-auto-sync-create"
+	account, err := store.AddAccountForOwner(ownerID, "Auto sync create", "auto-sync-create@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, fixture.session(ownerID, account.ID, account.AppleID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"Apple Account 已提交隐私邮箱确认请求，但未收到可确认的结果",
+		time.Now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	mailboxes, _, failures, err := handler.createMailboxesForOwnerWithChannels(
+		context.Background(),
+		ownerID,
+		[]mailboxCreateRequest{{AccountID: account.ID, Channel: mailboxCreateChannelAuto}},
+		"AUTO",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("auto create after locked reconciliation = %#v", err)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("auto create failures = %+v, want none", failures)
+	}
+	if len(mailboxes) != 1 || mailboxes[0].Email != "auto-created@icloud.com" {
+		t.Fatalf("created mailboxes = %+v, want auto-created@icloud.com", mailboxes)
+	}
+	if fixture.addCalls.Load() != 0 {
+		t.Fatalf("Apple Account generate calls = %d, want 0 after list 401", fixture.addCalls.Load())
+	}
+	if fixture.listCalls.Load() == 0 {
+		t.Fatal("Apple Account list was not probed before auto create")
+	}
+	if fixture.webGenCalls.Load() == 0 {
+		t.Fatal("iCloud Web create was not used after automatic reconciliation")
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after auto create")
+	}
+	if account.MailboxCreateReconciliationRequired {
+		t.Fatal("reconciliation lock was not cleared before automatic create")
+	}
+}
+
+func TestAutoMailboxCreateFallsBackToWebWhenAppleListUnauthorizedBeforeGenerate(t *testing.T) {
+	fixture := startAppleUnauthorizedWebCreateServers(t)
+	defer fixture.cleanup()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-auto-list-401"
+	account, err := store.AddAccountForOwner(ownerID, "Auto list 401", "auto-list-401@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fixture.session(ownerID, account.ID, account.AppleID)
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	mailbox, remote, err := handler.createICloudMailboxForOwner(context.Background(), ownerID, account.ID, "AUTO", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixture.addCalls.Load() != 0 {
+		t.Fatalf("Apple Account generate calls = %d, want 0 when list is unauthorized", fixture.addCalls.Load())
+	}
+	if fixture.listCalls.Load() == 0 {
+		t.Fatal("Apple Account list was not probed before auto create")
+	}
+	if remote.Email != "auto-created@icloud.com" || remote.AnonymousID != "web-auto-1" || remote.Origin != mailboxRemoteOriginICloudWeb {
+		t.Fatalf("fallback remote = %+v, want iCloud Web mailbox", remote)
+	}
+	if mailbox.Email != "auto-created@icloud.com" {
+		t.Fatalf("fallback mailbox = %+v, want locally saved iCloud Web mailbox", mailbox)
+	}
+}
+
+func TestMailboxCreateStillBlocksWhenAutomaticSyncCannotConfirm(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var listCalls, generateCalls atomic.Int32
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/hme/list":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "/v1/hme/generate", "/v1/hme/reserve":
+			generateCalls.Add(1)
+			t.Fatalf("iCloud Web create was called while reconciliation was still blocked: %s", r.URL.Path)
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-auto-sync-still-blocked"
+	account, err := store.AddAccountForOwner(ownerID, "Auto sync still blocked", "auto-sync-still-blocked@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "auto-sync-still-blocked-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				LastCheckOK:     true,
+				ManageExpiresAt: now.Add(time.Hour),
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"Apple Account 创建结果不确定",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, failures, err := handler.createMailboxesForOwnerWithChannels(
+		context.Background(),
+		ownerID,
+		[]mailboxCreateRequest{{AccountID: account.ID, Channel: mailboxCreateChannelAuto}},
+		"BLOCK",
+		"",
+	)
+	if !isCodedError(err, "mailbox_create_reconciliation_required") {
+		t.Fatalf("create error = %#v, want mailbox_create_reconciliation_required", err)
+	}
+	if listCalls.Load() == 0 {
+		t.Fatal("automatic sync did not attempt Apple Account list")
+	}
+	if generateCalls.Load() != 0 {
+		t.Fatalf("create provider calls = %d, want 0 while lock remains", generateCalls.Load())
+	}
+	if len(failures) != 1 || failures[0].Code != "mailbox_create_reconciliation_required" {
+		t.Fatalf("failures = %+v, want reconciliation gate failure", failures)
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok || !account.MailboxCreateReconciliationRequired {
+		t.Fatalf("account reconciliation state = %+v, want lock retained", account)
+	}
+}
+
+func TestMailboxSchedulerAutoSyncsReconciliationThenCreatesViaWeb(t *testing.T) {
+	fixture := startAppleUnauthorizedWebCreateServers(t)
+	defer fixture.cleanup()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-scheduler-auto-sync"
+	account, err := store.AddAccountForOwner(ownerID, "Scheduler auto sync", "scheduler-auto-sync@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, fixture.session(ownerID, account.ID, account.AppleID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"Apple Account 已提交隐私邮箱确认请求，但未收到可确认的结果",
+		time.Now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
+	handler.runMailboxSchedulerBatch(context.Background(), ownerID, job, mailboxSchedulerConfig{
+		AccountIDs:    []string{account.ID},
+		Label:         "SCH",
+		BatchSize:     1,
+		RoundInterval: 0,
+	}, 1)
+	state, events := job.snapshot()
+	if state.Success < 1 {
+		t.Fatalf("scheduler state = %+v events=%+v, want at least one success", state, events)
+	}
+	if fixture.addCalls.Load() != 0 {
+		t.Fatalf("Apple Account generate calls = %d, want 0", fixture.addCalls.Load())
+	}
+	var sawWebCreate bool
+	for _, event := range events {
+		if event.Type == "created" && strings.Contains(event.Message, "旧接口") && strings.Contains(event.Message, "auto-created@icloud.com") {
+			sawWebCreate = true
+			break
+		}
+	}
+	if !sawWebCreate {
+		t.Fatalf("scheduler events = %+v, want a successful iCloud Web create after automatic sync", events)
+	}
+}
+
+type appleUnauthorizedWebCreateFixture struct {
+	appleURL    string
+	webURL      string
+	listCalls   *atomic.Int32
+	addCalls    *atomic.Int32
+	webGenCalls *atomic.Int32
+	cleanup     func()
+}
+
+func startAppleUnauthorizedWebCreateServers(t *testing.T) appleUnauthorizedWebCreateFixture {
+	t.Helper()
+	oldBaseURL := appleAccountManageBaseURL
+	listCalls := &atomic.Int32{}
+	addCalls := &atomic.Int32{}
+	webGenCalls := &atomic.Int32{}
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/account/manage/email/private"):
+			listCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case r.Method == http.MethodGet && r.URL.Path == "/account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/account/manage/email/private/add":
+			addCalls.Add(1)
+			t.Fatal("Apple Account generate should not run after list unauthorized")
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	appleAccountManageBaseURL = appleServer.URL
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/hme/list":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hmeEmails":[{"anonymousId":"existing-1","hme":"existing@icloud.com","label":"EXISTING","isActive":true}]}}`))
+		case "/v1/hme/generate":
+			webGenCalls.Add(1)
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"auto-created@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":{"anonymousId":"web-auto-1","hme":"auto-created@icloud.com","label":"AUTO","isActive":true}}}`))
+		case "/v1/hme/deactivate", "/v1/hme/delete":
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	return appleUnauthorizedWebCreateFixture{
+		appleURL:    appleServer.URL,
+		webURL:      webServer.URL,
+		listCalls:   listCalls,
+		addCalls:    addCalls,
+		webGenCalls: webGenCalls,
+		cleanup: func() {
+			webServer.Close()
+			appleServer.Close()
+			appleAccountManageBaseURL = oldBaseURL
+		},
+	}
+}
+
+func (f appleUnauthorizedWebCreateFixture) session(ownerID, accountID, appleID string) ICloudSession {
+	now := time.Now()
+	return ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          accountID,
+		AppleID:            appleID,
+		DSID:               ownerID + "-dsid",
+		PremiumMailBaseURL: f.webURL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				LastCheckOK:     true,
+				ManageExpiresAt: now.Add(time.Hour),
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
 	}
 }
 
@@ -911,6 +1265,15 @@ func TestAutoMailboxCreateDoesNotFallbackAfterAppleAccountTransportFailure(t *te
 			_ = conn.Close()
 		case "GET /account/manage/email/private":
 			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
 		default:
 			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
 		}
@@ -7220,6 +7583,8 @@ func TestAutoMailboxCreateFallsBackWhenAppleAccountAuthFailedBeforeGenerate(t *t
 	var addCalls, webCalls atomic.Int32
 	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "POST /account/manage/email/private/add":
 			addCalls.Add(1)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -7291,8 +7656,8 @@ func TestAutoMailboxCreateFallsBackWhenAppleAccountAuthFailedBeforeGenerate(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if addCalls.Load() == 0 {
-		t.Fatal("Apple Account generate was not attempted before fallback")
+	if addCalls.Load() != 0 {
+		t.Fatalf("Apple Account generate calls = %d, want 0 when list unauthorized", addCalls.Load())
 	}
 	if webCalls.Load() == 0 {
 		t.Fatal("iCloud Web fallback was not used after Apple Account auth failure")
@@ -7311,6 +7676,8 @@ func TestAutoMailboxCreateLockOriginUsesWebAfterFallbackUncertain(t *testing.T) 
 
 	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "POST /account/manage/email/private/add":
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "GET /account/manage/gs/ws/token":
@@ -7403,6 +7770,8 @@ func TestMailboxSchedulerAutoFallbackUncertainUsesReconciliationEvent(t *testing
 
 	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "POST /account/manage/email/private/add":
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "GET /account/manage/gs/ws/token":
@@ -7515,9 +7884,11 @@ func TestMailboxSchedulerAutoFallsBackInSameRequestWhenAppleAuthFailsBeforeGener
 	oldBaseURL := appleAccountManageBaseURL
 	defer func() { appleAccountManageBaseURL = oldBaseURL }()
 
-	var addCalls, webGenerateCalls, addCallsBeforeWeb atomic.Int32
+	var addCalls, webGenerateCalls atomic.Int32
 	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		case "POST /account/manage/email/private/add":
 			addCalls.Add(1)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -7539,9 +7910,6 @@ func TestMailboxSchedulerAutoFallsBackInSameRequestWhenAppleAuthFailsBeforeGener
 		switch r.URL.Path {
 		case "/v1/hme/generate":
 			n := webGenerateCalls.Add(1)
-			if n == 1 {
-				addCallsBeforeWeb.Store(addCalls.Load())
-			}
 			if n > 1 {
 				http.Error(w, "too many generate calls", http.StatusTooManyRequests)
 				return
@@ -7602,14 +7970,11 @@ func TestMailboxSchedulerAutoFallsBackInSameRequestWhenAppleAuthFailsBeforeGener
 	}
 	handler.runMailboxSchedulerBatch(context.Background(), ownerID, job, cfg, 1)
 	state, events := job.snapshot()
-	if addCalls.Load() == 0 {
-		t.Fatal("scheduler auto create did not attempt Apple Account generate before fallback")
+	if addCalls.Load() != 0 {
+		t.Fatalf("Apple Account generate calls = %d, want 0 when list unauthorized", addCalls.Load())
 	}
 	if webGenerateCalls.Load() == 0 {
 		t.Fatal("scheduler auto create did not fall back to iCloud Web in the same request")
-	}
-	if addCallsBeforeWeb.Load() != 2 {
-		t.Fatalf("Apple Account generate calls before first iCloud Web fallback = %d, want 2 (one 401 plus one in-request retry), not a later scheduler round", addCallsBeforeWeb.Load())
 	}
 	var firstCreateEvent string
 	for i := len(events) - 1; i >= 0; i-- {
@@ -9025,6 +9390,15 @@ func TestIMAPSaveWithoutAccountIDRejectsAppleIDOwnedByOtherOwner(t *testing.T) {
 }
 
 func TestCreateICloudMailboxRechecksReconciliationAfterAccountLock(t *testing.T) {
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+	}))
+	defer webServer.Close()
+
 	store := newTestStore(t)
 	handler := NewServer(Config{}, store, discardLogger()).(*Server)
 	ownerID := "owner-create-lock-recheck"
@@ -9037,7 +9411,7 @@ func TestCreateICloudMailboxRechecksReconciliationAfterAccountLock(t *testing.T)
 		AccountID:          account.ID,
 		AppleID:            account.AppleID,
 		DSID:               "lock-recheck-dsid",
-		PremiumMailBaseURL: "http://127.0.0.1:1",
+		PremiumMailBaseURL: webServer.URL,
 		IsICloudPlus:       true,
 		CanCreateHME:       true,
 		Cookies:            []SessionCookie{{Name: "session", Value: "cookie"}},

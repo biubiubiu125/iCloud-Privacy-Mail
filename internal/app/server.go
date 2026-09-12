@@ -3402,6 +3402,10 @@ func appleAccountListClientAndContext(ctx context.Context, source string) (*IClo
 }
 
 func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Request, ownerID string, session ICloudSession) (syncICloudMailboxResult, []publicMailbox, error) {
+	return s.syncICloudMailboxesForSessionMaybeLocked(ctx, r, ownerID, session, false)
+}
+
+func (s *Server) syncICloudMailboxesForSessionMaybeLocked(ctx context.Context, r *http.Request, ownerID string, session ICloudSession, holdingAccountLock bool) (syncICloudMailboxResult, []publicMailbox, error) {
 	ownerID = s.dataOwnerIDForSession(ownerID, session)
 	result := syncICloudMailboxResult{
 		AccountID: session.AccountID,
@@ -3414,12 +3418,14 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 		return result, nil, err
 	}
 	accountOperationKey := mailboxAccountOperationKey(ownerID, session.AccountID)
-	releaseAccountOperation, err := s.acquireMailboxAccountOperationSlot(ctx, accountOperationKey)
-	if err != nil {
-		result.Error = publicErrorMessage(err)
-		return result, nil, err
+	if !holdingAccountLock {
+		releaseAccountOperation, err := s.acquireMailboxAccountOperationSlot(ctx, accountOperationKey)
+		if err != nil {
+			result.Error = publicErrorMessage(err)
+			return result, nil, err
+		}
+		defer releaseAccountOperation()
 	}
-	defer releaseAccountOperation()
 	if err := s.ensureOwnerNotDeleting(ownerID); err != nil {
 		result.Error = publicErrorMessage(err)
 		return result, nil, err
@@ -6715,6 +6721,32 @@ func mailboxBatchThreadLimit(mailboxes []Mailbox) int {
 	return limit
 }
 
+func (s *Server) autoReconcileMailboxCreateIfNeeded(ctx context.Context, ownerID, accountID string, session ICloudSession, holdingAccountLock bool) error {
+	message, blocked := s.store.AccountMailboxCreateReconciliationForOwner(ownerID, accountID)
+	if !blocked {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	if err != nil {
+		return errCode("mailbox_create_reconciliation_required", message+"；自动同步失败："+err.Error()+"；请先同步 iCloud 远端邮箱列表确认后再重试", true)
+	}
+	_, _, syncErr := s.syncICloudMailboxesForSessionMaybeLocked(ctx, req, ownerID, session, holdingAccountLock)
+	if _, stillBlocked := s.store.AccountMailboxCreateReconciliationForOwner(ownerID, accountID); stillBlocked {
+		detail := strings.TrimSpace(message)
+		if detail == "" {
+			detail = "账号创建结果待核对"
+		}
+		if syncErr != nil {
+			detail += "；自动同步失败：" + publicErrorMessage(syncErr)
+		}
+		return errCode("mailbox_create_reconciliation_required", detail+"；请先同步 iCloud 远端邮箱列表确认后再重试", true)
+	}
+	if s.logger != nil {
+		s.logger.Info("mailbox create reconciliation cleared by automatic sync", "account_id", accountID, "owner", ownerID)
+	}
+	return nil
+}
+
 func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
 	if err := s.ensureOwnerNotDeleting(ownerID); err != nil {
 		return Mailbox{}, ICloudRemoteMailbox{}, err
@@ -6743,8 +6775,8 @@ func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accou
 	if err := s.ensureOwnerNotDeleting(ownerID); err != nil {
 		return Mailbox{}, ICloudRemoteMailbox{}, err
 	}
-	if message, blocked := s.store.AccountMailboxCreateReconciliationForOwner(ownerID, accountID); blocked {
-		return Mailbox{}, ICloudRemoteMailbox{}, errCode("mailbox_create_reconciliation_required", message+"；请先同步 iCloud 远端邮箱列表确认后再重试", true)
+	if err := s.autoReconcileMailboxCreateIfNeeded(ctx, ownerID, accountID, session, true); err != nil {
+		return Mailbox{}, ICloudRemoteMailbox{}, err
 	}
 	createChannel := mailboxCreateChannelFromContext(ctx)
 	remote, err := s.createICloudMailboxRemoteWithChannel(ctx, ownerID, session, label, note, createChannel)
@@ -6984,10 +7016,10 @@ func (s *Server) createMailboxesForOwnerWithChannels(ctx context.Context, ownerI
 			channel := channels[strings.TrimSpace(effectiveAccountID)]
 			createCtx := contextWithMailboxCreateChannel(ctx, channel)
 			effectiveOwnerID := s.dataOwnerIDForSession(ownerID, session)
-			if message, blocked := s.store.AccountMailboxCreateReconciliationForOwner(effectiveOwnerID, effectiveAccountID); blocked {
+			if err := s.autoReconcileMailboxCreateIfNeeded(createCtx, effectiveOwnerID, effectiveAccountID, session, false); err != nil {
 				results[index] = createResult{
 					session:   session,
-					err:       errCode("mailbox_create_reconciliation_required", message+"；请先同步 iCloud 远端邮箱列表确认后再重试", true),
+					err:       err,
 					accountID: effectiveAccountID,
 					channel:   channel,
 				}
@@ -7063,21 +7095,51 @@ func (s *Server) createICloudMailboxRemoteWithChannel(ctx context.Context, owner
 	}
 
 	if _, ok := appleAccountLoginState(session); ok {
-		remote, err := s.createICloudMailboxRemoteAppleAccount(ctx, ownerID, session, label, note, key)
-		if err == nil {
-			return remote, nil
-		}
-		if strings.TrimSpace(remote.AnonymousID) != "" {
-			return remote, err
-		}
-		if !appleAccountCreateMayFallback(err) {
-			return ICloudRemoteMailbox{}, err
-		}
-		if s.logger != nil {
-			s.logger.Warn("Apple Account mailbox create failed before a remote mailbox was reserved; falling back to iCloud HME", "account_id", session.AccountID, "err", providerErrorForLog(err))
+		session, skipApple, probeErr := s.appleAccountAutoCreateShouldFallback(ctx, ownerID, session)
+		if skipApple {
+			if s.logger != nil {
+				s.logger.Warn("Apple Account mailbox create skipped after list probe; falling back to iCloud HME", "account_id", session.AccountID, "err", providerErrorForLog(probeErr))
+			}
+		} else {
+			remote, err := s.createICloudMailboxRemoteAppleAccount(ctx, ownerID, session, label, note, key)
+			if err == nil {
+				return remote, nil
+			}
+			if strings.TrimSpace(remote.AnonymousID) != "" {
+				return remote, err
+			}
+			if !appleAccountCreateMayFallback(err) {
+				return ICloudRemoteMailbox{}, err
+			}
+			if s.logger != nil {
+				s.logger.Warn("Apple Account mailbox create failed before a remote mailbox was reserved; falling back to iCloud HME", "account_id", session.AccountID, "err", providerErrorForLog(err))
+			}
 		}
 	}
 	return s.createICloudMailboxRemoteICloudWeb(ctx, session, label, note, key)
+}
+
+func (s *Server) appleAccountAutoCreateShouldFallback(ctx context.Context, ownerID string, session ICloudSession) (ICloudSession, bool, error) {
+	if _, ok := appleAccountLoginState(session); !ok {
+		return session, false, nil
+	}
+	client, listCtx, cancelList := appleAccountListClientAndContext(ctx, string(mailboxCreateChannelAppleAccount))
+	_, updatedSession, listErr := client.ListPrivacyMailboxesForOriginWithSessionAndAPIKey(
+		listCtx,
+		session,
+		string(mailboxCreateChannelAppleAccount),
+		s.cfg.AppleAccountAPIKey,
+	)
+	cancelList()
+	if _, ok := appleAccountLoginState(updatedSession); ok {
+		if saveErr := s.store.SaveICloudSessionForOwner(s.dataOwnerIDForSession(ownerID, session), updatedSession); saveErr != nil && s.logger != nil {
+			s.logger.Warn("failed to save updated Apple Account login state after create list probe", "account_id", session.AccountID, "err", saveErr)
+		}
+	}
+	if listErr != nil && appleAccountCreateMayFallback(listErr) {
+		return updatedSession, true, listErr
+	}
+	return updatedSession, false, listErr
 }
 
 func appleAccountCreateMayFallback(err error) bool {
