@@ -189,6 +189,16 @@ func appleAccountManageNeedsCreateRefresh(loginState LoginState, now time.Time) 
 	return !appleAccountManageRecentStateUsable(loginState, now)
 }
 
+func appleAccountManageNeedsListRefresh(loginState LoginState, now time.Time) bool {
+	if strings.TrimSpace(loginState.APIKey) == "" {
+		return true
+	}
+	if loginState.ManageExpiresAt.IsZero() {
+		return false
+	}
+	return !now.Before(loginState.ManageExpiresAt.Add(-appleAccountManageRefreshSkew))
+}
+
 func appleAccountManageRecentStateUsable(loginState LoginState, now time.Time) bool {
 	if strings.TrimSpace(loginState.Scnt) == "" {
 		return false
@@ -262,6 +272,12 @@ func appleAccountKeepAliveShouldRescue(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "http 401") || strings.Contains(msg, "http 403")
+}
+
+func appleAccountListShouldRescue(err error) bool {
+	return appleAccountKeepAliveShouldRescue(err) ||
+		isCodedError(err, "apple_account_api_key_missing") ||
+		isCodedError(err, "apple_account_mailbox_list_incomplete")
 }
 
 func appleAccountKeepAliveTransientError(err error) bool {
@@ -920,8 +936,7 @@ func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx con
 		defer release()
 		fallbackAPIKey = strings.TrimSpace(fallbackAPIKey)
 		state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
-		remotes, err := c.listAppleAccountPrivacyMailboxes(ctx, &state)
-		if err != nil && (appleAccountKeepAliveShouldRescue(err) || isCodedError(err, "apple_account_api_key_missing")) {
+		if appleAccountManageNeedsListRefresh(state, time.Now()) {
 			refreshedState, refreshedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, session, state, fallbackAPIKey)
 			if refreshErr != nil {
 				return nil, refreshedSession, refreshErr
@@ -929,6 +944,22 @@ func (c *ICloudClient) ListPrivacyMailboxesForOriginWithSessionAndAPIKey(ctx con
 			session = refreshedSession
 			state = refreshedState
 			state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
+		}
+		remotes, err := c.listAppleAccountPrivacyMailboxes(ctx, &state)
+		if err != nil && appleAccountListShouldRescue(err) {
+			incompleteList := isCodedError(err, "apple_account_mailbox_list_incomplete")
+			refreshedState, refreshedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, session, state, fallbackAPIKey)
+			if refreshErr != nil && !incompleteList {
+				return nil, refreshedSession, refreshErr
+			}
+			if refreshErr == nil {
+				session = refreshedSession
+				state = refreshedState
+				state.APIKey = firstNonEmpty(strings.TrimSpace(state.APIKey), fallbackAPIKey)
+			}
+			if incompleteList {
+				_ = c.warmAppleAccountPortal(ctx, &state)
+			}
 			remotes, err = c.listAppleAccountPrivacyMailboxes(ctx, &state)
 		}
 		if err != nil {

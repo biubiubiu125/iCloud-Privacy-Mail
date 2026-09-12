@@ -1,11 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -6243,6 +6245,1484 @@ func TestICloudWebMailboxSyncClearsICloudWebReconciliationState(t *testing.T) {
 	}
 	if account.MailboxCreateReconciliationRequired {
 		t.Fatalf("account reconciliation state = %+v, want cleared after iCloud Web sync", account)
+	}
+}
+
+func TestICloudWebMailboxSyncClearsAppleAccountReconciliationState(t *testing.T) {
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"web-unlock-1","hme":"web-unlock@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer remoteServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-web-clears-apple-lock"
+	account, err := store.AddAccountForOwner(ownerID, "Web clears Apple lock", "web-clears-apple-lock@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "web-clears-apple-lock-dsid",
+		PremiumMailBaseURL: remoteServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "cookie"}},
+		LoginStates: []LoginState{{
+			Kind:    LoginStateICloudWeb,
+			Cookies: []SessionCookie{{Name: "session", Value: "cookie"}},
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"新接口创建结果不确定",
+		time.Now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	); err != nil {
+		t.Fatal(err)
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after iCloud Web sync")
+	}
+	if account.MailboxCreateReconciliationRequired {
+		t.Fatalf("account reconciliation state = %+v, want cleared after complete iCloud Web list", account)
+	}
+}
+
+func TestAppleAccountIncompleteListDoesNotMarkMissingWhenICloudWebSucceeds(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"web-keep-1","hme":"web-keep@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-apple-incomplete-web-ok"
+	account, err := store.AddAccountForOwner(ownerID, "Apple incomplete web ok", "apple-incomplete-web-ok@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appleMailbox, err := store.AddMailboxForOwnerWithRemote(ownerID, account.ID, ICloudRemoteMailbox{
+		AnonymousID: "keep-apple",
+		Origin:      mailboxRemoteOriginAppleAccount,
+		Email:       "keep-apple@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "apple-incomplete-web-ok-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"新接口创建结果不确定",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, err := handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Error != "" {
+		t.Fatalf("sync error = %q, want empty when iCloud Web list succeeded", result.Error)
+	}
+	if result.Warning == "" {
+		t.Fatal("expected warning when Apple Account list stayed incomplete")
+	}
+	if result.RemoteMissing != 0 {
+		t.Fatalf("remote missing = %d, want 0 when Apple Account list was incomplete", result.RemoteMissing)
+	}
+	current, ok := store.FindMailboxByID(appleMailbox.ID)
+	if !ok {
+		t.Fatal("Apple Account mailbox disappeared after incomplete Apple list")
+	}
+	if !current.RemoteMissingAt.IsZero() || current.Status == StatusDisabled {
+		t.Fatalf("Apple Account mailbox marked missing from incomplete list: %+v", current)
+	}
+	account, ok = store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after mixed-source sync")
+	}
+	if account.MailboxCreateReconciliationRequired {
+		t.Fatalf("account reconciliation state = %+v, want cleared after complete iCloud Web list", account)
+	}
+}
+
+func TestAppleAccountMailboxListWarmsAndRetriesMissingHMEEmails(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var listCalls, privacyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if listCalls.Load() == 1 {
+				_, _ = w.Write([]byte(`{"success":true,"result":{"forwardToEmails":[]}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"id":"warmed-1","emailAddress":"warmed-list@icloud.com","isActive":true}
+					]
+				}
+			}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "token-scnt")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "manage-scnt")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			privacyCalls.Add(1)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	appleAccountManageBaseURL = server.URL
+
+	now := time.Now()
+	remotes, _, err := (&ICloudClient{client: server.Client()}).ListPrivacyMailboxesForOriginWithSession(
+		context.Background(),
+		ICloudSession{LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Scnt:            "scnt",
+			APIKey:          "api-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(time.Hour),
+			LastCheckOK:     true,
+		}}},
+		mailboxRemoteOriginAppleAccount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listCalls.Load() != 2 {
+		t.Fatalf("Apple Account list calls = %d, want 2 after missing hmeEmails retry", listCalls.Load())
+	}
+	if privacyCalls.Load() == 0 {
+		t.Fatal("privacy page was not warmed before retrying the incomplete Apple Account list")
+	}
+	if len(remotes) != 1 || remotes[0].Email != "warmed-list@icloud.com" {
+		t.Fatalf("remotes = %+v, want warmed Apple Account mailbox", remotes)
+	}
+}
+
+func TestAppleAccountIncompleteListRetriesAfterManageRefreshFailure(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var listCalls, privacyCalls, tokenCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if listCalls.Load() == 1 {
+				_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"id":"refresh-fail-1","emailAddress":"refresh-fail-retry@icloud.com","isActive":true}
+					]
+				}
+			}`))
+		case "GET /account/manage/gs/ws/token":
+			tokenCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/section/privacy":
+			privacyCalls.Add(1)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	appleAccountManageBaseURL = server.URL
+
+	now := time.Now()
+	remotes, _, err := (&ICloudClient{client: server.Client()}).ListPrivacyMailboxesForOriginWithSession(
+		context.Background(),
+		ICloudSession{LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Scnt:            "scnt",
+			APIKey:          "api-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(time.Hour),
+			LastCheckOK:     true,
+		}}},
+		mailboxRemoteOriginAppleAccount,
+	)
+	if err != nil {
+		t.Fatalf("incomplete list after refresh failure err = %#v, want warmed retry to succeed", err)
+	}
+	if tokenCalls.Load() == 0 {
+		t.Fatal("manage token refresh was not attempted after missing hmeEmails")
+	}
+	if listCalls.Load() != 2 {
+		t.Fatalf("Apple Account list calls = %d, want 2 after refresh failure", listCalls.Load())
+	}
+	if privacyCalls.Load() == 0 {
+		t.Fatal("privacy page was not warmed after manage refresh failure")
+	}
+	if len(remotes) != 1 || remotes[0].Email != "refresh-fail-retry@icloud.com" {
+		t.Fatalf("remotes = %+v, want mailbox from list retry after refresh failure", remotes)
+	}
+}
+
+func TestAppleAccountIncompleteListKeepsIncompleteWhenRefreshFailsAndRetryStaysIncomplete(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var listCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	appleAccountManageBaseURL = server.URL
+
+	now := time.Now()
+	_, _, err := (&ICloudClient{client: server.Client()}).ListPrivacyMailboxesForOriginWithSession(
+		context.Background(),
+		ICloudSession{LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Scnt:            "scnt",
+			APIKey:          "api-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(time.Hour),
+			LastCheckOK:     true,
+		}}},
+		mailboxRemoteOriginAppleAccount,
+	)
+	if !isCodedError(err, "apple_account_mailbox_list_incomplete") {
+		t.Fatalf("err = %#v, want apple_account_mailbox_list_incomplete rather than refresh 401", err)
+	}
+	if listCalls.Load() != 2 {
+		t.Fatalf("Apple Account list calls = %d, want 2 after refresh failure", listCalls.Load())
+	}
+}
+
+func TestAppleAccountIncompleteListPersistsRefreshedManageStateWhenWebSucceeds(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("scnt", "incomplete-list-scnt")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"persist-web-1","hme":"persist-web@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-apple-incomplete-persist"
+	account, err := store.AddAccountForOwner(ownerID, "Apple incomplete persist", "apple-incomplete-persist@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "apple-incomplete-persist-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "stale-scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     false,
+				KeepAliveFailCount: 2,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	); err != nil {
+		t.Fatal(err)
+	}
+	saved, ok := store.ICloudSessionForOwnerAccount(ownerID, account.ID)
+	if !ok {
+		t.Fatal("session disappeared after dual-source sync")
+	}
+	state, ok := appleAccountLoginState(saved)
+	if !ok {
+		t.Fatal("Apple Account login state missing after dual-source sync")
+	}
+	if state.Scnt != "incomplete-list-scnt" {
+		t.Fatalf("saved Apple Account scnt = %q, want incomplete-list-scnt from failed list response", state.Scnt)
+	}
+	if state.LastCheckOK || state.KeepAliveFailCount != 2 {
+		t.Fatalf("saved Apple Account keepalive = ok=%v fail=%d, want previous keepalive failure preserved", state.LastCheckOK, state.KeepAliveFailCount)
+	}
+}
+
+func TestAppleAccountOnlyMailboxSyncFailsWhenListStaysIncomplete(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var listCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	appleAccountManageBaseURL = server.URL
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-apple-incomplete-only"
+	account, err := store.AddAccountForOwner(ownerID, "Apple incomplete only", "apple-incomplete-only@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:   ownerID,
+		AccountID: account.ID,
+		AppleID:   account.AppleID,
+		LoginStates: []LoginState{{
+			Kind:            LoginStateAppleAccount,
+			Scnt:            "scnt",
+			APIKey:          "api-key",
+			LastCheckedAt:   now,
+			ManageExpiresAt: now.Add(time.Hour),
+			LastCheckOK:     true,
+		}},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"新接口创建结果不确定",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	)
+	if !isCodedError(err, "apple_account_mailbox_list_incomplete") {
+		t.Fatalf("Apple Account-only incomplete sync error = %#v, want apple_account_mailbox_list_incomplete", err)
+	}
+	if listCalls.Load() < 2 {
+		t.Fatalf("Apple Account list calls = %d, want a warmup retry", listCalls.Load())
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after incomplete Apple Account sync")
+	}
+	if !account.MailboxCreateReconciliationRequired {
+		t.Fatal("incomplete Apple Account-only list cleared the create lock")
+	}
+}
+
+func TestMailboxCreateReconciliationStaysWhenNoOriginListCompletes(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":{"forwardToEmails":[]}}`))
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-both-lists-incomplete"
+	account, err := store.AddAccountForOwner(ownerID, "Both incomplete", "both-incomplete@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "both-incomplete-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		ownerID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"新接口创建结果不确定",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	); err == nil {
+		t.Fatal("sync succeeded with no complete Hide My Email list")
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after incomplete dual-source sync")
+	}
+	if !account.MailboxCreateReconciliationRequired {
+		t.Fatal("incomplete lists cleared the create lock")
+	}
+	_, _, err = handler.createICloudMailboxForOwner(context.Background(), ownerID, account.ID, "LOCKED", "")
+	if !isCodedError(err, "mailbox_create_reconciliation_required") {
+		t.Fatalf("create error = %#v, want mailbox_create_reconciliation_required", err)
+	}
+}
+
+func TestIncompleteDualSourceSyncKeepsBothProviderErrors(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":{"forwardToEmails":[]}}`))
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-both-list-errors"
+	account, err := store.AddAccountForOwner(ownerID, "Both list errors", "both-list-errors@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "both-list-errors-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	result, _, syncErr := handler.syncICloudMailboxesForSession(
+		context.Background(),
+		httptest.NewRequest(http.MethodGet, "/", nil),
+		ownerID,
+		session,
+	)
+	if syncErr == nil {
+		t.Fatal("sync succeeded with no complete Hide My Email list")
+	}
+	if !strings.Contains(result.Error, string(mailboxCreateChannelAppleAccount)+"：") {
+		t.Fatalf("sync error = %q, want apple_account source prefix", result.Error)
+	}
+	if !strings.Contains(result.Error, string(mailboxCreateChannelICloudWeb)+"：") {
+		t.Fatalf("sync error = %q, want icloud_web source prefix", result.Error)
+	}
+	if !strings.Contains(result.Error, "Apple Account 隐私邮箱列表响应缺少 hmeEmails") {
+		t.Fatalf("sync error = %q, want Apple Account incomplete-list detail", result.Error)
+	}
+	if !strings.Contains(result.Error, "iCloud 隐私邮箱列表响应缺少 hmeEmails") {
+		t.Fatalf("sync error = %q, want iCloud Web incomplete-list detail", result.Error)
+	}
+}
+
+func TestAutoMailboxCreateFallsBackWhenAppleAccountAuthFailedBeforeGenerate(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var addCalls, webCalls atomic.Int32
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			addCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"fallback-candidate@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":{"anonymousId":"web-fallback-1","hme":"fallback-created@icloud.com","label":"FALLBACK","isActive":true}}}`))
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-auto-fallback-auth"
+	account, err := store.AddAccountForOwner(ownerID, "Auto fallback", "auto-fallback@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	session := ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "auto-fallback-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}
+	if err := store.SaveICloudSessionForOwner(ownerID, session); err != nil {
+		t.Fatal(err)
+	}
+
+	mailbox, remote, err := handler.createICloudMailboxForOwner(context.Background(), ownerID, account.ID, "FALLBACK", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addCalls.Load() == 0 {
+		t.Fatal("Apple Account generate was not attempted before fallback")
+	}
+	if webCalls.Load() == 0 {
+		t.Fatal("iCloud Web fallback was not used after Apple Account auth failure")
+	}
+	if remote.Email != "fallback-created@icloud.com" || remote.AnonymousID != "web-fallback-1" || remote.Origin != mailboxRemoteOriginICloudWeb {
+		t.Fatalf("fallback remote = %+v, want iCloud Web mailbox", remote)
+	}
+	if mailbox.Email != "fallback-created@icloud.com" {
+		t.Fatalf("fallback mailbox = %+v, want locally saved iCloud Web mailbox", mailbox)
+	}
+}
+
+func TestAutoMailboxCreateLockOriginUsesWebAfterFallbackUncertain(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"web-uncertain@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			http.Error(w, "upstream closed", http.StatusBadGateway)
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-auto-lock-web-origin"
+	account, err := store.AddAccountForOwner(ownerID, "Auto lock web origin", "auto-lock-web-origin@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "auto-lock-web-origin-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, failures, createErr := handler.createMailboxesForOwnerWithChannels(
+		context.Background(),
+		ownerID,
+		[]mailboxCreateRequest{{AccountID: account.ID, Channel: mailboxCreateChannelAuto}},
+		"LOCK",
+		"",
+	)
+	if createErr == nil && len(failures) == 0 {
+		t.Fatal("auto create after web reserve failure succeeded, want uncertain lock")
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after auto create fallback uncertain")
+	}
+	if !account.MailboxCreateReconciliationRequired {
+		t.Fatal("auto create after web reserve failure did not set the reconciliation lock")
+	}
+	if account.MailboxCreateReconciliationOrigin != mailboxRemoteOriginICloudWeb {
+		t.Fatalf("reconciliation origin = %q, want %q after auto fallback hit uncertain iCloud Web create", account.MailboxCreateReconciliationOrigin, mailboxRemoteOriginICloudWeb)
+	}
+}
+
+func TestMailboxSchedulerAutoFallbackUncertainUsesReconciliationEvent(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"scheduler-web-uncertain@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			http.Error(w, "upstream closed", http.StatusBadGateway)
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-scheduler-auto-uncertain"
+	account, err := store.AddAccountForOwner(ownerID, "Scheduler auto uncertain", "scheduler-auto-uncertain@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "scheduler-auto-uncertain-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
+	handler.runMailboxSchedulerBatch(context.Background(), ownerID, job, mailboxSchedulerConfig{
+		AccountIDs:    []string{account.ID},
+		Label:         "SCH",
+		BatchSize:     1,
+		RoundInterval: 0,
+	}, 1)
+	state, events := job.snapshot()
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after scheduler auto fallback uncertain")
+	}
+	if !account.MailboxCreateReconciliationRequired {
+		t.Fatal("scheduler auto fallback uncertain did not set the reconciliation lock")
+	}
+	if account.MailboxCreateReconciliationOrigin != mailboxRemoteOriginICloudWeb {
+		t.Fatalf("reconciliation origin = %q, want %q", account.MailboxCreateReconciliationOrigin, mailboxRemoteOriginICloudWeb)
+	}
+	if state.Success != 0 || state.Failed != 1 {
+		t.Fatalf("scheduler state = %+v, want success=0 failed=1", state)
+	}
+	var sawReconciliation, sawExhausted, sawSwitch bool
+	for _, event := range events {
+		if event.Type == "failed" && strings.Contains(event.Message, "远端结果不确定") && strings.Contains(event.Message, "已停止自动切换接口") {
+			sawReconciliation = true
+			if !strings.Contains(event.Message, "旧接口") {
+				t.Fatalf("reconciliation event used wrong channel: %q", event.Message)
+			}
+			if strings.Contains(event.Message, "新接口") {
+				t.Fatalf("reconciliation event still blamed the new interface: %q", event.Message)
+			}
+		}
+		if strings.Contains(event.Message, "该账号本轮已无可用接口") {
+			sawExhausted = true
+		}
+		if event.Type == "channel_failed" && strings.Contains(event.Message, "切换旧接口继续尝试") {
+			sawSwitch = true
+		}
+	}
+	if !sawReconciliation || sawExhausted || sawSwitch {
+		t.Fatalf("events did not keep auto-fallback uncertain as reconciliation: recon=%v exhausted=%v switch=%v events=%+v", sawReconciliation, sawExhausted, sawSwitch, events)
+	}
+}
+
+func TestMailboxSchedulerAutoFallsBackInSameRequestWhenAppleAuthFailsBeforeGenerate(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	var addCalls, webGenerateCalls, addCallsBeforeWeb atomic.Int32
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /account/manage/email/private/add":
+			addCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hme/generate":
+			n := webGenerateCalls.Add(1)
+			if n == 1 {
+				addCallsBeforeWeb.Store(addCalls.Load())
+			}
+			if n > 1 {
+				http.Error(w, "too many generate calls", http.StatusTooManyRequests)
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"scheduler-fallback@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":{"anonymousId":"scheduler-web-1","hme":"scheduler-fallback@icloud.com","label":"SCH","isActive":true}}}`))
+		case "/v1/hme/deactivate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	ownerID := "owner-scheduler-auto-fallback"
+	account, err := store.AddAccountForOwner(ownerID, "Scheduler auto fallback", "scheduler-auto-fallback@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "scheduler-auto-fallback-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "scnt",
+				APIKey:          "api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "web-cookie"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
+	cfg := mailboxSchedulerConfig{
+		AccountIDs:    []string{account.ID},
+		Label:         "SCH",
+		BatchSize:     1,
+		RoundInterval: 0,
+	}
+	handler.runMailboxSchedulerBatch(context.Background(), ownerID, job, cfg, 1)
+	state, events := job.snapshot()
+	if addCalls.Load() == 0 {
+		t.Fatal("scheduler auto create did not attempt Apple Account generate before fallback")
+	}
+	if webGenerateCalls.Load() == 0 {
+		t.Fatal("scheduler auto create did not fall back to iCloud Web in the same request")
+	}
+	if addCallsBeforeWeb.Load() != 2 {
+		t.Fatalf("Apple Account generate calls before first iCloud Web fallback = %d, want 2 (one 401 plus one in-request retry), not a later scheduler round", addCallsBeforeWeb.Load())
+	}
+	var firstCreateEvent string
+	for i := len(events) - 1; i >= 0; i-- {
+		switch events[i].Type {
+		case "created", "channel_failed", "failed":
+			firstCreateEvent = events[i].Type
+		}
+		if firstCreateEvent != "" {
+			break
+		}
+	}
+	if firstCreateEvent != "created" {
+		t.Fatalf("first scheduler create event = %q, want created from same-request iCloud Web fallback", firstCreateEvent)
+	}
+	if state.Success < 1 {
+		t.Fatalf("scheduler state = %+v, want at least one success after same-request fallback", state)
+	}
+}
+
+func TestSyncICloudMailboxesHTTPClearsLockAndLogsAppleListWarning(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/hme/list":
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"anonymousId":"http-web-listed","hme":"http-web-listed@icloud.com","isActive":true}
+					]
+				}
+			}`))
+		case "/v1/hme/generate":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":"http-web-created@icloud.com"}}`))
+		case "/v1/hme/reserve":
+			_, _ = w.Write([]byte(`{"success":true,"result":{"hme":{"anonymousId":"http-web-created","hme":"http-web-created@icloud.com","label":"AFTER","isActive":true}}}`))
+		default:
+			t.Fatalf("unexpected iCloud Web request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer webServer.Close()
+
+	var logBuf bytes.Buffer
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, slog.New(slog.NewTextHandler(&logBuf, nil))).(*Server)
+	cookie, user := registerTestUser(t, handler, "http-sync-lock", "sync123")
+	account, err := store.AddAccountForOwner(user.ID, "HTTP sync lock", "http-sync-lock@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
+		OwnerID:            user.ID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "http-sync-lock-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "session", Value: "http-sync-cookie", Domain: "127.0.0.1", Path: "/"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "http-sync-scnt",
+				APIKey:          "http-sync-api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "http-sync-cookie", Domain: "127.0.0.1", Path: "/"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(
+		user.ID,
+		account.ID,
+		mailboxRemoteOriginAppleAccount,
+		"新接口创建结果不确定",
+		now,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("HTTP sync status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Success bool `json:"success"`
+		Partial bool `json:"partial"`
+		Failed  int  `json:"failed"`
+		Results []struct {
+			Error   string `json:"error"`
+			Warning string `json:"warning"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success || response.Partial || response.Failed != 0 {
+		t.Fatalf("HTTP sync response = %+v, want success with iCloud Web list as authority", response)
+	}
+	if len(response.Results) != 1 || response.Results[0].Error != "" || response.Results[0].Warning == "" {
+		t.Fatalf("HTTP sync results = %+v, want warning without failing the whole sync", response.Results)
+	}
+	account, ok := store.FindAccountByID(account.ID)
+	if !ok {
+		t.Fatal("account disappeared after HTTP sync")
+	}
+	if account.MailboxCreateReconciliationRequired {
+		t.Fatalf("account reconciliation state = %+v, want cleared after HTTP sync with complete iCloud Web list", account)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "iCloud mailbox list failed") {
+		t.Fatalf("docker-level list warning missing from logs: %q", logs)
+	}
+	if !strings.Contains(logs, "缺少 hmeEmails") {
+		t.Fatalf("Apple Account incomplete-list detail missing from logs: %q", logs)
+	}
+	if strings.Contains(logs, "http-web-listed@icloud.com") {
+		t.Fatalf("mailbox address leaked into sync warning logs: %q", logs)
+	}
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/create", strings.NewReader(`{"account_id":"`+account.ID+`","label":"AFTER","create_channel":"icloud_web"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.AddCookie(cookie)
+	addClosureTestCSRF(createReq, cookie)
+	createRR := httptest.NewRecorder()
+	handler.ServeHTTP(createRR, createReq)
+	if createRR.Code != http.StatusCreated {
+		t.Fatalf("create after HTTP sync status = %d body=%s, want 201", createRR.Code, createRR.Body.String())
+	}
+	var createBody struct {
+		Code      string `json:"code"`
+		Created   int    `json:"created"`
+		Mailboxes []struct {
+			Email string `json:"email"`
+		} `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(createRR.Body.Bytes(), &createBody); err != nil {
+		t.Fatal(err)
+	}
+	if createBody.Code == "mailbox_create_reconciliation_required" {
+		t.Fatal("create after HTTP sync was still blocked by the reconciliation lock")
+	}
+	if createBody.Created != 1 || len(createBody.Mailboxes) != 1 || createBody.Mailboxes[0].Email != "http-web-created@icloud.com" {
+		t.Fatalf("create after HTTP sync body = %+v, want one iCloud Web mailbox", createBody)
+	}
+}
+
+func TestSyncICloudMailboxesHTTPDoesNotLogMailboxAddressesOnIncompleteWarning(t *testing.T) {
+	oldBaseURL := appleAccountManageBaseURL
+	defer func() { appleAccountManageBaseURL = oldBaseURL }()
+
+	appleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /account/manage/email/private":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"success": true,
+				"result": {
+					"hmeEmails": [
+						{"anonymousId":"dup-1","hme":"dup-listed@icloud.com","isActive":true},
+						{"anonymousId":"dup-2","hme":"dup-listed@icloud.com","isActive":true}
+					]
+				}
+			}`))
+		case "GET /account/manage/gs/ws/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		case "GET /account/manage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "GET /account/manage/section/privacy":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<html>privacy</html>`))
+		case "GET /bootstrap/portal":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"timeOutInterval":15}`))
+		default:
+			t.Fatalf("unexpected Apple Account request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer appleServer.Close()
+	appleAccountManageBaseURL = appleServer.URL
+
+	webServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/hme/list" {
+			t.Fatalf("iCloud Web list path = %q, want /v2/hme/list", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"success": true,
+			"result": {
+				"hmeEmails": [
+					{"anonymousId":"safe-web-listed","hme":"safe-web-listed@icloud.com","isActive":true}
+				]
+			}
+		}`))
+	}))
+	defer webServer.Close()
+
+	var logBuf bytes.Buffer
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, slog.New(slog.NewTextHandler(&logBuf, nil))).(*Server)
+	cookie, user := registerTestUser(t, handler, "http-sync-dup", "sync123")
+	account, err := store.AddAccountForOwner(user.ID, "HTTP sync dup", "http-sync-dup@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.SaveICloudSessionForOwner(user.ID, ICloudSession{
+		OwnerID:            user.ID,
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "http-sync-dup-dsid",
+		PremiumMailBaseURL: webServer.URL,
+		Host:               "www.icloud.com",
+		Cookies:            []SessionCookie{{Name: "session", Value: "http-sync-dup-cookie", Domain: "127.0.0.1", Path: "/"}},
+		LoginStates: []LoginState{
+			{
+				Kind:            LoginStateAppleAccount,
+				Scnt:            "http-sync-dup-scnt",
+				APIKey:          "http-sync-dup-api-key",
+				LastCheckedAt:   now,
+				ManageExpiresAt: now.Add(time.Hour),
+				LastCheckOK:     true,
+			},
+			{
+				Kind:    LoginStateICloudWeb,
+				Cookies: []SessionCookie{{Name: "session", Value: "http-sync-dup-cookie", Domain: "127.0.0.1", Path: "/"}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/icloud/mailboxes/sync", strings.NewReader(`{"account_id":"`+account.ID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	addClosureTestCSRF(req, cookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("HTTP sync status = %d body=%s, want 200", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Results []struct {
+			Warning string `json:"warning"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 || response.Results[0].Warning == "" {
+		t.Fatalf("HTTP sync results = %+v, want warning", response.Results)
+	}
+	if strings.Contains(response.Results[0].Warning, "dup-listed@icloud.com") {
+		t.Fatalf("mailbox address leaked into sync warning: %q", response.Results[0].Warning)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "iCloud mailbox list failed") {
+		t.Fatalf("docker-level list warning missing from logs: %q", logs)
+	}
+	if strings.Contains(logs, "dup-listed@icloud.com") {
+		t.Fatalf("mailbox address leaked into sync warning logs: %q", logs)
+	}
+	if strings.Contains(logs, "safe-web-listed@icloud.com") {
+		t.Fatalf("web mailbox address leaked into sync warning logs: %q", logs)
 	}
 }
 

@@ -379,6 +379,19 @@ func (s *Server) runMailboxSchedulerBatch(ctx context.Context, ownerID string, j
 				if channel == mailboxCreateChannelAuto {
 					channel = activeRequestChannel(activeRequests, accountID)
 				}
+				if schedulerAutoAttemptExhaustedProviders(failure) {
+					if accountID != "" {
+						disableSchedulerCreateChannel(disabledChannels, accountID, mailboxCreateChannelAppleAccount)
+						disableSchedulerCreateChannel(disabledChannels, accountID, mailboxCreateChannelICloudWeb)
+						delete(oneShotNextChannels, accountID)
+						skippedThisBatch[accountID] = true
+					}
+					job.state.Failed++
+					job.state.LastError = failure.Error
+					job.addEventLocked("failed", schedulerAccountFailedMessage(index, accountLabel, channel, failure.Error), batch, Mailbox{}, errors.New(failure.Error))
+					continue
+				}
+				channel = schedulerEffectiveFailureChannel(channel, failure)
 				if schedulerRequiresMailboxCreateReconciliation(failure) {
 					if accountID != "" {
 						delete(oneShotNextChannels, accountID)
@@ -589,16 +602,71 @@ func activeSchedulerCreateRequests(accountIDs []string, channels map[string][]ma
 		if accountID == "" || skipped[accountID] {
 			continue
 		}
-		channel, ok := oneShotSchedulerCreateChannel(oneShotFallback[accountID], disabled[accountID])
-		if !ok {
-			channel, ok = nextSchedulerCreateChannel(channels[accountID], disabled[accountID])
-		}
+		channel, ok := schedulerCreateRequestChannel(channels[accountID], disabled[accountID], oneShotFallback[accountID])
 		if !ok {
 			continue
 		}
 		out = append(out, mailboxCreateRequest{AccountID: accountID, Channel: channel})
 	}
 	return out
+}
+
+func schedulerChannelAvailable(channels []mailboxCreateChannel, disabled map[mailboxCreateChannel]bool, want mailboxCreateChannel) bool {
+	want = normalizeMailboxCreateChannel(want)
+	if want == mailboxCreateChannelAuto {
+		return false
+	}
+	if disabled != nil && disabled[want] {
+		return false
+	}
+	for _, channel := range channels {
+		if normalizeMailboxCreateChannel(channel) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func schedulerCreateRequestChannel(channels []mailboxCreateChannel, disabled map[mailboxCreateChannel]bool, oneShot mailboxCreateChannel) (mailboxCreateChannel, bool) {
+	if channel, ok := oneShotSchedulerCreateChannel(oneShot, disabled); ok {
+		return channel, true
+	}
+	channel, ok := nextSchedulerCreateChannel(channels, disabled)
+	if !ok {
+		return mailboxCreateChannelAuto, false
+	}
+	if normalizeMailboxCreateChannel(channel) == mailboxCreateChannelAppleAccount &&
+		schedulerChannelAvailable(channels, disabled, mailboxCreateChannelICloudWeb) {
+		return mailboxCreateChannelAuto, true
+	}
+	return channel, true
+}
+
+func schedulerEffectiveFailureChannel(channel mailboxCreateChannel, failure createMailboxFailure) mailboxCreateChannel {
+	channel = normalizeMailboxCreateChannel(channel)
+	if channel != mailboxCreateChannelAuto {
+		return channel
+	}
+	switch strings.TrimSpace(failure.Code) {
+	case "icloud_create_uncertain", "icloud_mailbox_anonymous_id_missing":
+		return mailboxCreateChannelICloudWeb
+	default:
+		return mailboxCreateChannelAppleAccount
+	}
+}
+
+func schedulerAutoAttemptExhaustedProviders(failure createMailboxFailure) bool {
+	if normalizeMailboxCreateChannel(mailboxCreateChannel(failure.Channel)) != mailboxCreateChannelAuto {
+		return false
+	}
+	if schedulerRequiresMailboxCreateReconciliation(failure) {
+		return false
+	}
+	code := strings.TrimSpace(failure.Code)
+	if code == "" || strings.HasPrefix(code, "apple_account_") || code == "mailbox_create_reconciliation_required" {
+		return false
+	}
+	return true
 }
 
 func oneShotSchedulerCreateChannel(channel mailboxCreateChannel, disabled map[mailboxCreateChannel]bool) (mailboxCreateChannel, bool) {
@@ -649,7 +717,7 @@ func nextSchedulerCreateChannelAfter(channels []mailboxCreateChannel, disabled m
 func schedulerTransientCreateFailure(failure createMailboxFailure) bool {
 	switch strings.TrimSpace(failure.Code) {
 	case "apple_account_generate_empty", "apple_account_api_failed", "apple_account_bad_response":
-		return normalizeMailboxCreateChannel(mailboxCreateChannel(failure.Channel)) == mailboxCreateChannelAppleAccount
+		return schedulerEffectiveFailureChannel(mailboxCreateChannel(failure.Channel), failure) == mailboxCreateChannelAppleAccount
 	default:
 		return false
 	}

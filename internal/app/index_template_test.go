@@ -590,15 +590,36 @@ func TestIndexTemplateCopiesExternalMailboxAPIWithSeparateToken(t *testing.T) {
 	block := scriptFunctionBlock(t, html, "async function copyMailboxValue", "async function writeClipboard")
 	for _, marker := range []string{
 		"row.api_url",
-		"row.api_token",
-		"const apiValue = `${apiURL}----${apiToken}`",
+		"mode === 'api' ? apiURL",
+		"`${email}----${apiURL}`",
 	} {
 		if !strings.Contains(block, marker) {
-			t.Errorf("copyMailboxValue must expose API URL and independent token; missing %q in %s", marker, block)
+			t.Errorf("copyMailboxValue must copy the complete API URL; missing %q in %s", marker, block)
 		}
+	}
+	if strings.Contains(block, "${apiURL}----${apiToken}") {
+		t.Fatalf("copyMailboxValue must not copy URL----token: %s", block)
 	}
 	if strings.Contains(block, "mailboxCodeURL(row") {
 		t.Fatalf("copyMailboxValue must not copy the browser-only session URL")
+	}
+}
+
+func TestIndexTemplateMailboxCodeURLDoesNotFilterByChatGPT(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	block := scriptFunctionBlock(t, html, "function mailboxCodeURL", "async function syncMailbox")
+	if strings.Contains(block, "'ChatGPT'") || strings.Contains(block, `"ChatGPT"`) {
+		t.Fatalf("mailboxCodeURL must not default keyword to ChatGPT: %s", block)
+	}
+	if !strings.Contains(block, "options.keyword || 'OpenAI'") {
+		t.Fatalf("mailboxCodeURL must default keyword to OpenAI so Grok mail is not filtered: %s", block)
+	}
+	if strings.Contains(html, "/sync?keyword=ChatGPT") {
+		t.Fatal("panel mailbox sync must not force keyword=ChatGPT")
 	}
 }
 

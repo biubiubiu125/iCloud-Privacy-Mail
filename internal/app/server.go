@@ -3300,7 +3300,7 @@ func (s *Server) handleSyncICloudMailboxes(w http.ResponseWriter, r *http.Reques
 			if isCodedError(err, "icloud_sync_partial") {
 				partialSourceFailure = true
 			}
-			s.logger.Warn("iCloud mailbox list failed", "account_id", result.AccountID, "err", err)
+			s.logger.Warn("iCloud mailbox list failed", "account_id", result.AccountID, "err", providerErrorForLog(err))
 		}
 		total += result.RemoteTotal
 		localProcessed += result.LocalProcessed
@@ -3459,6 +3459,18 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 			s.cfg.AppleAccountAPIKey,
 		)
 		cancelList()
+		if strings.EqualFold(strings.TrimSpace(source), string(mailboxCreateChannelAppleAccount)) {
+			if saveErr := s.store.SaveICloudSessionForOwner(ownerID, updatedSession); saveErr != nil {
+				if listErr == nil {
+					result.Error = publicErrorMessage(saveErr)
+					return result, out, saveErr
+				}
+				if s.logger != nil {
+					s.logger.Warn("failed to save updated Apple Account login state after failed mailbox list", "account_id", session.AccountID, "err", saveErr)
+				}
+			}
+		}
+		session = updatedSession
 		if listErr != nil {
 			if firstErr == nil {
 				firstErr = listErr
@@ -3469,13 +3481,6 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 			result.Error += source + "：" + publicErrorMessage(listErr)
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(source), string(mailboxCreateChannelAppleAccount)) {
-			if saveErr := s.store.SaveICloudSessionForOwner(ownerID, updatedSession); saveErr != nil {
-				result.Error = publicErrorMessage(saveErr)
-				return result, out, saveErr
-			}
-		}
-		session = updatedSession
 		successfulSources++
 		successfulRemoteCount += len(remotes)
 		reconcileLocalState := func() error {
@@ -3511,8 +3516,7 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 			}
 			result.RemoteMissing += remoteMissing
 			if accountID != "" {
-				if reconciliationOrigin, blocked := s.store.AccountMailboxCreateReconciliationOriginForOwner(ownerID, accountID); blocked &&
-					(reconciliationOrigin == "" || strings.EqualFold(reconciliationOrigin, remoteOrigin)) {
+				if _, blocked := s.store.AccountMailboxCreateReconciliationOriginForOwner(ownerID, accountID); blocked {
 					if clearErr := s.store.ClearAccountMailboxCreateReconciliationRequired(ownerID, accountID); clearErr != nil {
 						return clearErr
 					}
@@ -3547,11 +3551,18 @@ func (s *Server) syncICloudMailboxesForSession(ctx context.Context, r *http.Requ
 		if firstErr == nil {
 			firstErr = errCode("icloud_sync_failed", "没有任何 iCloud 隐私邮箱来源同步成功", true)
 		}
-		result.Error = publicErrorMessage(firstErr)
+		if strings.TrimSpace(result.Error) == "" {
+			result.Error = publicErrorMessage(firstErr)
+		}
 		return result, out, firstErr
 	}
 	if firstErr != nil {
-		return result, out, errCode("icloud_sync_partial", "部分 iCloud 隐私邮箱来源同步失败："+result.Error, true)
+		result.Warning = "部分 iCloud 隐私邮箱来源同步失败：" + redactMailboxAddressesForLog(result.Error)
+		result.Error = ""
+		if s.logger != nil {
+			s.logger.Warn("iCloud mailbox list failed", "account_id", result.AccountID, "err", providerErrorForLog(firstErr))
+		}
+		return result, out, nil
 	}
 	return result, out, nil
 }
@@ -6740,17 +6751,10 @@ func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accou
 		return Mailbox{}, ICloudRemoteMailbox{}, errCode("mailbox_create_reconciliation_required", message+"；请先同步 iCloud 远端邮箱列表确认后再重试", true)
 	}
 	createChannel := mailboxCreateChannelFromContext(ctx)
-	if createChannel == mailboxCreateChannelAuto {
-		if _, ok := appleAccountLoginState(session); ok {
-			createChannel = mailboxCreateChannelAppleAccount
-		} else {
-			createChannel = mailboxCreateChannelICloudWeb
-		}
-	}
 	remote, err := s.createICloudMailboxRemoteWithChannel(ctx, ownerID, session, label, note, createChannel)
 	if err != nil {
 		if strings.TrimSpace(remote.AnonymousID) == "" {
-			return Mailbox{}, remote, s.recordMailboxCreateReconciliationRequired(ownerID, accountID, createChannel, err)
+			return Mailbox{}, remote, s.recordMailboxCreateReconciliationRequired(ownerID, accountID, createChannel, err, remote)
 		}
 		if cleanupErr := s.cleanupCreatedRemoteMailbox(ctx, ownerID, accountID, remote); cleanupErr != nil {
 			if s.logger != nil {
@@ -6760,7 +6764,7 @@ func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accou
 				"mailbox_create_remote_cleanup_failed",
 				"远端邮箱创建链路失败："+publicErrorMessage(err)+"；远端回滚也失败："+publicErrorMessage(cleanupErr),
 				true,
-			))
+			), remote)
 		}
 		return Mailbox{}, remote, err
 	}
@@ -6769,7 +6773,7 @@ func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accou
 			"icloud_mailbox_anonymous_id_missing",
 			"Provider 创建成功但未返回远端匿名 ID，未写入本地邮箱记录",
 			true,
-		))
+		), remote)
 	}
 	storeNote := strings.TrimSpace(remote.Note)
 	if storeNote == "" {
@@ -6785,7 +6789,7 @@ func (s *Server) createICloudMailboxForOwner(ctx context.Context, ownerID, accou
 				"mailbox_create_persist_and_cleanup_failed",
 				"本地邮箱记录保存失败："+publicErrorMessage(err)+"；远端回滚也失败："+publicErrorMessage(cleanupErr),
 				true,
-			))
+			), remote)
 		}
 		return Mailbox{}, remote, err
 	}
@@ -6823,7 +6827,24 @@ func mailboxCreateChannelRemoteOrigin(channel mailboxCreateChannel) string {
 	}
 }
 
-func (s *Server) recordMailboxCreateReconciliationRequired(ownerID, accountID string, channel mailboxCreateChannel, err error) error {
+func mailboxCreateReconciliationOrigin(channel mailboxCreateChannel, err error, remote ICloudRemoteMailbox) string {
+	origin := strings.ToUpper(strings.TrimSpace(remote.Origin))
+	if origin == mailboxRemoteOriginAppleAccount || origin == mailboxRemoteOriginICloudWeb {
+		return origin
+	}
+	var coded codedError
+	if errors.As(err, &coded) {
+		switch strings.TrimSpace(coded.code) {
+		case "apple_account_create_uncertain", "apple_account_create_empty":
+			return mailboxRemoteOriginAppleAccount
+		case "icloud_create_uncertain":
+			return mailboxRemoteOriginICloudWeb
+		}
+	}
+	return mailboxCreateChannelRemoteOrigin(channel)
+}
+
+func (s *Server) recordMailboxCreateReconciliationRequired(ownerID, accountID string, channel mailboxCreateChannel, err error, remote ICloudRemoteMailbox) error {
 	if !mailboxCreateRequiresReconciliation(err) {
 		return err
 	}
@@ -6836,7 +6857,7 @@ func (s *Server) recordMailboxCreateReconciliationRequired(ownerID, accountID st
 			true,
 		)
 	}
-	origin := mailboxCreateChannelRemoteOrigin(channel)
+	origin := mailboxCreateReconciliationOrigin(channel, err, remote)
 	if markErr := s.store.MarkAccountMailboxCreateReconciliationRequiredForOrigin(ownerID, accountID, origin, publicErrorMessage(err), time.Now()); markErr != nil {
 		if s.logger != nil {
 			s.logger.Error("persist mailbox create reconciliation state failed", "account_id", accountID, "create_err", err, "persist_err", markErr)
@@ -6977,15 +6998,7 @@ func (s *Server) createMailboxesForOwnerWithChannels(ctx context.Context, ownerI
 				return
 			}
 			mailbox, remote, err := s.createMailboxForOwner(createCtx, effectiveOwnerID, effectiveAccountID, label, note)
-			effectiveChannel := channel
-			if effectiveChannel == mailboxCreateChannelAuto {
-				if _, ok := appleAccountLoginState(session); ok {
-					effectiveChannel = mailboxCreateChannelAppleAccount
-				} else {
-					effectiveChannel = mailboxCreateChannelICloudWeb
-				}
-			}
-			err = s.recordMailboxCreateReconciliationRequired(effectiveOwnerID, effectiveAccountID, effectiveChannel, err)
+			err = s.recordMailboxCreateReconciliationRequired(effectiveOwnerID, effectiveAccountID, channel, err, remote)
 			results[index] = createResult{
 				session:   session,
 				mailbox:   mailbox,
@@ -7061,15 +7074,26 @@ func (s *Server) createICloudMailboxRemoteWithChannel(ctx context.Context, owner
 		if strings.TrimSpace(remote.AnonymousID) != "" {
 			return remote, err
 		}
-		// An Apple Account create request may have reached the remote service
-		// even when the response is lost or malformed. Never switch providers
-		// automatically in that state: doing so can create a second remote
-		// mailbox for one user action. The caller can explicitly choose the
-		// iCloud Web channel after reconciling the remote state.
-		return ICloudRemoteMailbox{}, err
+		if !appleAccountCreateMayFallback(err) {
+			return ICloudRemoteMailbox{}, err
+		}
+		if s.logger != nil {
+			s.logger.Warn("Apple Account mailbox create failed before a remote mailbox was reserved; falling back to iCloud HME", "account_id", session.AccountID, "err", providerErrorForLog(err))
+		}
 	}
-	remote, err := s.createICloudMailboxRemoteICloudWeb(ctx, session, label, note, key)
-	return remote, err
+	return s.createICloudMailboxRemoteICloudWeb(ctx, session, label, note, key)
+}
+
+func appleAccountCreateMayFallback(err error) bool {
+	if err == nil || mailboxCreateRequiresReconciliation(err) {
+		return false
+	}
+	if isCodedError(err, "apple_account_api_key_missing") ||
+		isCodedError(err, "apple_account_session_missing") ||
+		isCodedError(err, "apple_account_auth_failed") {
+		return true
+	}
+	return appleAccountKeepAliveShouldRescue(err)
 }
 
 func mailboxCreateAccountKey(ownerID string, session ICloudSession) string {
@@ -8762,6 +8786,16 @@ func publicErrorMessage(err error) string {
 		return coded.message
 	}
 	return "操作失败"
+}
+
+var mailboxAddressLogPattern = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
+
+func redactMailboxAddressesForLog(message string) string {
+	return mailboxAddressLogPattern.ReplaceAllString(message, "[redacted]")
+}
+
+func providerErrorForLog(err error) string {
+	return redactMailboxAddressesForLog(publicErrorMessage(err))
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

@@ -1408,7 +1408,7 @@
         <button class="danger" onclick="cleanAllRemoteCodes()">一键删除码</button>
         <button class="ghost" onclick="closeRunConfig()">关闭</button>
       </div>
-      <div class="hint">导出数据：当前登录账号的登录账号/登录态 + 隐私邮箱池；邮箱API 每行 邮箱----API URL----API Token / CSV 三列；只导出邮箱为一行一个邮箱。导出邮箱支持选择指定 Apple 登录态。管理员首页默认只导出自己的数据；如需导出其他用户或全量数据，请到管理页选择对应范围。</div>
+      <div class="hint">导出数据：当前登录账号的登录账号/登录态 + 隐私邮箱池；邮箱API 每行 邮箱----完整取码URL / CSV 两列；只导出邮箱为一行一个邮箱。导出邮箱支持选择指定 Apple 登录态。管理员首页默认只导出自己的数据；如需导出其他用户或全量数据，请到管理页选择对应范围。</div>
     </section>
   </div>
   <script>
@@ -3616,7 +3616,7 @@
 
     function mailboxCodeURL(row, options = {}) {
       const url = new URL(`/api/mailboxes/${encodeURIComponent(row.id)}/code`, location.origin);
-      url.searchParams.set('keyword', options.keyword || 'ChatGPT');
+      url.searchParams.set('keyword', options.keyword || 'OpenAI');
       if (options.waitMs) url.searchParams.set('wait_ms', String(options.waitMs));
       if (options.after) url.searchParams.set('after', options.after);
       if (options.peek) url.searchParams.set('peek', '1');
@@ -3629,7 +3629,7 @@
       mailboxSyncResults.set(id, {loading: true});
       renderMailboxes();
       try {
-        const data = await api(`/api/mailboxes/${encodeURIComponent(id)}/sync?keyword=ChatGPT`, {method:'POST', body:'{}'});
+        const data = await api(`/api/mailboxes/${encodeURIComponent(id)}/sync?keyword=OpenAI`, {method:'POST', body:'{}'});
         const messages = await api(`/api/mailboxes/${encodeURIComponent(id)}/messages`);
         mailboxSyncResults.set(id, {ok: true});
         log(`同步完成：${row ? row.email : id}，新增 ${data.synced || 0} 封验证码邮件，本地已有 ${(messages.messages || []).length} 封`);
@@ -3789,9 +3789,7 @@
       if (!row) return;
       const email = row.email || '';
       const apiURL = row.api_url || '';
-      const apiToken = row.api_token || '';
-      const apiValue = `${apiURL}----${apiToken}`;
-      const value = mode === 'email' ? email : (mode === 'api' ? apiValue : `${email}----${apiValue}`);
+      const value = mode === 'email' ? email : (mode === 'api' ? apiURL : `${email}----${apiURL}`);
       await writeClipboard(value);
       activeMailboxCopyMenuID = '';
       renderMailboxes();

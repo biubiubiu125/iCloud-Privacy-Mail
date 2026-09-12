@@ -8823,6 +8823,14 @@ func TestMailboxSchedulerSkipsFailedAccountWithinCurrentBatch(t *testing.T) {
 	}
 }
 
+func schedulerTestAttemptChannel(ctx context.Context) mailboxCreateChannel {
+	channel := mailboxCreateChannelFromContext(ctx)
+	if normalizeMailboxCreateChannel(channel) == mailboxCreateChannelAuto {
+		return mailboxCreateChannelAppleAccount
+	}
+	return channel
+}
+
 func TestMailboxSchedulerFallsBackToOldInterfaceAfterNewInterfaceFails(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
@@ -8852,7 +8860,7 @@ func TestMailboxSchedulerFallsBackToOldInterfaceAfterNewInterfaceFails(t *testin
 	var attemptsMu sync.Mutex
 	attempts := map[mailboxCreateChannel]int{}
 	server.createMailboxForOwner = func(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
-		channel := mailboxCreateChannelFromContext(ctx)
+		channel := schedulerTestAttemptChannel(ctx)
 		attemptsMu.Lock()
 		attempts[channel]++
 		attempt := attempts[channel]
@@ -8954,7 +8962,7 @@ func TestMailboxSchedulerDoesNotFallbackAfterUncertainNewInterfaceCreate(t *test
 	var attemptsMu sync.Mutex
 	attempts := map[mailboxCreateChannel]int{}
 	server.createMailboxForOwner = func(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
-		channel := mailboxCreateChannelFromContext(ctx)
+		channel := schedulerTestAttemptChannel(ctx)
 		attemptsMu.Lock()
 		attempts[channel]++
 		attemptsMu.Unlock()
@@ -9032,7 +9040,7 @@ func TestMailboxSchedulerRetriesNewInterfaceAfterTransientEmptyResponse(t *testi
 	attempts := map[mailboxCreateChannel]int{}
 	var sequence []mailboxCreateChannel
 	server.createMailboxForOwner = func(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
-		channel := mailboxCreateChannelFromContext(ctx)
+		channel := schedulerTestAttemptChannel(ctx)
 		attemptsMu.Lock()
 		attempts[channel]++
 		attempt := attempts[channel]
@@ -9096,6 +9104,89 @@ func TestMailboxSchedulerRetriesNewInterfaceAfterTransientEmptyResponse(t *testi
 	}
 	if !sawTransientRetry || !sawTransientFallback {
 		t.Fatalf("events did not include transient retry and fallback: retry=%v fallback=%v events=%+v", sawTransientRetry, sawTransientFallback, events)
+	}
+}
+
+func TestMailboxSchedulerOneShotAppleRetryStaysExplicitApple(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	server := handler.(*Server)
+	ownerID := "owner-scheduler-oneshot-apple"
+	if err := store.SaveICloudSessionForOwner(ownerID, ICloudSession{
+		OwnerID:            ownerID,
+		AppleID:            "oneshot-apple@example.com",
+		DSID:               "dsid-oneshot-apple",
+		PremiumMailBaseURL: "https://example.invalid",
+		IsICloudPlus:       true,
+		CanCreateHME:       true,
+		Cookies:            []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}},
+		LoginStates: []LoginState{
+			{Kind: LoginStateAppleAccount, Host: "appleid.apple.com", Origin: "https://account.apple.com", Scnt: "scnt", SessionID: "sid"},
+			{Kind: LoginStateICloudWeb, Host: "www.icloud.com", Origin: "https://www.icloud.com", Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH", Value: "cookie", Domain: ".icloud.com", Path: "/"}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sessions := store.ICloudSessionsForOwner(ownerID)
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	accountID := sessions[0].AccountID
+
+	var attemptsMu sync.Mutex
+	attempts := map[mailboxCreateChannel]int{}
+	var sequence []mailboxCreateChannel
+	server.createMailboxForOwner = func(ctx context.Context, ownerID, accountID, label, note string) (Mailbox, ICloudRemoteMailbox, error) {
+		requested := mailboxCreateChannelFromContext(ctx)
+		channel := schedulerTestAttemptChannel(ctx)
+		attemptsMu.Lock()
+		attempts[channel]++
+		attempt := attempts[channel]
+		sequence = append(sequence, requested)
+		attemptsMu.Unlock()
+		switch channel {
+		case mailboxCreateChannelAppleAccount:
+			switch attempt {
+			case 1, 2:
+				return Mailbox{}, ICloudRemoteMailbox{}, errCode("apple_account_generate_empty", "Apple Account 未返回候选隐私邮箱；阶段：生成候选隐私邮箱；HTTP 200；原始返回：空响应", true)
+			default:
+				return Mailbox{}, ICloudRemoteMailbox{}, errCode("apple_account_hme_limit", "新接口当前小时额度已用完", true)
+			}
+		case mailboxCreateChannelICloudWeb:
+			if attempt > 1 {
+				return Mailbox{}, ICloudRemoteMailbox{}, errCode("icloud_hme_limit", "旧接口当前小时额度已用完", true)
+			}
+		default:
+			return Mailbox{}, ICloudRemoteMailbox{}, errCode("unexpected_channel", "定时创建没有指定接口", false)
+		}
+		email := fmt.Sprintf("%s-%d@icloud.com", channel, attempt)
+		mailbox, err := store.AddMailboxForOwner(ownerID, accountID, label, email)
+		if err != nil {
+			return Mailbox{}, ICloudRemoteMailbox{}, err
+		}
+		return mailbox, ICloudRemoteMailbox{Email: mailbox.Email, Label: mailbox.Label, IsActive: true, Origin: string(channel)}, nil
+	}
+
+	job := &mailboxSchedulerJob{state: mailboxSchedulerState{Running: true, BatchSize: 1}}
+	server.runMailboxSchedulerBatch(context.Background(), ownerID, job, mailboxSchedulerConfig{
+		AccountIDs: []string{accountID},
+		Label:      "SCH",
+		BatchSize:  1,
+	}, 1)
+	state, _ := job.snapshot()
+	attemptsMu.Lock()
+	defer attemptsMu.Unlock()
+	wantSequence := []mailboxCreateChannel{
+		mailboxCreateChannelAuto,
+		mailboxCreateChannelAppleAccount,
+		mailboxCreateChannelICloudWeb,
+		mailboxCreateChannelICloudWeb,
+	}
+	if !reflect.DeepEqual(sequence, wantSequence) {
+		t.Fatalf("requested channel sequence = %+v, want %+v (one-shot Apple retry must stay explicit Apple, not auto)", sequence, wantSequence)
+	}
+	if state.Success != 1 || state.Failed != 1 {
+		t.Fatalf("scheduler state = %+v, want success=1 failed=1", state)
 	}
 }
 
@@ -10220,20 +10311,27 @@ func TestSyncICloudMailboxesReportsPartialProviderSourceFailure(t *testing.T) {
 	addClosureTestCSRF(req, cookie)
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
-	if rr.Code != http.StatusMultiStatus {
-		t.Fatalf("partial-source sync status = %d body=%s, want 207", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusOK {
+		t.Fatalf("authoritative-web sync status = %d body=%s, want 200", rr.Code, rr.Body.String())
 	}
 	var response struct {
-		Success bool   `json:"success"`
-		Partial bool   `json:"partial"`
+		Success bool `json:"success"`
+		Partial bool `json:"partial"`
 		Code    string `json:"code"`
 		Failed  int    `json:"failed"`
+		Results []struct {
+			Error   string `json:"error"`
+			Warning string `json:"warning"`
+		} `json:"results"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Success || !response.Partial || response.Code != "icloud_sync_partial" || response.Failed != 1 {
-		t.Fatalf("partial-source sync response = %+v, want success=false partial=true code=icloud_sync_partial failed=1", response)
+	if !response.Success || response.Partial || response.Code != "" || response.Failed != 0 {
+		t.Fatalf("authoritative-web sync response = %+v, want success=true with iCloud Web list as authority", response)
+	}
+	if len(response.Results) != 1 || response.Results[0].Error != "" || response.Results[0].Warning == "" {
+		t.Fatalf("authoritative-web sync results = %+v, want warning without failing the whole sync", response.Results)
 	}
 }
 
