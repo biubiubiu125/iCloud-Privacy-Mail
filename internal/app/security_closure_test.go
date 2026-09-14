@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -431,24 +432,64 @@ func TestSnapshotForOwnerDoesNotExposeMismatchedMailboxMessages(t *testing.T) {
 	}
 }
 
-func TestAPIURLAndExportKeepTokenOutOfURL(t *testing.T) {
+func TestAPIURLAndExportIncludeMailboxTokenInURL(t *testing.T) {
 	store := newTestStore(t)
-	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger()).(*Server)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example", APIKey: "global-secret"}, store, discardLogger()).(*Server)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	mailbox := Mailbox{
 		Email:    "alias@icloud.com",
 		APIToken: "secret-api-token",
 	}
 
-	if got := handler.mailboxAPIURL(req, mailbox); strings.Contains(got, "key=") || strings.Contains(got, mailbox.APIToken) {
-		t.Fatalf("API URL leaks token: %q", got)
+	wantURL := "https://mail.example/api/v1/mailboxes/alias@icloud.com/code?key=secret-api-token"
+	got := handler.mailboxAPIURL(req, mailbox)
+	if got != wantURL {
+		t.Fatalf("mailboxAPIURL = %q, want %q", got, wantURL)
 	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse mailboxAPIURL: %v", err)
+	}
+	if parsed.Query().Get("key") != mailbox.APIToken {
+		t.Fatalf("mailboxAPIURL key = %q, want mailbox token", parsed.Query().Get("key"))
+	}
+	if parsed.Query().Get("wait_ms") != "" {
+		t.Fatalf("backend api_url must not embed wait_ms: %q", got)
+	}
+	if strings.Contains(got, "global-secret") {
+		t.Fatalf("mailboxAPIURL leaked global api_key: %q", got)
+	}
+
 	record := handler.mailboxExportRecord(req, mailbox, mailboxExportAPI)
-	if len(record) != 3 || record[0] != mailbox.Email || record[2] != mailbox.APIToken {
-		t.Fatalf("API export record=%v, want email/path/token", record)
+	if len(record) != 2 || record[0] != mailbox.Email || record[1] != wantURL {
+		t.Fatalf("API export record=%v, want email and complete URL", record)
 	}
-	if strings.Contains(record[1], mailbox.APIToken) || strings.Contains(record[1], "key=") {
-		t.Fatalf("API export URL leaks token: %q", record[1])
+}
+
+func TestPublicMailboxCodeURLAcceptsMailboxTokenWithoutSession(t *testing.T) {
+	store := newTestStore(t)
+	mailbox, err := store.AddMailbox("", "API", "alias@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example", APIKey: "global-secret"}, store, discardLogger()).(*Server)
+	apiURL := handler.mailboxAPIURL(httptest.NewRequest(http.MethodGet, "/", nil), mailbox)
+	parsed, err := url.Parse(apiURL)
+	if err != nil {
+		t.Fatalf("parse mailboxAPIURL: %v", err)
+	}
+	if parsed.Query().Get("key") != mailbox.APIToken {
+		t.Fatalf("mailboxAPIURL key = %q, want %q in %q", parsed.Query().Get("key"), mailbox.APIToken, apiURL)
+	}
+
+	codeReq := httptest.NewRequest(http.MethodGet, parsed.EscapedPath()+"?"+parsed.RawQuery+"&cache=1", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, codeReq)
+	if rr.Code == http.StatusUnauthorized || strings.Contains(rr.Body.String(), "invalid_api_key") {
+		t.Fatalf("public api_url was rejected without session: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"no_code"`) && !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("public api_url body = %s, want no_code or success", rr.Body.String())
 	}
 }
 

@@ -1518,7 +1518,7 @@ func (s *Server) writeMailboxTextExport(w http.ResponseWriter, r *http.Request, 
 				line = map[string]string{
 					"email":     record[0],
 					"api_url":   record[1],
-					"api_token": record[2],
+					"api_token": mailbox.APIToken,
 				}
 			}
 			data, err := json.Marshal(line)
@@ -2124,7 +2124,7 @@ func (s *Server) mailboxExportRecord(r *http.Request, mailbox Mailbox, mode mail
 	if mode == mailboxExportEmail {
 		return []string{email}
 	}
-	return []string{email, s.mailboxAPIURL(r, mailbox), mailbox.APIToken}
+	return []string{email, s.mailboxAPIURL(r, mailbox)}
 }
 
 func parseMailboxExportFormat(value string) (mailboxExportFormat, error) {
@@ -5093,33 +5093,38 @@ func (s *Server) releaseMailboxRemoteDeleteReference(key string, gate *mailboxRe
 	}
 }
 
+func mailboxRemoteOriginForProvider(mailbox Mailbox) string {
+	origin := strings.ToUpper(strings.TrimSpace(mailbox.RemoteOrigin))
+	if origin == "" {
+		return mailboxRemoteOriginICloudWeb
+	}
+	return origin
+}
+
 func (s *Server) validateRemoteMailboxDelete(mailbox Mailbox) error {
 	remoteID := strings.TrimSpace(mailbox.RemoteAnonymousID)
 	if remoteID == "" {
 		return errCode("icloud_mailbox_anonymous_id_missing", "该邮箱没有已确认的 iCloud 远端 ID，不能安全删除远端邮箱；请先同步或重新导入邮箱", true)
 	}
-	remoteOrigin := strings.ToUpper(strings.TrimSpace(mailbox.RemoteOrigin))
-	if remoteOrigin == "" {
-		return errCode("icloud_mailbox_remote_origin_unknown", "该邮箱没有已确认的 iCloud 远端来源，已拒绝调用删除接口；请先同步或重新导入邮箱", true)
-	}
+	remoteOrigin := mailboxRemoteOriginForProvider(mailbox)
 	switch remoteOrigin {
-	case "APPLE_ACCOUNT", "ICLOUD_WEB":
+	case mailboxRemoteOriginAppleAccount, mailboxRemoteOriginICloudWeb:
 	default:
 		return errCode("icloud_mailbox_remote_origin_unknown", "该邮箱缺少可识别的 iCloud 远端来源，已拒绝调用错误的删除接口；请先同步或重新导入邮箱", true)
 	}
 	session, ok := s.sessionForMailbox(mailbox.OwnerID, mailbox.AccountID)
 	if !ok {
-		if remoteOrigin == "APPLE_ACCOUNT" {
+		if remoteOrigin == mailboxRemoteOriginAppleAccount {
 			return errCode("apple_account_session_missing", "未保存 Apple Account 新接口登录态，请先完成新接口登录", true)
 		}
 		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先保存旧接口登录态", true)
 	}
-	if remoteOrigin == "APPLE_ACCOUNT" {
+	if remoteOrigin == mailboxRemoteOriginAppleAccount {
 		if _, hasState := appleAccountLoginState(session); !hasState {
 			return errCode("apple_account_session_missing", "未保存 Apple Account 新接口登录态，请先完成新接口登录", true)
 		}
 	}
-	if remoteOrigin == "ICLOUD_WEB" {
+	if remoteOrigin == mailboxRemoteOriginICloudWeb {
 		if _, hasWeb := iCloudWebSessionForClient(session); !hasWeb {
 			return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先保存旧接口登录态", true)
 		}
@@ -5132,15 +5137,15 @@ func (s *Server) deleteICloudMailboxRemote(ctx context.Context, mailbox Mailbox)
 		return err
 	}
 	remoteID := strings.TrimSpace(mailbox.RemoteAnonymousID)
-	remoteOrigin := strings.ToUpper(strings.TrimSpace(mailbox.RemoteOrigin))
+	remoteOrigin := mailboxRemoteOriginForProvider(mailbox)
 	session, ok := s.sessionForMailbox(mailbox.OwnerID, mailbox.AccountID)
 	if !ok {
-		if remoteOrigin == "APPLE_ACCOUNT" {
+		if remoteOrigin == mailboxRemoteOriginAppleAccount {
 			return errCode("apple_account_session_missing", "未保存 Apple Account 新接口登录态，请先完成新接口登录", true)
 		}
 		return errCode("icloud_session_missing", "未保存 iCloud 登录态，请先保存旧接口登录态", true)
 	}
-	if remoteOrigin == "APPLE_ACCOUNT" {
+	if remoteOrigin == mailboxRemoteOriginAppleAccount {
 		opCtx, cancel := context.WithTimeout(ctx, appleAccountManageOperationTimeout)
 		defer cancel()
 		updatedSession, err := newICloudKeepAliveClient().DeletePrivacyMailboxWithAppleAccount(opCtx, session, s.cfg.AppleAccountAPIKey, remoteID)
@@ -8515,7 +8520,7 @@ func (s *Server) publicExternalMailbox(r *http.Request, mailbox Mailbox) publicM
 
 func (s *Server) mailboxAPIURL(r *http.Request, mailbox Mailbox) string {
 	baseURL := firstNonEmpty(s.cfg.PublicBaseURL, requestBaseURL(r))
-	return fmt.Sprintf("%s/api/v1/mailboxes/%s/code", strings.TrimRight(baseURL, "/"), url.PathEscape(mailbox.Email))
+	return fmt.Sprintf("%s/api/v1/mailboxes/%s/code?key=%s", strings.TrimRight(baseURL, "/"), url.PathEscape(mailbox.Email), url.QueryEscape(mailbox.APIToken))
 }
 
 func (s *Server) publicSession(session *ICloudSession) publicICloudSession {

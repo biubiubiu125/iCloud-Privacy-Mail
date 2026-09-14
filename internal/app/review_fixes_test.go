@@ -1569,7 +1569,7 @@ func TestRemoteDeleteRefreshesCurrentMailboxStateBeforeProvider(t *testing.T) {
 	}
 }
 
-func TestRemoteDeleteRejectsBlankOrigin(t *testing.T) {
+func TestRemoteDeleteTreatsBlankOriginAsLegacyICloudWeb(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{}, store, discardLogger()).(*Server)
 	ownerID := "owner-blank-origin"
@@ -1585,6 +1585,10 @@ func TestRemoteDeleteRejectsBlankOrigin(t *testing.T) {
 		OwnerID:            ownerID,
 		AccountID:          accountID,
 		AppleID:            "blank-origin@example.com",
+		DSID:               "blank-origin-dsid",
+		ClientID:           "blank-origin-client",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
 		PremiumMailBaseURL: ts.URL,
 		Cookies:            []SessionCookie{{Name: "session", Value: "cookie"}},
 		LoginStates: []LoginState{{
@@ -1603,11 +1607,70 @@ func TestRemoteDeleteRejectsBlankOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.deleteICloudMailboxRemote(context.Background(), mailbox); !isCodedError(err, "icloud_mailbox_remote_origin_unknown") {
-		t.Fatalf("blank-origin remote delete error = %#v, want icloud_mailbox_remote_origin_unknown", err)
+	if strings.TrimSpace(mailbox.RemoteOrigin) != "" {
+		t.Fatalf("fixture RemoteOrigin = %q, want blank", mailbox.RemoteOrigin)
 	}
-	if len(paths) != 0 {
-		t.Fatalf("blank-origin remote delete called provider paths = %#v, want none", paths)
+	if err := handler.deleteICloudMailboxRemote(context.Background(), mailbox); err != nil {
+		t.Fatalf("blank-origin remote delete error = %#v, want success via legacy iCloud web", err)
+	}
+	if got, want := strings.Join(paths, "\n"), "POST /v1/hme/deactivate\nPOST /v1/hme/delete"; got != want {
+		t.Fatalf("blank-origin remote delete paths = %q, want %q", got, want)
+	}
+}
+
+func TestDeleteMailboxRouteTreatsBlankOriginAsLegacyICloudWeb(t *testing.T) {
+	var paths []string
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":{}}`))
+	}))
+	defer remoteServer.Close()
+
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	adminCookie, _ := registerTestUser(t, handler, "blank-origin-delete", "admin123")
+	account, err := store.AddAccountForOwner("", "Blank origin", "blank-origin@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveICloudSession(ICloudSession{
+		AccountID:          account.ID,
+		AppleID:            account.AppleID,
+		DSID:               "blank-origin-dsid",
+		ClientID:           "blank-origin-client",
+		ClientBuildNumber:  "build",
+		MasteringNumber:    "master",
+		PremiumMailBaseURL: remoteServer.URL,
+		Cookies:            []SessionCookie{{Name: "session", Value: "cookie"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwnerWithRemote("", account.ID, ICloudRemoteMailbox{
+		AnonymousID: "blank-origin-route-id",
+		Email:       "blank-origin-route@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(mailbox.RemoteOrigin) != "" {
+		t.Fatalf("fixture RemoteOrigin = %q, want blank", mailbox.RemoteOrigin)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/mailboxes/"+mailbox.ID+"?delete_remote=1", nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got, want := strings.Join(paths, "\n"), "POST /v1/hme/deactivate\nPOST /v1/hme/delete"; got != want {
+		t.Fatalf("blank-origin route paths = %q, want %q", got, want)
+	}
+	if _, ok := store.FindMailboxByID(mailbox.ID); ok {
+		t.Fatal("local mailbox record remains after blank-origin remote delete")
 	}
 }
 

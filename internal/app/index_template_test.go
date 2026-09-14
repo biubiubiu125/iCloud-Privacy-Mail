@@ -590,11 +590,13 @@ func TestIndexTemplateCopiesExternalMailboxAPIWithSeparateToken(t *testing.T) {
 	block := scriptFunctionBlock(t, html, "async function copyMailboxValue", "async function writeClipboard")
 	for _, marker := range []string{
 		"row.api_url",
+		"searchParams.set('wait_ms'",
+		"'12000'",
 		"mode === 'api' ? apiURL",
 		"`${email}----${apiURL}`",
 	} {
 		if !strings.Contains(block, marker) {
-			t.Errorf("copyMailboxValue must copy the complete API URL; missing %q in %s", marker, block)
+			t.Errorf("copyMailboxValue must copy api_url with wait_ms=12000; missing %q in %s", marker, block)
 		}
 	}
 	if strings.Contains(block, "${apiURL}----${apiToken}") {
@@ -602,6 +604,9 @@ func TestIndexTemplateCopiesExternalMailboxAPIWithSeparateToken(t *testing.T) {
 	}
 	if strings.Contains(block, "mailboxCodeURL(row") {
 		t.Fatalf("copyMailboxValue must not copy the browser-only session URL")
+	}
+	if strings.Contains(block, "ChatGPT") {
+		t.Fatalf("copyMailboxValue must not add ChatGPT keyword: %s", block)
 	}
 }
 

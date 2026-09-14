@@ -5566,8 +5566,11 @@ func TestMailboxAPITextExportIsScoped(t *testing.T) {
 		t.Fatalf("content-type = %q, want text/plain", ct)
 	}
 	userBody := rr.Body.String()
-	if !strings.Contains(userBody, userBox.Email+"----"+userBox.APIURL+"----") {
+	if !strings.Contains(userBody, userBox.Email+"----"+userBox.APIURL) {
 		t.Fatalf("user export missing own mailbox api: %q", userBody)
+	}
+	if strings.Contains(userBody, userBox.APIURL+"----") {
+		t.Fatalf("user export still has token column: %q", userBody)
 	}
 	if strings.Contains(userBody, adminBox.Email) {
 		t.Fatalf("user export leaked admin mailbox: %q", userBody)
@@ -5583,9 +5586,12 @@ func TestMailboxAPITextExportIsScoped(t *testing.T) {
 		t.Fatalf("admin mailbox api export status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	adminBody := rr.Body.String()
-	for _, row := range []string{adminBox.Email + "----" + adminBox.APIURL + "----", userBox.Email + "----" + userBox.APIURL + "----"} {
+	for _, row := range []string{adminBox.Email + "----" + adminBox.APIURL, userBox.Email + "----" + userBox.APIURL} {
 		if !strings.Contains(adminBody, row) {
 			t.Fatalf("admin export missing row %q in %q", row, adminBody)
+		}
+		if strings.Contains(adminBody, strings.SplitN(row, "----", 2)[1]+"----") {
+			t.Fatalf("admin export still has token column for %q in %q", row, adminBody)
 		}
 	}
 }
@@ -6142,8 +6148,11 @@ func TestMailboxExportFiltersByAccountID(t *testing.T) {
 		t.Fatalf("account filtered api export status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "one-alias@icloud.com----https://mail.example/api/v1/mailboxes/one-alias@icloud.com/code----") {
+	if !strings.Contains(body, "one-alias@icloud.com----https://mail.example/api/v1/mailboxes/one-alias@icloud.com/code?key=") {
 		t.Fatalf("filtered export missing account one API: %q", body)
+	}
+	if strings.Contains(body, "/code----") {
+		t.Fatalf("filtered export still has token column: %q", body)
 	}
 	if strings.Contains(body, "two-alias@icloud.com") {
 		t.Fatalf("filtered export leaked account two: %q", body)
@@ -6193,8 +6202,11 @@ func TestMailboxExportFiltersGlobalOwnerSentinel(t *testing.T) {
 		t.Fatalf("global owner export status = %d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "global-alias@icloud.com----https://mail.example/api/v1/mailboxes/global-alias@icloud.com/code----") {
+	if !strings.Contains(body, "global-alias@icloud.com----https://mail.example/api/v1/mailboxes/global-alias@icloud.com/code?key=") {
 		t.Fatalf("global owner export missing global mailbox API: %q", body)
+	}
+	if strings.Contains(body, "/code----") {
+		t.Fatalf("global owner export still has token column: %q", body)
 	}
 	if strings.Contains(body, "user-alias@icloud.com") {
 		t.Fatalf("global owner export leaked user mailbox: %q", body)
@@ -6239,6 +6251,40 @@ func TestMailboxExportPostJSONFiltersByAccountID(t *testing.T) {
 	body := rr.Body.String()
 	if !strings.Contains(body, `"email":"post-two@icloud.com"`) || strings.Contains(body, "post-one@icloud.com") {
 		t.Fatalf("post account filtered export body = %q", body)
+	}
+}
+
+func TestMailboxAPIJSONLExportKeepsSeparateTokenField(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{PublicBaseURL: "https://mail.example"}, store, discardLogger())
+	adminCookie, _ := registerTestUser(t, handler, "jsonl-api-export", "admin123")
+	box := createTestMailboxWithCookie(t, handler, adminCookie, "API", "jsonl-api@icloud.com")
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/export-mailbox-apis", strings.NewReader(`{"format":"jsonl"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("jsonl api export status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var line struct {
+		Email    string `json:"email"`
+		APIURL   string `json:"api_url"`
+		APIToken string `json:"api_token"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &line); err != nil {
+		t.Fatalf("jsonl decode: %v body=%s", err, rr.Body.String())
+	}
+	if line.Email != box.Email || line.APIToken != box.APIToken {
+		t.Fatalf("jsonl line = %+v, want email/token from mailbox", line)
+	}
+	if !strings.Contains(line.APIURL, "key="+url.QueryEscape(box.APIToken)) {
+		t.Fatalf("jsonl api_url missing mailbox key: %q", line.APIURL)
+	}
+	if strings.Contains(line.APIURL, "wait_ms=") {
+		t.Fatalf("jsonl api_url must not embed wait_ms: %q", line.APIURL)
 	}
 }
 
@@ -8291,8 +8337,14 @@ func TestClaimMailboxRequiresGlobalAPIKeyAndMarksUsed(t *testing.T) {
 	if body.Mailbox.APIToken != mailbox.APIToken {
 		t.Fatalf("api_token = %q, want stored token", body.Mailbox.APIToken)
 	}
-	if strings.Contains(body.Mailbox.APIURL, mailbox.APIToken) {
-		t.Fatalf("api_url leaked token: %q", body.Mailbox.APIURL)
+	if !strings.Contains(body.Mailbox.APIURL, "key="+url.QueryEscape(mailbox.APIToken)) {
+		t.Fatalf("claim api_url missing mailbox key: %q", body.Mailbox.APIURL)
+	}
+	if strings.Contains(body.Mailbox.APIURL, "wait_ms=") {
+		t.Fatalf("claim api_url must not embed wait_ms: %q", body.Mailbox.APIURL)
+	}
+	if strings.Contains(body.Mailbox.APIURL, "global-key") {
+		t.Fatalf("claim api_url leaked global key: %q", body.Mailbox.APIURL)
 	}
 	if body.Mailbox.OwnerID != "" || body.Mailbox.AccountID != "" || body.Mailbox.RemoteAnonymousID != "" {
 		t.Fatalf("claim leaked internal ownership fields: %+v", body.Mailbox)
@@ -8347,8 +8399,14 @@ func TestLookupMailboxesRequiresGlobalAPIKeyAndKeepsStatus(t *testing.T) {
 	if body.Mailboxes[0].APIToken != mailbox.APIToken {
 		t.Fatalf("lookup api_token = %q, want stored token", body.Mailboxes[0].APIToken)
 	}
-	if strings.Contains(body.Mailboxes[0].APIURL, mailbox.APIToken) {
-		t.Fatalf("lookup api_url leaked token: %q", body.Mailboxes[0].APIURL)
+	if !strings.Contains(body.Mailboxes[0].APIURL, "key="+url.QueryEscape(mailbox.APIToken)) {
+		t.Fatalf("lookup api_url missing mailbox key: %q", body.Mailboxes[0].APIURL)
+	}
+	if strings.Contains(body.Mailboxes[0].APIURL, "wait_ms=") {
+		t.Fatalf("lookup api_url must not embed wait_ms: %q", body.Mailboxes[0].APIURL)
+	}
+	if strings.Contains(body.Mailboxes[0].APIURL, "global-key") {
+		t.Fatalf("lookup api_url leaked global key: %q", body.Mailboxes[0].APIURL)
 	}
 	if body.Mailboxes[0].OwnerID != "" || body.Mailboxes[0].AccountID != "" || body.Mailboxes[0].RemoteAnonymousID != "" {
 		t.Fatalf("lookup leaked internal ownership fields: %+v", body.Mailboxes[0])

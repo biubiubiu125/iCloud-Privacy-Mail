@@ -3788,7 +3788,9 @@
       const row = lastMailboxes.find(x => x.id === id);
       if (!row) return;
       const email = row.email || '';
-      const apiURL = row.api_url || '';
+      const url = new URL(row.api_url || '', location.origin);
+      url.searchParams.set('wait_ms', '12000');
+      const apiURL = url.toString();
       const value = mode === 'email' ? email : (mode === 'api' ? apiURL : `${email}----${apiURL}`);
       await writeClipboard(value);
       activeMailboxCopyMenuID = '';

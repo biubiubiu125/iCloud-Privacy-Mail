@@ -15,7 +15,7 @@
 - 隐私邮箱创建：优先调用 Apple Account 新接口创建，账号只有旧登录态时使用 iCloud Hide My Email `generate + reserve`；已提交但结果不确定时不会自动切换接口，必须先同步远端列表核对。
 - 批量/定时创建：可勾选多个 Apple 登录态；手动创建会让选中账号同时跑一轮，定时只设置间隔，失败账号只在本次定时创建中临时跳过，其他账号继续创建，直到本次账号全部失败后等待下一次。
 - 邮件同步：创建邮箱的 Apple 登录态只用于创建；验证码收件使用 iCloud 邮箱账号 + App 专用密码，通过 IMAP 监听和同步最新验证码邮件。
-- 取码 API：每个隐私邮箱自动生成独立 `api_token`；复制、导出和领取接口给出带 `?key=` 与 `wait_ms=12000` 的完整取码 URL，浏览器或注册机可直接 GET。
+- 取码 API：每个隐私邮箱自动生成独立 `api_token`；复制、导出和领取接口给出带 `?key=` 的完整取码 URL。面板复制会再加 `wait_ms=12000`，浏览器或注册机可直接 GET。
 - 自动取号 API：外部项目可用全局 `api_key` 领取可用邮箱，领取后自动标记为已使用。
 - 登录态检测：可手动检测 iCloud Mail 是否还能同步，也可在前端开启定时检测。
 - 账号级代理：每个 Apple/iCloud 账号可单独配置 HTTP/HTTPS 或 SOCKS5 代理，登录、2FA、创建、同步、导出、删除和 IMAP 收件都会沿用该代理。
@@ -237,7 +237,7 @@ http://127.0.0.1:8787/login
 2. 点击 `开始创建`；当前勾选账号会在同一次请求里同时各创建 1 个。
 3. 后端优先调用 Apple Account 新接口创建邮箱；没有新接口登录态时使用旧 iCloud Hide My Email 接口。已提交但没有可确认响应、远端回滚失败或返回缺少远端 ID 时会锁定该账号的创建操作，必须先同步远端列表确认后再重试，避免新旧接口重复创建。
 4. 本次结果会记录成功数量和账号级失败；某个账号失败不会阻断其他账号。
-5. 每个邮箱会生成独立 API URL 和 `api_token`；复制/导出的地址自带 `?key=<mailbox_token>&wait_ms=12000`，可直接 GET 取码。
+5. 每个邮箱会生成独立 API URL 和 `api_token`；复制/导出/领取的 `api_url` 自带 `?key=<mailbox_token>`。面板复制会再加 `wait_ms=12000`，可直接 GET 取码。
 
 定时创建只保留间隔配置，默认间隔为 `60` 分钟。没有总数和每次轮数输入，面板旁边只记录累计成功/失败数量。每次定时开始后，当前勾选账号会同时创建；若某个账号在本次定时创建里达到上限或创建失败，只会临时跳过这个账号，其他账号继续创建；直到本次参与账号都临时失败后，任务才进入等待。下一次定时开始时会重新尝试全部勾选账号。
 
@@ -349,7 +349,7 @@ Content-Type: application/json
   "success": true,
   "mailbox": {
     "email": "alias@icloud.com",
-    "api_url": "https://www.example.com/api/v1/mailboxes/alias@icloud.com/code?key=...&wait_ms=12000",
+    "api_url": "https://www.example.com/api/v1/mailboxes/alias@icloud.com/code?key=...",
     "api_token": "...",
     "api_active": true,
     "icloud_active": true,
@@ -372,7 +372,7 @@ GET /api/v1/health
 - 服务器真实数据只保存到 `config.json` 的 `data_path`。
 - 前端不显示、不修改服务器数据目录。
 - `导出数据` 会触发浏览器保存文件选择框；不支持 File System Access API 的浏览器会回退为默认下载。
-- `导出邮箱API` 支持 `txt/csv/tsv/jsonl`。TXT 每行 `邮箱----完整取码URL`，CSV/TSV 为邮箱、完整取码 URL 两列；完整 URL 含 `?key=` 与 `wait_ms=12000`。JSONL 另保留 `api_token` 字段。
+- `导出邮箱API` 支持 `txt/csv/tsv/jsonl`。TXT 每行 `邮箱----完整取码URL`，CSV/TSV 为邮箱、完整取码 URL 两列；完整 URL 含 `?key=`，不含 `wait_ms`。JSONL 另保留 `api_token` 字段。面板复制会在该 URL 上再加 `wait_ms=12000`。
 - `只导出邮箱` 支持 `txt/csv/tsv/jsonl`，所有格式均保持一行一个邮箱记录。
 - 前端导出可选择 `当前 TAB 账号`、`全部登录态` 或指定 Apple 登录态。
 - 邮箱池支持按 `全部`、`已导出`、`未导出` 分类显示；导出邮箱 API 后会记录导出时间并显示在邮箱行上。
