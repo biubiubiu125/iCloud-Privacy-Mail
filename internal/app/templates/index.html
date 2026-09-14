@@ -542,15 +542,18 @@
       justify-content: space-between;
     }
     .search-field { min-width: 0; max-width: none; }
-    .mailbox-filter-row { display: flex; gap: 8px; align-items: flex-end; justify-content: flex-end; min-width: 0; }
-    .mailbox-filter-field { width: 100%; color: var(--muted); font-size: 12px; font-weight: 700; }
-    .mailbox-control-stack { grid-column: 2; display: grid; gap: 8px; justify-items: end; align-items: start; }
-    .mailbox-action-row { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; justify-content: flex-end; }
+    .mailbox-filter-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; justify-content: flex-start; min-width: 0; }
+    .mailbox-filter-field { min-width: 140px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .mailbox-control-stack { grid-column: 1 / -1; display: grid; gap: 8px; justify-items: start; align-items: start; }
+    .mailbox-action-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-start; }
     .mailbox-action-row #mailboxSelectionInfo { margin-left: 4px; white-space: nowrap; }
+    .mailbox-selection-bar { grid-column: 1 / -1; display: none; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-start; min-width: 0; }
+    .mailbox-selection-bar.is-visible { display: flex; }
+    .mailbox-selection-bar select { min-width: 140px; padding: 8px 10px; }
     .pager { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; justify-content: flex-end; color: var(--muted); font-size: 13px; }
     .pager button { padding: 8px 11px; border-radius: 8px; }
     #mailboxPageInfo { white-space: nowrap; }
-    .mailbox-filter-field select { width: 100%; min-width: 180px; padding: 8px 10px; }
+    .mailbox-filter-field select { width: 100%; min-width: 140px; padding: 8px 10px; }
     .page-size-control { display: inline-flex; flex-direction: row; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
     .page-size-control input { width: 76px; padding: 8px 10px; }
     .mailbox-select-cell { width: 42px; text-align: center; }
@@ -1322,6 +1325,29 @@
                   <option value="unexported">未导出</option>
                 </select>
               </label>
+              <label class="mailbox-filter-field">使用状态
+                <select id="mailboxStatusFilter" title="使用状态筛选" onchange="setMailboxStatusFilter()">
+                  <option value="all">全部</option>
+                  <option value="unused">未使用</option>
+                  <option value="used">已使用</option>
+                  <option value="failed">失败</option>
+                  <option value="disabled">停用</option>
+                </select>
+              </label>
+              <label class="mailbox-filter-field">API 状态
+                <select id="mailboxAPIFilter" title="API 开关筛选" onchange="setMailboxAPIFilter()">
+                  <option value="all">全部</option>
+                  <option value="1">已启用</option>
+                  <option value="0">已停用</option>
+                </select>
+              </label>
+              <label class="mailbox-filter-field">远端状态
+                <select id="mailboxRemoteFilter" title="远端删除核对筛选" onchange="setMailboxRemoteFilter()">
+                  <option value="all">全部</option>
+                  <option value="unknown">待核对</option>
+                  <option value="failed">删除失败</option>
+                </select>
+              </label>
               <label class="mailbox-filter-field">同步范围
                 <select id="mailboxSyncAccount" title="同步登录态；全部模式同步所有可用的新旧接口登录态">
                   <option value="">全部可同步登录态</option>
@@ -1335,10 +1361,6 @@
                 <button onclick="selectVisibleMailboxes(true)">全选本页</button>
                 <button onclick="selectAllFilteredMailboxes()">全选筛选结果</button>
                 <button onclick="clearMailboxSelection()">清空选择</button>
-                <button onclick="exportSelectedMailboxes('api')">导出选中API</button>
-                <button onclick="exportSelectedMailboxes('email')">导出选中邮箱</button>
-                <button class="danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
-                <button class="danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
                 <span id="mailboxSelectionInfo" class="muted">已选 0 个</span>
               </div>
               <div class="pager">
@@ -1350,6 +1372,27 @@
                 <span id="mailboxPageInfo">第 1/1 页</span>
                 <button id="mailboxNextPage" onclick="changeMailboxPage(1)">下一页</button>
               </div>
+            </div>
+            <div id="mailboxSelectionBar" class="mailbox-selection-bar">
+              <button onclick="exportSelectedMailboxes('api')">导出选中API</button>
+              <button onclick="exportSelectedMailboxes('email')">导出选中邮箱</button>
+              <button onclick="copySelectedMailboxes('email')">复制选中邮箱</button>
+              <button onclick="copySelectedMailboxes('api')">复制选中API</button>
+              <select id="mailboxSelectedStatus" title="批量改状态" onchange="setSelectedMailboxStatus(this.value)">
+                <option value="">改状态</option>
+                <option value="available">可用</option>
+                <option value="used">已使用</option>
+                <option value="failed">失败</option>
+                <option value="disabled">停用</option>
+              </select>
+              <button onclick="enableSelectedMailboxes()">启用 API</button>
+              <button onclick="disableSelectedMailboxes()">停用 API</button>
+              <select id="mailboxSelectedBindAccount" title="绑定选中邮箱" onchange="bindSelectedMailboxesToAccount(this.value)">
+                <option value="">绑定到账号</option>
+              </select>
+              <button onclick="syncSelectedMailboxes()">同步选中邮件</button>
+              <button class="danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
+              <button class="danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
             </div>
           </div>
           <div id="mailboxAccountTabs" class="account-tabs"></div>
@@ -1425,6 +1468,9 @@
     let mailboxPageSize = 10;
     let activeMailboxAccountKey = 'all';
     let activeMailboxExportFilter = 'all';
+    let activeMailboxStatusFilter = 'all';
+    let activeMailboxAPIFilter = 'all';
+    let activeMailboxRemoteFilter = 'all';
     let mailboxSearchTimer = null;
     let selectedMailboxIDs = new Set();
     const mailboxRemoteDeleteStatus = new Map();
@@ -2164,6 +2210,15 @@
       if (activeMailboxExportFilter === 'exported' || activeMailboxExportFilter === 'unexported') {
         params.set('api_exported', activeMailboxExportFilter === 'exported' ? '1' : '0');
       }
+      if (activeMailboxStatusFilter && activeMailboxStatusFilter !== 'all') {
+        params.set('status', activeMailboxStatusFilter);
+      }
+      if (activeMailboxAPIFilter && activeMailboxAPIFilter !== 'all') {
+        params.set('api_active', activeMailboxAPIFilter);
+      }
+      if (activeMailboxRemoteFilter && activeMailboxRemoteFilter !== 'all') {
+        params.set('remote_delete', activeMailboxRemoteFilter);
+      }
       return `${path}?${params.toString()}`;
     }
 
@@ -2308,7 +2363,7 @@
       try {
         const exportURL = new URL(path, window.location.origin);
         const params = new URLSearchParams();
-        ['owner_id', 'account_id', 'account_key', 'search', 'q', 'api_exported', 'exported'].forEach(key => {
+        ['owner_id', 'account_id', 'account_key', 'search', 'q', 'api_exported', 'exported', 'status', 'api_active', 'remote_delete'].forEach(key => {
           const value = exportURL.searchParams.get(key);
           if (value) params.set(key, value);
         });
@@ -2733,6 +2788,16 @@
         .sort((a, b) => a.title.localeCompare(b.title));
     }
 
+    function renderMailboxSelectionBindOptions() {
+      const select = $('mailboxSelectedBindAccount');
+      if (!select) return;
+      const current = select.value || '';
+      const accounts = mailboxBindAccounts();
+      select.innerHTML = ['<option value="">绑定到账号</option>', ...accounts.map(account => `<option value="${esc(account.id)}">${esc(account.title)}</option>`)].join('');
+      const values = new Set(['', ...accounts.map(account => account.id)]);
+      select.value = values.has(current) ? current : '';
+    }
+
     function mailboxBindControl(row) {
       if (!row || String(row.account_id || '').trim()) return '';
       const ownerID = String(row.owner_id || '').trim();
@@ -2773,6 +2838,27 @@
       loadMailboxPage().catch(err => log('切换导出状态筛选失败：' + err.message));
     }
 
+    function setMailboxStatusFilter() {
+      activeMailboxStatusFilter = $('mailboxStatusFilter') ? $('mailboxStatusFilter').value : 'all';
+      mailboxPage = 1;
+      invalidateMailboxSelection();
+      loadMailboxPage().catch(err => log('切换使用状态筛选失败：' + err.message));
+    }
+
+    function setMailboxAPIFilter() {
+      activeMailboxAPIFilter = $('mailboxAPIFilter') ? $('mailboxAPIFilter').value : 'all';
+      mailboxPage = 1;
+      invalidateMailboxSelection();
+      loadMailboxPage().catch(err => log('切换 API 状态筛选失败：' + err.message));
+    }
+
+    function setMailboxRemoteFilter() {
+      activeMailboxRemoteFilter = $('mailboxRemoteFilter') ? $('mailboxRemoteFilter').value : 'all';
+      mailboxPage = 1;
+      invalidateMailboxSelection();
+      loadMailboxPage().catch(err => log('切换远端状态筛选失败：' + err.message));
+    }
+
     function changeMailboxPage(delta) {
       mailboxPage += delta;
       loadMailboxPage().catch(err => log('切换邮箱页失败：' + err.message));
@@ -2798,6 +2884,15 @@
       if (activeMailboxExportFilter && activeMailboxExportFilter !== 'all') {
         params.set('exported', activeMailboxExportFilter);
       }
+      if (activeMailboxStatusFilter && activeMailboxStatusFilter !== 'all') {
+        params.set('status', activeMailboxStatusFilter);
+      }
+      if (activeMailboxAPIFilter && activeMailboxAPIFilter !== 'all') {
+        params.set('api_active', activeMailboxAPIFilter);
+      }
+      if (activeMailboxRemoteFilter && activeMailboxRemoteFilter !== 'all') {
+        params.set('remote_delete', activeMailboxRemoteFilter);
+      }
       return params;
     }
 
@@ -2810,6 +2905,15 @@
       }
       if (activeMailboxExportFilter && activeMailboxExportFilter !== 'all') {
         scope.exported = activeMailboxExportFilter;
+      }
+      if (activeMailboxStatusFilter && activeMailboxStatusFilter !== 'all') {
+        scope.status = activeMailboxStatusFilter;
+      }
+      if (activeMailboxAPIFilter && activeMailboxAPIFilter !== 'all') {
+        scope.api_active = activeMailboxAPIFilter;
+      }
+      if (activeMailboxRemoteFilter && activeMailboxRemoteFilter !== 'all') {
+        scope.remote_delete = activeMailboxRemoteFilter;
       }
       return scope;
     }
@@ -2955,6 +3059,9 @@
       if ($('mailboxPrevPage')) $('mailboxPrevPage').disabled = page <= 1;
       if ($('mailboxNextPage')) $('mailboxNextPage').disabled = page >= totalPages;
       if ($('mailboxExportFilter')) $('mailboxExportFilter').value = activeMailboxExportFilter || 'all';
+      if ($('mailboxStatusFilter')) $('mailboxStatusFilter').value = activeMailboxStatusFilter || 'all';
+      if ($('mailboxAPIFilter')) $('mailboxAPIFilter').value = activeMailboxAPIFilter || 'all';
+      if ($('mailboxRemoteFilter')) $('mailboxRemoteFilter').value = activeMailboxRemoteFilter || 'all';
       const visibleSelectedCount = rows.filter(row => row && row.id && selectedMailboxIDs.has(String(row.id))).length;
       const visibleAllSelected = rows.length > 0 && visibleSelectedCount === rows.length;
       const visibleSomeSelected = visibleSelectedCount > 0 && visibleSelectedCount < rows.length;
@@ -2965,6 +3072,11 @@
       }
       const selectedInfo = $('mailboxSelectionInfo');
       if (selectedInfo) selectedInfo.textContent = `已选 ${mailboxSelectedCount()} 个`;
+      const selectionBar = $('mailboxSelectionBar');
+      if (selectionBar) {
+        selectionBar.classList.toggle('is-visible', mailboxSelectedCount() > 0);
+      }
+      renderMailboxSelectionBindOptions();
       if (rows.length === 0) {
         $('mailboxes').innerHTML = '<tr><td colspan="7" class="muted">没有匹配的邮箱</td></tr>';
         return;
@@ -3011,7 +3123,9 @@
                 <option value="disabled">停用</option>
               </select>
               ${mailboxBindControl(row)}
-              <button onclick="disableMailbox(${jsArg(row.id)})">停用 API</button>
+              ${row.api_active
+                ? `<button onclick="disableMailbox(${jsArg(row.id)})">停用 API</button>`
+                : `<button onclick="enableMailbox(${jsArg(row.id)})">启用 API</button>`}
               <button class="danger" onclick="deleteMailbox(${jsArg(row.id)})">删除 API</button>
             </div>
             </td>
@@ -3744,9 +3858,9 @@
     async function setMailboxStatus(id, status) {
       if (!status) return;
       try {
-        const apiActive = status === 'disabled' ? false : undefined;
+        const apiActive = status === 'disabled' ? false : true;
         const payload = {status, note: '面板手动改状态'};
-        if (apiActive !== undefined) payload.api_active = apiActive;
+        payload.api_active = apiActive;
         await api(`/api/mailboxes/${encodeURIComponent(id)}/status`, {method:'POST', body: JSON.stringify(payload)});
         log(`状态已更新：${id} -> ${status}`);
         await refresh();
@@ -3765,15 +3879,118 @@
       }
     }
 
+    async function enableMailbox(id) {
+      try {
+        await api(`/api/mailboxes/${encodeURIComponent(id)}/enable`, {method:'POST', body:'{}'});
+        log('已启用：' + id);
+        await refresh();
+      } catch (err) {
+        log('启用失败：' + err.message);
+      }
+    }
+
+    async function applySelectedMailboxStatus(payload) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要更新的邮箱');
+        return;
+      }
+      try {
+        const data = await api('/api/mailboxes/bulk-status', {
+          method: 'POST',
+          body: JSON.stringify({
+            ids,
+            ...payload,
+            scope: mailboxSelectionScope()
+          })
+        });
+        log(`批量改状态完成：更新 ${data.updated || 0}，失败 ${data.failed || 0}`);
+        (data.failures || []).forEach(item => {
+          log(`改状态失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+        await refresh();
+      } catch (err) {
+        log('批量改状态失败：' + err.message);
+        const data = err.data || {};
+        (data.failures || []).forEach(item => {
+          log(`改状态失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
+        });
+        await refresh().catch(refreshErr => log('批量改状态后刷新列表失败：' + refreshErr.message));
+      }
+    }
+
+    function setSelectedMailboxStatus(status) {
+      const select = $('mailboxSelectedStatus');
+      if (select) select.value = '';
+      status = String(status || '').trim();
+      if (!status) return;
+      const apiActive = status === 'disabled' ? false : true;
+      return applySelectedMailboxStatus({status, api_active: apiActive, note: '面板批量改状态'});
+    }
+
+    function enableSelectedMailboxes() {
+      return applySelectedMailboxStatus({status: 'available', api_active: true, note: '面板批量启用 API'});
+    }
+
+    function disableSelectedMailboxes() {
+      return applySelectedMailboxStatus({status: 'disabled', api_active: false, note: '面板批量停用 API'});
+    }
+
+    async function bindSelectedMailboxesToAccount(accountID) {
+      const select = $('mailboxSelectedBindAccount');
+      if (select) select.value = '';
+      accountID = String(accountID || '').trim();
+      if (!accountID) return;
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要绑定的邮箱');
+        return;
+      }
+      if (!confirm(`确认将 ${ids.length} 个选中邮箱绑定到选定 Apple 账号？`)) return;
+      log(`开始绑定选中邮箱：${ids.length} 个`);
+      for (const id of ids) {
+        try {
+          await api(`/api/mailboxes/${encodeURIComponent(id)}/bind`, {
+            method: 'POST',
+            body: JSON.stringify({account_id: accountID})
+          });
+          log('已绑定：' + id);
+        } catch (err) {
+          log('绑定失败：' + id + '：' + err.message);
+        }
+      }
+      await refresh();
+    }
+
+    async function syncSelectedMailboxes() {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要同步的邮箱');
+        return;
+      }
+      if (!confirm(`确认同步 ${ids.length} 个选中邮箱的邮件？`)) return;
+      log(`开始同步选中邮箱：${ids.length} 个`);
+      for (const id of ids) {
+        try {
+          await api(`/api/mailboxes/${encodeURIComponent(id)}/sync`, {method:'POST', body:'{}'});
+          log('已同步：' + id);
+        } catch (err) {
+          log('同步失败：' + id + '：' + err.message);
+        }
+      }
+      await refresh();
+    }
+
     async function deleteMailbox(id) {
       const row = lastMailboxes.find(x => x.id === id);
+      if (!confirm('确认删除这个 API 绑定？')) return;
       const deleteRemote = confirm('是否同时删除 iCloud 创建的远端隐私邮箱？点击“取消”只删除本地记录。');
-      if (!confirm(`确认删除这个 API 绑定？${deleteRemote ? '（同时删除远端）' : ''}`)) return;
+      const remoteStatus = mailboxRemoteDeleteStatusOf(id) || (row && row.remote_delete_status) || '';
+      const confirmUnknown = remoteStatus === 'unknown';
+      const confirmFailed = !deleteRemote && remoteStatus === 'failed';
+      if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
+      log(`正在删除${deleteRemote ? '（含远端）' : '本地记录'}：` + (row ? row.email : id));
       try {
-        const remoteStatus = mailboxRemoteDeleteStatusOf(id) || (row && row.remote_delete_status) || '';
-        const confirmUnknown = remoteStatus === 'unknown';
-        const confirmFailed = !deleteRemote && remoteStatus === 'failed';
-        if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
         await api(`/api/mailboxes/${encodeURIComponent(id)}?delete_remote=${deleteRemote ? '1' : '0'}&confirm_unknown=${confirmUnknown ? '1' : '0'}&confirm_failed=${confirmFailed ? '1' : '0'}`, {method:'DELETE'});
         log('已删除：' + (row ? row.email : id));
         selectedMailboxIDs.delete(id);
@@ -3797,6 +4014,56 @@
       renderMailboxes();
       const label = mode === 'email' ? '邮箱' : (mode === 'api' ? 'API' : '邮箱+API');
       log(`已复制${label}：${email}`);
+    }
+
+    async function selectedMailboxRows() {
+      const ids = new Set(selectedMailboxIDsList());
+      const fromPage = (lastMailboxes || []).filter(row => row && ids.has(String(row.id)));
+      if (fromPage.length === ids.size) return fromPage;
+      const rows = [];
+      const seen = new Set();
+      let page = 1;
+      while (true) {
+        const params = mailboxListQuery();
+        params.set('page', String(page));
+        params.set('page_size', '500');
+        const data = await api('/api/mailboxes?' + params.toString());
+        (data.mailboxes || []).forEach(row => {
+          const id = String(row && row.id || '');
+          if (!id || !ids.has(id) || seen.has(id)) return;
+          seen.add(id);
+          rows.push(row);
+        });
+        const totalPages = Math.max(1, Number(data.pagination && data.pagination.total_pages || 1));
+        if (page >= totalPages || seen.size === ids.size) break;
+        page += 1;
+      }
+      return rows;
+    }
+
+    async function copySelectedMailboxes(mode) {
+      const ids = selectedMailboxIDsList();
+      if (ids.length === 0) {
+        log('请先选择要复制的邮箱');
+        return;
+      }
+      try {
+        const rows = await selectedMailboxRows();
+        if (rows.length === 0) {
+          log('选中的邮箱已不在当前筛选结果中，请刷新后重试');
+          return;
+        }
+        const lines = rows.map(row => {
+          if (mode === 'email') return row.email || '';
+          const url = new URL(row.api_url || '', location.origin);
+          url.searchParams.set('wait_ms', '12000');
+          return url.toString();
+        }).filter(Boolean);
+        await writeClipboard(lines.join('\n'));
+        log(`已复制选中${mode === 'email' ? '邮箱' : 'API'}：${lines.length} 个`);
+      } catch (err) {
+        log('复制选中失败：' + err.message);
+      }
     }
 
     async function writeClipboard(text) {

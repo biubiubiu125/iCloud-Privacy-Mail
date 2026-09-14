@@ -9224,6 +9224,54 @@ func TestDeleteMailboxRouteKeepsLocalRecordWhenOldICloudRemoteDeleteFails(t *tes
 	}
 }
 
+func TestDeleteMailboxRemoteReturnsBusyWhenAccountOperationHeld(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	oldTimeout := mailboxAccountOperationAcquireTimeout
+	mailboxAccountOperationAcquireTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { mailboxAccountOperationAcquireTimeout = oldTimeout })
+	adminCookie, _ := registerTestUser(t, handler, "delete-busy", "admin123")
+	account, err := store.AddAccountForOwner("", "Busy delete", "busy-delete@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwnerWithRemote("", account.ID, ICloudRemoteMailbox{
+		AnonymousID: "busy-delete-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "busy-delete@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := handler.acquireCurrentMailboxAccountOperation(context.Background(), mailbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	done := make(chan struct{})
+	rr := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodDelete, "/api/mailboxes/"+mailbox.ID+"?delete_remote=1", nil)
+		req.AddCookie(adminCookie)
+		addClosureTestCSRF(req, adminCookie)
+		handler.ServeHTTP(rr, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("remote delete blocked while account operation held")
+	}
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("delete status = %d body=%s, want 409 mailbox_operation_in_progress", rr.Code, rr.Body.String())
+	}
+	if _, ok := store.FindMailboxByID(mailbox.ID); !ok {
+		t.Fatal("local mailbox was removed while account operation was busy")
+	}
+}
+
 func TestFailedOldICloudRemoteDeleteFailsClosed(t *testing.T) {
 	mailbox := Mailbox{
 		RemoteDeleteStatus: "failed",

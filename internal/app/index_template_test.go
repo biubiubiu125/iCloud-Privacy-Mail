@@ -537,6 +537,25 @@ func TestIndexTemplateGuardsAsyncFilteredMailboxSelection(t *testing.T) {
 	}
 }
 
+func TestIndexTemplateDeleteMailboxAbortsOnFirstCancel(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	block := scriptFunctionBlock(t, string(data), "async function deleteMailbox", "async function copyMailboxValue")
+	bindConfirm := strings.Index(block, "确认删除这个 API 绑定？")
+	remoteConfirm := strings.Index(block, "是否同时删除 iCloud")
+	if bindConfirm < 0 || remoteConfirm < 0 || bindConfirm > remoteConfirm {
+		t.Fatalf("deleteMailbox must confirm the API binding first so Cancel aborts: %s", block)
+	}
+	if !strings.Contains(block, "if (!confirm('确认删除这个 API 绑定？')) return;") {
+		t.Fatalf("deleteMailbox first confirm must abort on cancel: %s", block)
+	}
+	if !strings.Contains(block, "正在删除") {
+		t.Fatalf("deleteMailbox must log in-progress deletion: %s", block)
+	}
+}
+
 func TestIndexTemplateSingleMailboxDeleteLogsRemoteFailures(t *testing.T) {
 	data, err := webFS.ReadFile("templates/index.html")
 	if err != nil {
@@ -665,8 +684,14 @@ func TestIndexTemplateMailboxStatusActionsLogFailures(t *testing.T) {
 		{
 			name:        "disable",
 			startMarker: "async function disableMailbox",
-			endMarker:   "async function deleteMailbox",
+			endMarker:   "async function enableMailbox",
 			logMarker:   "log('停用失败：' + err.message);",
+		},
+		{
+			name:        "enable",
+			startMarker: "async function enableMailbox",
+			endMarker:   "async function applySelectedMailboxStatus",
+			logMarker:   "log('启用失败：' + err.message);",
 		},
 	} {
 		block := scriptFunctionBlock(t, html, tc.startMarker, tc.endMarker)
@@ -942,4 +967,109 @@ func scriptFunctionBlock(t *testing.T, html, startMarker, endMarker string) stri
 		t.Fatalf("template is missing %s after %s", endMarker, startMarker)
 	}
 	return html[start : start+end]
+}
+
+func TestIndexTemplateShowsMailboxPoolFiltersAndSelectionActions(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		`id="mailboxStatusFilter"`,
+		`<option value="unused">未使用</option>`,
+		`<option value="used">已使用</option>`,
+		`id="mailboxAPIFilter"`,
+		`id="mailboxRemoteFilter"`,
+		`id="mailboxSelectionBar"`,
+		`onclick="exportSelectedMailboxes('api')"`,
+		`onclick="exportSelectedMailboxes('email')"`,
+		`onclick="copySelectedMailboxes('email')"`,
+		`onclick="copySelectedMailboxes('api')"`,
+		`onclick="enableSelectedMailboxes()"`,
+		`onclick="disableSelectedMailboxes()"`,
+		`onclick="syncSelectedMailboxes()"`,
+		`onchange="setSelectedMailboxStatus(this.value)"`,
+		`onchange="bindSelectedMailboxesToAccount(this.value)"`,
+		`onclick="deleteSelectedMailboxes(false)"`,
+		`onclick="deleteSelectedMailboxes(true)"`,
+		`.mailbox-selection-bar {`,
+		`.mailbox-selection-bar.is-visible`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing mailbox pool marker %q", marker)
+		}
+	}
+	actionRow := scriptFunctionBlock(t, html, `<div class="mailbox-action-row">`, `<div class="pager">`)
+	for _, marker := range []string{
+		`onclick="exportSelectedMailboxes('api')"`,
+		`onclick="deleteSelectedMailboxes(false)"`,
+	} {
+		if strings.Contains(actionRow, marker) {
+			t.Errorf("always-visible action row still contains selected-only control %q", marker)
+		}
+	}
+	query := scriptFunctionBlock(t, html, "function mailboxListQuery()", "function mailboxSelectionScope()")
+	for _, marker := range []string{
+		`params.set('status', activeMailboxStatusFilter)`,
+		`params.set('api_active', activeMailboxAPIFilter)`,
+		`params.set('remote_delete', activeMailboxRemoteFilter)`,
+	} {
+		if !strings.Contains(query, marker) {
+			t.Errorf("mailboxListQuery missing filter %q in %s", marker, query)
+		}
+	}
+	scope := scriptFunctionBlock(t, html, "function mailboxSelectionScope()", "function invalidateMailboxSelection()")
+	for _, marker := range []string{
+		"scope.status = activeMailboxStatusFilter",
+		"scope.api_active = activeMailboxAPIFilter",
+		"scope.remote_delete = activeMailboxRemoteFilter",
+	} {
+		if !strings.Contains(scope, marker) {
+			t.Errorf("mailboxSelectionScope missing filter %q in %s", marker, scope)
+		}
+	}
+}
+
+func TestIndexTemplateTogglesEnableMailboxButton(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	row := scriptFunctionBlock(t, html, "function renderMailboxes()", "function mailboxAccountTitle")
+	for _, marker := range []string{
+		"row.api_active",
+		"disableMailbox(",
+		"enableMailbox(",
+		"停用 API",
+		"启用 API",
+	} {
+		if !strings.Contains(row, marker) {
+			t.Errorf("mailbox row missing enable/disable toggle marker %q", marker)
+		}
+	}
+	enable := scriptFunctionBlock(t, html, "async function enableMailbox", "async function deleteMailbox")
+	for _, marker := range []string{
+		"/enable",
+		"log('启用失败：' + err.message);",
+	} {
+		if !strings.Contains(enable, marker) {
+			t.Errorf("enableMailbox missing %q in %s", marker, enable)
+		}
+	}
+}
+
+func TestIndexTemplateSetMailboxStatusReenablesAPIWhenLeavingDisabled(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	block := scriptFunctionBlock(t, string(data), "async function setMailboxStatus", "async function disableMailbox")
+	if !strings.Contains(block, "const apiActive = status === 'disabled' ? false : true;") {
+		t.Fatalf("setMailboxStatus must restore api_active when leaving disabled, block=%s", block)
+	}
+	if !strings.Contains(block, "payload.api_active = apiActive;") {
+		t.Fatalf("setMailboxStatus must always send api_active, block=%s", block)
+	}
 }

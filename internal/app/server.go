@@ -37,6 +37,7 @@ var mailboxCodePollDebounce = 100 * time.Millisecond
 var mailboxCodeLocalPollInterval = 100 * time.Millisecond
 var mailboxCodeBatchSyncTimeout = 120 * time.Second
 var mailboxCodeMaxClientWait = 30 * time.Second
+var mailboxAccountOperationAcquireTimeout = 3 * time.Second
 var iCloudMailboxListAccountTimeout = 3 * time.Minute
 var mailWatcherPollInterval = 3 * time.Second
 var mailWatcherActiveTTL = 20 * time.Minute
@@ -638,9 +639,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/mailboxes", s.handleListMailboxes)
 	s.mux.HandleFunc("POST /api/mailboxes", s.handleCreateMailbox)
 	s.mux.HandleFunc("POST /api/mailboxes/bulk-delete", s.handleBulkDeleteMailboxes)
+	s.mux.HandleFunc("POST /api/mailboxes/bulk-status", s.handleBulkSetMailboxStatus)
 	s.mux.HandleFunc("POST /api/mailboxes/remote-clean", s.handleCleanRemoteMailboxes)
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/verify", s.handleVerifyMailbox)
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/disable", s.handleDisableMailbox)
+	s.mux.HandleFunc("POST /api/mailboxes/{id}/enable", s.handleEnableMailbox)
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/status", s.handleSetMailboxStatus)
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/bind", s.handleBindMailbox)
 	s.mux.HandleFunc("POST /api/mailboxes/{id}/sync", s.handleSyncMailbox)
@@ -1401,7 +1404,7 @@ func (s *Server) writeMailboxTextExport(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := validateMailboxExportedFilter(request.ExportedFilter); err != nil {
+	if err := validateMailboxExportFilters(request); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -1427,8 +1430,7 @@ func (s *Server) writeMailboxTextExport(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	mailboxes := filterMailboxesForExport(state.Mailboxes, accountID, selectedIDs)
-	mailboxes = filterMailboxesByAPIExportedState(mailboxes, request.ExportedFilter)
-	mailboxes = filterMailboxesBySearchKeyword(mailboxes, mailboxAccountMap(state.Accounts), request.Search)
+	mailboxes = applyMailboxExportRequestFilters(mailboxes, mailboxAccountMap(state.Accounts), request)
 	if request.IDsRequested && len(mailboxes) == 0 {
 		writeError(w, http.StatusNotFound, errCode("mailbox_not_found", "选择的邮箱不存在或无权限", false))
 		return
@@ -1460,8 +1462,7 @@ func (s *Server) writeMailboxTextExport(w http.ResponseWriter, r *http.Request, 
 		}
 		state = s.mailboxExportState(r, request.OwnerID)
 		currentMailboxes := filterMailboxesForExport(state.Mailboxes, accountID, selectedIDs)
-		currentMailboxes = filterMailboxesByAPIExportedState(currentMailboxes, request.ExportedFilter)
-		currentMailboxes = filterMailboxesBySearchKeyword(currentMailboxes, mailboxAccountMap(state.Accounts), request.Search)
+		currentMailboxes = applyMailboxExportRequestFilters(currentMailboxes, mailboxAccountMap(state.Accounts), request)
 		if request.IDsRequested {
 			if len(currentMailboxes) == 0 {
 				release()
@@ -1743,26 +1744,32 @@ func mailboxAccountOperationKeysEqual(left, right []Mailbox) bool {
 }
 
 type mailboxExportRequest struct {
-	Format         string
-	AccountID      string
-	OwnerID        string
-	ExportedFilter string
-	Search         string
-	IDs            map[string]struct{}
-	IDsRequested   bool
-	ExportedAt     time.Time
-	RollbackToken  string
+	Format             string
+	AccountID          string
+	OwnerID            string
+	ExportedFilter     string
+	Search             string
+	StatusFilter       string
+	APIActiveFilter    string
+	RemoteDeleteFilter string
+	IDs                map[string]struct{}
+	IDsRequested       bool
+	ExportedAt         time.Time
+	RollbackToken      string
 }
 
 func parseMailboxExportRequest(r *http.Request) (mailboxExportRequest, error) {
 	request := mailboxExportRequest{
-		Format:         strings.TrimSpace(r.URL.Query().Get("format")),
-		AccountID:      normalizeExportAccountID(firstNonEmpty(r.URL.Query().Get("account_id"), r.URL.Query().Get("account_key"))),
-		OwnerID:        strings.TrimSpace(r.URL.Query().Get("owner_id")),
-		ExportedFilter: strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("api_exported"), r.URL.Query().Get("exported"))),
-		Search:         strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("search"), r.URL.Query().Get("q"))),
-		IDs:            parseMailboxIDs(r.URL.Query()),
-		IDsRequested:   mailboxIDsRequested(r.URL.Query()),
+		Format:             strings.TrimSpace(r.URL.Query().Get("format")),
+		AccountID:          normalizeExportAccountID(firstNonEmpty(r.URL.Query().Get("account_id"), r.URL.Query().Get("account_key"))),
+		OwnerID:            strings.TrimSpace(r.URL.Query().Get("owner_id")),
+		ExportedFilter:     strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("api_exported"), r.URL.Query().Get("exported"))),
+		Search:             strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("search"), r.URL.Query().Get("q"))),
+		StatusFilter:       strings.TrimSpace(r.URL.Query().Get("status")),
+		APIActiveFilter:    strings.TrimSpace(r.URL.Query().Get("api_active")),
+		RemoteDeleteFilter: strings.TrimSpace(r.URL.Query().Get("remote_delete")),
+		IDs:                parseMailboxIDs(r.URL.Query()),
+		IDsRequested:       mailboxIDsRequested(r.URL.Query()),
 	}
 	if r.Method != http.MethodPost || r.Body == nil {
 		return request, nil
@@ -1781,6 +1788,9 @@ func parseMailboxExportRequest(r *http.Request) (mailboxExportRequest, error) {
 		MailboxIDs    json.RawMessage `json:"mailbox_ids"`
 		ExportedAt    string          `json:"exported_at"`
 		RollbackToken string          `json:"rollback_token"`
+		Status        string          `json:"status"`
+		APIActive     string          `json:"api_active"`
+		RemoteDelete  string          `json:"remote_delete"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
 	decoder.DisallowUnknownFields()
@@ -1809,6 +1819,15 @@ func parseMailboxExportRequest(r *http.Request) (mailboxExportRequest, error) {
 	}
 	if search := strings.TrimSpace(firstNonEmpty(payload.Search, payload.Q)); search != "" {
 		request.Search = search
+	}
+	if status := strings.TrimSpace(payload.Status); status != "" {
+		request.StatusFilter = status
+	}
+	if apiActive := strings.TrimSpace(payload.APIActive); apiActive != "" {
+		request.APIActiveFilter = apiActive
+	}
+	if remoteDelete := strings.TrimSpace(payload.RemoteDelete); remoteDelete != "" {
+		request.RemoteDeleteFilter = remoteDelete
 	}
 	request.RollbackToken = normalizeExportRollbackToken(payload.RollbackToken)
 	ids, idsPresent, err := parseMailboxIDsJSON(payload.IDs)
@@ -2030,6 +2049,83 @@ func validateMailboxExportedFilter(value string) error {
 	default:
 		return errCode("invalid_export_filter", "导出状态筛选只支持 all、exported 或 unexported", false)
 	}
+}
+
+func validateMailboxStatusFilter(value string) error {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all", "unused", StatusAvailable, StatusActive, StatusUsed, StatusFailed, StatusDisabled:
+		return nil
+	default:
+		return errCode("invalid_status_filter", "使用状态筛选只支持 all、unused、available、active、used、failed 或 disabled", false)
+	}
+}
+
+func validateMailboxAPIActiveFilter(value string) error {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all", "1", "true", "yes", "on", "enabled", "0", "false", "no", "off", "disabled":
+		return nil
+	default:
+		return errCode("invalid_api_active_filter", "API 状态筛选只支持 all、enabled 或 disabled", false)
+	}
+}
+
+func validateMailboxRemoteDeleteFilter(value string) error {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all", "unknown", "pending", "failed", "succeeded":
+		return nil
+	default:
+		return errCode("invalid_remote_delete_filter", "远端状态筛选只支持 all、unknown、pending、failed 或 succeeded", false)
+	}
+}
+
+func validateMailboxListFilters(values url.Values) error {
+	if err := validateMailboxExportedFilter(firstNonEmpty(values.Get("exported"), values.Get("api_exported"))); err != nil {
+		return err
+	}
+	if err := validateMailboxStatusFilter(values.Get("status")); err != nil {
+		return err
+	}
+	if err := validateMailboxAPIActiveFilter(values.Get("api_active")); err != nil {
+		return err
+	}
+	return validateMailboxRemoteDeleteFilter(values.Get("remote_delete"))
+}
+
+func validateMailboxExportFilters(request mailboxExportRequest) error {
+	if err := validateMailboxExportedFilter(request.ExportedFilter); err != nil {
+		return err
+	}
+	if err := validateMailboxStatusFilter(request.StatusFilter); err != nil {
+		return err
+	}
+	if err := validateMailboxAPIActiveFilter(request.APIActiveFilter); err != nil {
+		return err
+	}
+	return validateMailboxRemoteDeleteFilter(request.RemoteDeleteFilter)
+}
+
+func mailboxExportListValues(request mailboxExportRequest) url.Values {
+	values := url.Values{}
+	if search := strings.TrimSpace(request.Search); search != "" {
+		values.Set("search", search)
+	}
+	if exported := strings.TrimSpace(request.ExportedFilter); exported != "" {
+		values.Set("exported", exported)
+	}
+	if status := strings.TrimSpace(request.StatusFilter); status != "" {
+		values.Set("status", status)
+	}
+	if apiActive := strings.TrimSpace(request.APIActiveFilter); apiActive != "" {
+		values.Set("api_active", apiActive)
+	}
+	if remoteDelete := strings.TrimSpace(request.RemoteDeleteFilter); remoteDelete != "" {
+		values.Set("remote_delete", remoteDelete)
+	}
+	return values
+}
+
+func applyMailboxExportRequestFilters(mailboxes []Mailbox, accountsByID map[string]Account, request mailboxExportRequest) []Mailbox {
+	return filterMailboxesForList(mailboxes, accountsByID, mailboxExportListValues(request))
 }
 
 func filterMailboxesForExport(mailboxes []Mailbox, accountID string, selectedIDs map[string]struct{}) []Mailbox {
@@ -3679,8 +3775,7 @@ func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListMailboxes(w http.ResponseWriter, r *http.Request) {
-	exportedFilter := strings.TrimSpace(firstNonEmpty(r.URL.Query().Get("exported"), r.URL.Query().Get("api_exported")))
-	if err := validateMailboxExportedFilter(exportedFilter); err != nil {
+	if err := validateMailboxListFilters(r.URL.Query()); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -3770,9 +3865,56 @@ func filterMailboxesForList(mailboxes []Mailbox, accountsByID map[string]Account
 				continue
 			}
 		}
+		if !mailboxMatchesStatusFilter(mailbox, values.Get("status")) {
+			continue
+		}
+		if !mailboxMatchesAPIActiveFilter(mailbox, values.Get("api_active")) {
+			continue
+		}
+		if !mailboxMatchesRemoteDeleteFilter(mailbox, values.Get("remote_delete")) {
+			continue
+		}
 		out = append(out, mailbox)
 	}
 	return out
+}
+
+func mailboxMatchesStatusFilter(mailbox Mailbox, statusFilter string) bool {
+	switch strings.ToLower(strings.TrimSpace(statusFilter)) {
+	case "", "all":
+		return true
+	case "unused":
+		return mailbox.Status == StatusAvailable || mailbox.Status == StatusActive
+	case StatusAvailable, StatusActive, StatusUsed, StatusFailed, StatusDisabled:
+		return strings.EqualFold(mailbox.Status, statusFilter)
+	default:
+		return false
+	}
+}
+
+func mailboxMatchesAPIActiveFilter(mailbox Mailbox, value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "all":
+		return true
+	case "1", "true", "yes", "on", "enabled":
+		return mailbox.APIActive
+	case "0", "false", "no", "off", "disabled":
+		return !mailbox.APIActive
+	default:
+		return false
+	}
+}
+
+func mailboxMatchesRemoteDeleteFilter(mailbox Mailbox, value string) bool {
+	filter := strings.ToLower(strings.TrimSpace(value))
+	switch filter {
+	case "", "all":
+		return true
+	case "unknown", "pending", "failed", "succeeded":
+		return strings.EqualFold(strings.TrimSpace(mailbox.RemoteDeleteStatus), filter)
+	default:
+		return false
+	}
 }
 
 func mailboxListMatchesSearch(mailbox Mailbox, accountsByID map[string]Account, keyword string) bool {
@@ -3821,7 +3963,7 @@ func paginateMailboxes(mailboxes []Mailbox, page, pageSize int) []Mailbox {
 
 func mailboxListPagination(r *http.Request) (int, int, bool) {
 	values := r.URL.Query()
-	paged := values.Has("page") || values.Has("page_size") || values.Has("search") || values.Has("q") || values.Has("account_key") || values.Has("account_id") || values.Has("owner_id") || values.Has("exported") || values.Has("api_exported")
+	paged := values.Has("page") || values.Has("page_size") || values.Has("search") || values.Has("q") || values.Has("account_key") || values.Has("account_id") || values.Has("owner_id") || values.Has("exported") || values.Has("api_exported") || values.Has("status") || values.Has("api_active") || values.Has("remote_delete")
 	page := parseBoundedPositiveInt(values.Get("page"), 1, 1, 1_000_000)
 	pageSize := parseBoundedPositiveInt(values.Get("page_size"), mailboxListDefaultPageSize, 1, mailboxListMaxPageSize)
 	return page, pageSize, paged
@@ -3986,6 +4128,29 @@ func (s *Server) handleDisableMailbox(w http.ResponseWriter, r *http.Request) {
 		nil,
 		StatusDisabled,
 		"API 已停用",
+	)
+	if err != nil {
+		writeError(w, mailboxMutationHTTPStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "mailbox": s.publicMailbox(r, mailbox)})
+}
+
+func (s *Server) handleEnableMailbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.canAccessMailboxID(r, id) {
+		writeError(w, http.StatusNotFound, errCode("mailbox_not_found", "邮箱不存在", false))
+		return
+	}
+	active := true
+	mailbox, err := s.setMailboxStatusForRequestWithAccess(
+		r.Context(),
+		id,
+		func(current Mailbox) bool { return s.canAccessMailbox(r, current) },
+		&active,
+		nil,
+		StatusAvailable,
+		"API 已启用",
 	)
 	if err != nil {
 		writeError(w, mailboxMutationHTTPStatus(err), err)
@@ -4476,10 +4641,13 @@ type mailboxCleanupFailure struct {
 }
 
 type mailboxSelectionScope struct {
-	OwnerID    string `json:"owner_id,omitempty"`
-	AccountKey string `json:"account_key,omitempty"`
-	Search     string `json:"search,omitempty"`
-	Exported   string `json:"exported,omitempty"`
+	OwnerID      string `json:"owner_id,omitempty"`
+	AccountKey   string `json:"account_key,omitempty"`
+	Search       string `json:"search,omitempty"`
+	Exported     string `json:"exported,omitempty"`
+	Status       string `json:"status,omitempty"`
+	APIActive    string `json:"api_active,omitempty"`
+	RemoteDelete string `json:"remote_delete,omitempty"`
 }
 
 func (s *Server) handleBulkDeleteMailboxes(w http.ResponseWriter, r *http.Request) {
@@ -4513,7 +4681,7 @@ func (s *Server) handleBulkDeleteMailboxes(w http.ResponseWriter, r *http.Reques
 	}
 	var scopedIDs map[string]struct{}
 	if payload.Scope != nil {
-		if err := validateMailboxExportedFilter(payload.Scope.Exported); err != nil {
+		if err := validateMailboxSelectionScope(*payload.Scope); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -4591,6 +4759,153 @@ func (s *Server) handleBulkDeleteMailboxes(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *Server) handleBulkSetMailboxStatus(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		IDs       []string               `json:"ids"`
+		Status    string                 `json:"status"`
+		Note      string                 `json:"note"`
+		APIActive *bool                  `json:"api_active"`
+		Scope     *mailboxSelectionScope `json:"scope,omitempty"`
+	}
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	seen := make(map[string]struct{}, len(payload.IDs))
+	ids := make([]string, 0, len(payload.IDs))
+	for _, id := range payload.IDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, errCode("mailbox_ids_missing", "请选择要更新的邮箱", false))
+		return
+	}
+	status := strings.ToLower(strings.TrimSpace(payload.Status))
+	if status != "" && !validMailboxStatus(status) {
+		writeError(w, http.StatusBadRequest, errCode("invalid_status", "状态只能是 available、used、failed、active、disabled", false))
+		return
+	}
+	if status == "" && payload.APIActive == nil {
+		writeError(w, http.StatusBadRequest, errCode("invalid_status", "请指定要更新的状态或 API 开关", false))
+		return
+	}
+	var scopedIDs map[string]struct{}
+	if payload.Scope != nil {
+		if err := validateMailboxSelectionScope(*payload.Scope); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		scopedIDs = s.mailboxIDsForSelectionScope(r, *payload.Scope)
+	}
+	note := strings.TrimSpace(payload.Note)
+	if note == "" {
+		note = "面板批量改状态"
+	}
+	updated := 0
+	failures := make([]mailboxDeleteFailure, 0)
+	startedAt := time.Now()
+	for index, id := range ids {
+		if err := r.Context().Err(); err != nil {
+			for _, remaining := range ids[index:] {
+				failures = append(failures, mailboxDeleteFailure{ID: remaining, Message: "请求已取消或超时，请重试剩余邮箱"})
+			}
+			break
+		}
+		if time.Since(startedAt) > bulkDeleteTimeBudget {
+			for _, remaining := range ids[index:] {
+				failures = append(failures, mailboxDeleteFailure{ID: remaining, Message: "批量改状态已达时间上限，请重试剩余邮箱"})
+			}
+			break
+		}
+		mailbox, ok := s.store.FindMailboxByID(id)
+		if !ok || !s.canAccessMailbox(r, mailbox) {
+			failures = append(failures, mailboxDeleteFailure{ID: id, Message: "邮箱不存在或无权限"})
+			continue
+		}
+		if scopedIDs != nil {
+			if _, ok := scopedIDs[id]; !ok {
+				failures = append(failures, mailboxDeleteFailure{
+					ID:      id,
+					Email:   mailbox.Email,
+					Message: "邮箱不再符合当前筛选条件，请刷新后重试",
+				})
+				continue
+			}
+		}
+		if _, err := s.setMailboxStatusForRequestWithAccess(
+			r.Context(),
+			id,
+			func(current Mailbox) bool { return s.canAccessMailbox(r, current) },
+			payload.APIActive,
+			nil,
+			status,
+			note,
+		); err != nil {
+			failures = append(failures, mailboxDeleteFailure{ID: id, Email: mailbox.Email, Message: publicErrorMessage(err)})
+			continue
+		}
+		updated++
+	}
+	httpStatus := http.StatusOK
+	success := true
+	message := ""
+	if len(failures) > 0 {
+		httpStatus = http.StatusMultiStatus
+		success = false
+		if updated == 0 {
+			message = "批量改状态全部失败，请查看 failures 中的逐条原因"
+		} else {
+			message = "批量改状态部分成功，请查看 failures 中的逐条原因"
+		}
+	}
+	writeJSON(w, httpStatus, map[string]any{
+		"success":  success,
+		"partial":  updated > 0 && len(failures) > 0,
+		"message":  message,
+		"updated":  updated,
+		"failed":   len(failures),
+		"failures": failures,
+	})
+}
+
+func validateMailboxSelectionScope(scope mailboxSelectionScope) error {
+	return validateMailboxListFilters(scope.listValues())
+}
+
+func (scope mailboxSelectionScope) listValues() url.Values {
+	values := make(url.Values)
+	if ownerID := strings.TrimSpace(scope.OwnerID); ownerID != "" {
+		values.Set("owner_id", ownerID)
+	}
+	if accountKey := strings.TrimSpace(scope.AccountKey); accountKey != "" {
+		values.Set("account_key", accountKey)
+	}
+	if search := strings.TrimSpace(scope.Search); search != "" {
+		values.Set("search", search)
+	}
+	if exported := strings.TrimSpace(scope.Exported); exported != "" {
+		values.Set("exported", exported)
+	}
+	if status := strings.TrimSpace(scope.Status); status != "" {
+		values.Set("status", status)
+	}
+	if apiActive := strings.TrimSpace(scope.APIActive); apiActive != "" {
+		values.Set("api_active", apiActive)
+	}
+	if remoteDelete := strings.TrimSpace(scope.RemoteDelete); remoteDelete != "" {
+		values.Set("remote_delete", remoteDelete)
+	}
+	return values
+}
+
 func (s *Server) mailboxIDsForSelectionScope(r *http.Request, scope mailboxSelectionScope) map[string]struct{} {
 	ownerID := strings.TrimSpace(scope.OwnerID)
 	state := s.scopedState(r)
@@ -4609,18 +4924,11 @@ func (s *Server) mailboxIDsForSelectionScope(r *http.Request, scope mailboxSelec
 			state = s.store.SnapshotForOwner(ownerID)
 		}
 	}
-	values := make(url.Values)
+	values := scope.listValues()
 	if ownerID != "" {
 		values.Set("owner_id", ownerID)
-	}
-	if accountKey := strings.TrimSpace(scope.AccountKey); accountKey != "" {
-		values.Set("account_key", accountKey)
-	}
-	if search := strings.TrimSpace(scope.Search); search != "" {
-		values.Set("search", search)
-	}
-	if exported := strings.TrimSpace(scope.Exported); exported != "" {
-		values.Set("exported", exported)
+	} else {
+		values.Del("owner_id")
 	}
 	base := filterMailboxesByOwner(
 		state.Mailboxes,
@@ -4698,28 +5006,40 @@ func (s *Server) deleteMailboxForRequestWithAccess(
 			remoteDeleteAcquired    bool
 			err                     error
 		)
+		acquireCtx := ctx
+		cancelAcquire := func() {}
 		if deleteRemote {
-			mailbox, releaseAccountOperation, err = s.acquireCurrentMailboxAccountOperation(ctx, mailboxID)
+			timeout := mailboxAccountOperationAcquireTimeout
+			if timeout <= 0 {
+				timeout = 3 * time.Second
+			}
+			acquireCtx, cancelAcquire = context.WithTimeout(ctx, timeout)
+		}
+		if deleteRemote {
+			mailbox, releaseAccountOperation, err = s.acquireCurrentMailboxAccountOperation(acquireCtx, mailboxID)
 			accountAcquired = err == nil
 		} else {
 			mailbox, releaseAccountOperation, accountAcquired, err = s.tryAcquireCurrentMailboxAccountOperation(mailboxID)
 		}
 		if err != nil {
-			return err
+			cancelAcquire()
+			return mailboxAccountOperationBusyError(err)
 		}
 		if !accountAcquired {
+			cancelAcquire()
 			return errCode("mailbox_operation_in_progress", "该邮箱正在执行同步或远端删除操作，请稍后重试", true)
 		}
 
 		if deleteRemote {
-			releaseRemoteDelete, err = s.acquireMailboxRemoteDeleteSlot(ctx, mailboxID)
+			releaseRemoteDelete, err = s.acquireMailboxRemoteDeleteSlot(acquireCtx, mailboxID)
 			remoteDeleteAcquired = err == nil
 		} else {
 			releaseRemoteDelete, remoteDeleteAcquired, err = s.tryAcquireMailboxRemoteDeleteSlot(mailboxID)
 		}
+		cancelAcquire()
 		if err != nil {
 			releaseAccountOperation()
-			return err
+			return mailboxAccountOperationBusyError(err)
 		}
 		if !remoteDeleteAcquired {
 			releaseAccountOperation()
@@ -4794,6 +5114,16 @@ func (s *Server) deleteMailboxForRequestWithAccess(
 		return err
 	}
 	return errCode("mailbox_operation_in_progress", "该邮箱正在切换 Apple 账号归属，请稍后重试", true)
+}
+
+func mailboxAccountOperationBusyError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return errCode("mailbox_operation_in_progress", "该邮箱账号正在执行同步、登录、创建或删除操作，请稍后重试", true)
+	}
+	return err
 }
 
 func mailboxDeleteHTTPStatus(err error, deleteRemote bool) int {
@@ -5323,7 +5653,10 @@ func (s *Server) writeMailboxCode(w http.ResponseWriter, r *http.Request, mailbo
 		return
 	}
 	mailbox = current
-	s.markMailWatcherActive(mailbox.ID)
+	documentNavigation := mailboxCodeRequestIsDocumentNavigation(r)
+	if !documentNavigation {
+		s.markMailWatcherActive(mailbox.ID)
+	}
 	after, err := parseAfter(r.URL.Query().Get("after"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -5339,7 +5672,7 @@ func (s *Server) writeMailboxCode(w http.ResponseWriter, r *http.Request, mailbo
 	now := time.Now()
 	codeAfter := mailboxCodeAfter(after, now)
 	allowStale := truthy(r.URL.Query().Get("allow_stale"))
-	cacheOnly := truthy(r.URL.Query().Get("cache"))
+	cacheOnly := truthy(r.URL.Query().Get("cache")) || documentNavigation
 	peekOnly := truthy(r.URL.Query().Get("peek")) || truthy(r.URL.Query().Get("preview"))
 	skipMessageID := strings.TrimSpace(mailbox.LastCodeMessageID)
 	if peekOnly {
@@ -5523,6 +5856,15 @@ func truthy(value string) bool {
 	default:
 		return false
 	}
+}
+
+func mailboxCodeRequestIsDocumentNavigation(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Mode")))
+	dest := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest")))
+	return mode == "navigate" || dest == "document"
 }
 
 func (s *Server) mailboxCodeWaitDuration(r *http.Request) time.Duration {

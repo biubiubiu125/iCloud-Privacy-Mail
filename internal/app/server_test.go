@@ -7073,6 +7073,75 @@ func TestMailboxCodeQueryWaitMSWaitsForSyncResult(t *testing.T) {
 	}
 }
 
+func TestPublicMailboxCodeDocumentNavigationSkipsWaitAndSync(t *testing.T) {
+	oldInterval := mailboxMailSyncMinInterval
+	mailboxMailSyncMinInterval = 0
+	t.Cleanup(func() { mailboxMailSyncMinInterval = oldInterval })
+	oldDebounce := mailboxCodePollDebounce
+	mailboxCodePollDebounce = 0
+	t.Cleanup(func() { mailboxCodePollDebounce = oldDebounce })
+
+	store := newTestStore(t)
+	ownerID := "owner-code-navigate"
+	if err := store.SaveICloudSessionForOwner(ownerID, testIMAPSession(ownerID, "", "receiver-navigate@icloud.com")); err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwner(ownerID, "", "UPI-1", "navigate@icloud.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewServer(Config{PublicFastSyncWaitMS: 20, PublicSyncMinIntervalMS: 1}, store, discardLogger())
+	server := handler.(*Server)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var startedOnce sync.Once
+	server.syncCodeMailboxBatch = func(ctx context.Context, state LoginState, mailboxes []Mailbox, after time.Time, keyword string, maxMessages int) (map[string][]ICloudSyncedMessage, error) {
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return map[string][]ICloudSyncedMessage{}, nil
+	}
+
+	start := time.Now()
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/mailboxes/"+url.PathEscape(mailbox.Email)+"/code?key="+mailbox.APIToken+"&wait_ms=5000", nil)
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	handler.ServeHTTP(rr, req)
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("browser document GET took %v, want cache-only no_code without IMAP wait", elapsed)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("code request = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Success || body.Code != "no_code" {
+		t.Fatalf("document navigation response = %+v, want no_code", body)
+	}
+	select {
+	case <-started:
+		t.Fatal("browser document GET must not start IMAP sync")
+	case <-time.After(80 * time.Millisecond):
+	}
+}
+
 func TestMailboxCodeQueryReturnsCodeInsertedDuringWaitTimeout(t *testing.T) {
 	oldInterval := mailboxMailSyncMinInterval
 	mailboxMailSyncMinInterval = 0
