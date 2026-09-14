@@ -4997,53 +4997,25 @@ func (s *Server) deleteMailboxForRequestWithAccess(
 	canAccess func(Mailbox) bool,
 	deleteRemote, confirmUnknown, confirmFailed bool,
 ) error {
+	if !deleteRemote {
+		return s.deleteLocalMailboxForRequestWithAccess(ctx, mailboxID, canAccess, confirmUnknown, confirmFailed)
+	}
 	for attempt := 0; attempt < 4; attempt++ {
-		var (
-			mailbox                 Mailbox
-			releaseAccountOperation func()
-			accountAcquired         bool
-			releaseRemoteDelete     func()
-			remoteDeleteAcquired    bool
-			err                     error
-		)
-		acquireCtx := ctx
-		cancelAcquire := func() {}
-		if deleteRemote {
-			timeout := mailboxAccountOperationAcquireTimeout
-			if timeout <= 0 {
-				timeout = 3 * time.Second
-			}
-			acquireCtx, cancelAcquire = context.WithTimeout(ctx, timeout)
+		timeout := mailboxAccountOperationAcquireTimeout
+		if timeout <= 0 {
+			timeout = 3 * time.Second
 		}
-		if deleteRemote {
-			mailbox, releaseAccountOperation, err = s.acquireCurrentMailboxAccountOperation(acquireCtx, mailboxID)
-			accountAcquired = err == nil
-		} else {
-			mailbox, releaseAccountOperation, accountAcquired, err = s.tryAcquireCurrentMailboxAccountOperation(mailboxID)
-		}
+		acquireCtx, cancelAcquire := context.WithTimeout(ctx, timeout)
+		mailbox, releaseAccountOperation, err := s.acquireCurrentMailboxAccountOperation(acquireCtx, mailboxID)
 		if err != nil {
 			cancelAcquire()
 			return mailboxAccountOperationBusyError(err)
 		}
-		if !accountAcquired {
-			cancelAcquire()
-			return errCode("mailbox_operation_in_progress", "该邮箱正在执行同步或远端删除操作，请稍后重试", true)
-		}
-
-		if deleteRemote {
-			releaseRemoteDelete, err = s.acquireMailboxRemoteDeleteSlot(acquireCtx, mailboxID)
-			remoteDeleteAcquired = err == nil
-		} else {
-			releaseRemoteDelete, remoteDeleteAcquired, err = s.tryAcquireMailboxRemoteDeleteSlot(mailboxID)
-		}
+		releaseRemoteDelete, err := s.acquireMailboxRemoteDeleteSlot(acquireCtx, mailboxID)
 		cancelAcquire()
 		if err != nil {
 			releaseAccountOperation()
 			return mailboxAccountOperationBusyError(err)
-		}
-		if !remoteDeleteAcquired {
-			releaseAccountOperation()
-			return errCode("mailbox_operation_in_progress", "该邮箱正在执行远端删除操作，请稍后重试", true)
 		}
 
 		current, ok := s.store.FindMailboxByID(mailboxID)
@@ -5069,43 +5041,22 @@ func (s *Server) deleteMailboxForRequestWithAccess(
 			releaseAccountOperation()
 			return err
 		}
-		if deleteRemote && !strings.EqualFold(strings.TrimSpace(mailbox.RemoteDeleteStatus), "succeeded") {
+		if !strings.EqualFold(strings.TrimSpace(mailbox.RemoteDeleteStatus), "succeeded") {
 			if err := s.validateRemoteMailboxDelete(mailbox); err != nil {
 				releaseRemoteDelete()
 				releaseAccountOperation()
 				return err
 			}
 		}
-		if deleteRemote {
-			if err := s.deleteRemoteMailboxLocked(ctx, mailbox, confirmUnknown); err != nil {
-				if isRemoteDeleteCompletedWarning(err) {
-					if s.logger != nil {
-						s.logger.Warn("remote mailbox delete completed with session persistence warning", "mailbox_id", mailbox.ID, "err", err)
-					}
-				} else {
-					releaseRemoteDelete()
-					releaseAccountOperation()
-					return err
+		if err := s.deleteRemoteMailboxLocked(ctx, mailbox, confirmUnknown); err != nil {
+			if isRemoteDeleteCompletedWarning(err) {
+				if s.logger != nil {
+					s.logger.Warn("remote mailbox delete completed with session persistence warning", "mailbox_id", mailbox.ID, "err", err)
 				}
-			}
-		} else {
-			switch strings.ToLower(strings.TrimSpace(mailbox.RemoteDeleteStatus)) {
-			case "unknown":
-				if !confirmUnknown {
-					releaseRemoteDelete()
-					releaseAccountOperation()
-					return errCode("remote_delete_unknown", "上次远端删除在进程退出前未确认结果，请先核对 iCloud 远端状态后再清理本地记录", true)
-				}
-			case "pending":
+			} else {
 				releaseRemoteDelete()
 				releaseAccountOperation()
-				return errCode("remote_delete_in_progress", "该邮箱已有远端删除操作进行中，请稍后重试", true)
-			case "failed":
-				if !confirmFailed {
-					releaseRemoteDelete()
-					releaseAccountOperation()
-					return errCode("remote_delete_failed", "上次远端删除失败，请先重试远端删除，或确认已核对 iCloud 后再清理本地记录", true)
-				}
+				return err
 			}
 		}
 		err = s.store.DeleteMailbox(mailboxID)
@@ -5114,6 +5065,56 @@ func (s *Server) deleteMailboxForRequestWithAccess(
 		return err
 	}
 	return errCode("mailbox_operation_in_progress", "该邮箱正在切换 Apple 账号归属，请稍后重试", true)
+}
+
+func (s *Server) deleteLocalMailboxForRequestWithAccess(
+	ctx context.Context,
+	mailboxID string,
+	canAccess func(Mailbox) bool,
+	confirmUnknown, confirmFailed bool,
+) error {
+	mailbox, ok := s.store.FindMailboxByID(mailboxID)
+	if !ok {
+		return errCode("mailbox_not_found", "邮箱不存在", false)
+	}
+	if canAccess != nil && !canAccess(mailbox) {
+		return errCode("mailbox_not_found", "邮箱不存在", false)
+	}
+	timeout := mailboxAccountOperationAcquireTimeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	acquireCtx, cancelAcquire := context.WithTimeout(ctx, timeout)
+	defer cancelAcquire()
+	releaseRemoteDelete, err := s.acquireMailboxRemoteDeleteSlot(acquireCtx, mailboxID)
+	if err != nil {
+		return mailboxAccountOperationBusyError(err)
+	}
+	defer releaseRemoteDelete()
+
+	current, ok := s.store.FindMailboxByID(mailboxID)
+	if !ok {
+		return errCode("mailbox_not_found", "邮箱不存在", false)
+	}
+	if canAccess != nil && !canAccess(current) {
+		return errCode("mailbox_not_found", "邮箱不存在", false)
+	}
+	if err := s.ensureOwnerNotDeleting(current.OwnerID); err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(current.RemoteDeleteStatus)) {
+	case "unknown":
+		if !confirmUnknown {
+			return errCode("remote_delete_unknown", "上次远端删除在进程退出前未确认结果，请先核对 iCloud 远端状态后再清理本地记录", true)
+		}
+	case "pending":
+		return errCode("remote_delete_in_progress", "该邮箱已有远端删除操作进行中，请稍后重试", true)
+	case "failed":
+		if !confirmFailed {
+			return errCode("remote_delete_failed", "上次远端删除失败，请先重试远端删除，或确认已核对 iCloud 后再清理本地记录", true)
+		}
+	}
+	return s.store.DeleteMailbox(mailboxID)
 }
 
 func mailboxAccountOperationBusyError(err error) error {

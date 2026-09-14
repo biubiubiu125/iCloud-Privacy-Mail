@@ -548,11 +548,67 @@ func TestIndexTemplateDeleteMailboxAbortsOnFirstCancel(t *testing.T) {
 	if bindConfirm < 0 || remoteConfirm < 0 || bindConfirm > remoteConfirm {
 		t.Fatalf("deleteMailbox must confirm the API binding first so Cancel aborts: %s", block)
 	}
-	if !strings.Contains(block, "if (!confirm('确认删除这个 API 绑定？')) return;") {
+	if strings.Contains(block, "if (!confirm('确认删除这个 API 绑定？')) return;") {
+		t.Fatalf("deleteMailbox first confirm cancel must show 已取消删除 instead of a silent return: %s", block)
+	}
+	cancelAt := strings.Index(block, "if (!confirm('确认删除这个 API 绑定？'))")
+	if cancelAt < 0 {
 		t.Fatalf("deleteMailbox first confirm must abort on cancel: %s", block)
+	}
+	cancelSnippet := block[cancelAt:]
+	if remoteAt := strings.Index(cancelSnippet, "是否同时删除 iCloud"); remoteAt > 0 {
+		cancelSnippet = cancelSnippet[:remoteAt]
+	}
+	if !strings.Contains(cancelSnippet, "已取消删除") || !strings.Contains(cancelSnippet, "return") {
+		t.Fatalf("deleteMailbox first confirm cancel must show 已取消删除 and return: %s", cancelSnippet)
 	}
 	if !strings.Contains(block, "正在删除") {
 		t.Fatalf("deleteMailbox must log in-progress deletion: %s", block)
+	}
+}
+
+func TestIndexTemplateShowsMailboxDeleteActionStatus(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		`id="mailboxActionStatus"`,
+		"function setMailboxActionStatus",
+		"let deletingMailboxIDs",
+		"let mailboxBulkDeleting",
+		"删除中",
+		"已取消删除",
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing mailbox delete status marker %q", marker)
+		}
+	}
+	deleteBlock := scriptFunctionBlock(t, html, "async function deleteMailbox", "async function copyMailboxValue")
+	for _, marker := range []string{
+		"setMailboxActionStatus(",
+		"deletingMailboxIDs.add(",
+		"deletingMailboxIDs.delete(",
+		"renderMailboxes()",
+	} {
+		if !strings.Contains(deleteBlock, marker) {
+			t.Errorf("deleteMailbox missing visible progress marker %q in %s", marker, deleteBlock)
+		}
+	}
+	bulkBlock := scriptFunctionBlock(t, html, "async function deleteSelectedMailboxes", "async function cleanAllRemoteCodes")
+	for _, marker := range []string{
+		"setMailboxActionStatus(",
+		"mailboxBulkDeleting = true",
+		"mailboxBulkDeleting = false",
+	} {
+		if !strings.Contains(bulkBlock, marker) {
+			t.Errorf("deleteSelectedMailboxes missing visible progress marker %q in %s", marker, bulkBlock)
+		}
+	}
+	row := scriptFunctionBlock(t, html, "function renderMailboxes()", "function mailboxAccountTitle")
+	if !strings.Contains(row, "deletingMailboxIDs") || !strings.Contains(row, "删除中") {
+		t.Fatalf("mailbox row must disable 删除 API and show 删除中 while a delete is in flight: %s", row)
 	}
 }
 

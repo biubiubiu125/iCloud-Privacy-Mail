@@ -3628,6 +3628,9 @@ func TestRemoteDeleteDoesNotTrustRemoteMissingMarkerAsProviderConfirmation(t *te
 func TestLocalMailboxDeleteCannotBypassActiveRemoteDelete(t *testing.T) {
 	store := newTestStore(t)
 	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	oldTimeout := mailboxAccountOperationAcquireTimeout
+	mailboxAccountOperationAcquireTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { mailboxAccountOperationAcquireTimeout = oldTimeout })
 	adminCookie, admin := registerTestUser(t, handler, "delete-lock-admin", "admin123")
 	mailbox, err := store.AddMailboxForOwnerWithRemote(admin.ID, "account-delete-lock", ICloudRemoteMailbox{
 		AnonymousID: "delete-lock-remote",

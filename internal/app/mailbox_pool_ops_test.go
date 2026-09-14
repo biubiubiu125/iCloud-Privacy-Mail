@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -398,6 +399,90 @@ func TestBulkStatusCannotResurrectRemoteDeletedMailbox(t *testing.T) {
 	}
 	if current != expected {
 		t.Fatalf("remote-deleted mailbox changed: got=%+v want=%+v", current, expected)
+	}
+}
+
+func TestDeleteMailboxLocalSucceedsWhenAccountOperationHeld(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	adminCookie, _ := registerTestUser(t, handler, "local-delete-busy-account", "admin123")
+	account, err := store.AddAccountForOwner("", "Busy account local delete", "busy-local-delete@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwnerWithRemote("", account.ID, ICloudRemoteMailbox{
+		AnonymousID: "busy-local-delete-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "busy-local-delete@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := handler.acquireCurrentMailboxAccountOperation(context.Background(), mailbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/mailboxes/"+mailbox.ID, nil)
+	req.AddCookie(adminCookie)
+	addClosureTestCSRF(req, adminCookie)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("local delete status = %d body=%s, want 200 while account operation held", rr.Code, rr.Body.String())
+	}
+	if _, ok := store.FindMailboxByID(mailbox.ID); ok {
+		t.Fatal("local mailbox still present after local-only delete while account operation held")
+	}
+}
+
+func TestDeleteMailboxLocalReturnsBusyWhenRemoteDeleteHeld(t *testing.T) {
+	store := newTestStore(t)
+	handler := NewServer(Config{}, store, discardLogger()).(*Server)
+	oldTimeout := mailboxAccountOperationAcquireTimeout
+	mailboxAccountOperationAcquireTimeout = 40 * time.Millisecond
+	t.Cleanup(func() { mailboxAccountOperationAcquireTimeout = oldTimeout })
+	adminCookie, _ := registerTestUser(t, handler, "local-delete-busy-remote", "admin123")
+	account, err := store.AddAccountForOwner("", "Busy remote local delete", "busy-remote-local@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailbox, err := store.AddMailboxForOwnerWithRemote("", account.ID, ICloudRemoteMailbox{
+		AnonymousID: "busy-remote-local-id",
+		Origin:      "ICLOUD_WEB",
+		Email:       "busy-remote-local@icloud.com",
+		IsActive:    true,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := handler.acquireMailboxRemoteDeleteSlot(context.Background(), mailbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	done := make(chan struct{})
+	rr := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		req := httptest.NewRequest(http.MethodDelete, "/api/mailboxes/"+mailbox.ID, nil)
+		req.AddCookie(adminCookie)
+		addClosureTestCSRF(req, adminCookie)
+		handler.ServeHTTP(rr, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("local delete blocked while remote delete slot held")
+	}
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("local delete status = %d body=%s, want 409 mailbox_operation_in_progress", rr.Code, rr.Body.String())
+	}
+	if _, ok := store.FindMailboxByID(mailbox.ID); !ok {
+		t.Fatal("local mailbox was removed while remote delete slot was busy")
 	}
 }
 

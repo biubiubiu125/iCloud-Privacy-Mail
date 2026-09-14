@@ -550,6 +550,16 @@
     .mailbox-selection-bar { grid-column: 1 / -1; display: none; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: flex-start; min-width: 0; }
     .mailbox-selection-bar.is-visible { display: flex; }
     .mailbox-selection-bar select { min-width: 140px; padding: 8px 10px; }
+    .mailbox-action-status {
+      margin: 0 18px 4px;
+      min-height: 1.4em;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.5;
+    }
+    .mailbox-action-status.is-error { color: var(--bad); }
+    .mailbox-action-status.is-ok { color: var(--ok); }
     .pager { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; justify-content: flex-end; color: var(--muted); font-size: 13px; }
     .pager button { padding: 8px 11px; border-radius: 8px; }
     #mailboxPageInfo { white-space: nowrap; }
@@ -1313,6 +1323,7 @@
             <h2>隐私邮箱池</h2>
             <p>复制 API、取验证码、同步邮件和修改状态。</p>
           </div>
+          <p id="mailboxActionStatus" class="mailbox-action-status" role="status"></p>
           <div class="toolbar list-toolbar">
             <label class="search-field">全局搜索邮箱
               <input id="mailboxSearch" placeholder="输入完整或部分邮箱，跨全部页搜索" oninput="setMailboxSearch()">
@@ -1391,8 +1402,8 @@
                 <option value="">绑定到账号</option>
               </select>
               <button onclick="syncSelectedMailboxes()">同步选中邮件</button>
-              <button class="danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
-              <button class="danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
+              <button id="mailboxDeleteSelectedButton" class="danger" onclick="deleteSelectedMailboxes(false)">删除选中</button>
+              <button id="mailboxDeleteSelectedRemoteButton" class="danger" onclick="deleteSelectedMailboxes(true)">删选中并删远端</button>
             </div>
           </div>
           <div id="mailboxAccountTabs" class="account-tabs"></div>
@@ -1473,6 +1484,8 @@
     let activeMailboxRemoteFilter = 'all';
     let mailboxSearchTimer = null;
     let selectedMailboxIDs = new Set();
+    let deletingMailboxIDs = new Set();
+    let mailboxBulkDeleting = false;
     const mailboxRemoteDeleteStatus = new Map();
     let mailboxLoadRequestSeq = 0;
     let mailboxSelectionGeneration = 0;
@@ -1787,6 +1800,13 @@
       const current = runtimeLogText === '等待操作...' ? '' : runtimeLogText;
       runtimeLogText = new Date().toLocaleTimeString() + ' ' + text + '\n' + current;
       renderGlobalLogs();
+    }
+
+    function setMailboxActionStatus(text, kind) {
+      const el = $('mailboxActionStatus');
+      if (!el) return;
+      el.textContent = text || '';
+      el.className = 'mailbox-action-status' + (kind === 'error' ? ' is-error' : kind === 'ok' ? ' is-ok' : '');
     }
 
     function setCreateLog(text) {
@@ -3076,6 +3096,8 @@
       if (selectionBar) {
         selectionBar.classList.toggle('is-visible', mailboxSelectedCount() > 0);
       }
+      if ($('mailboxDeleteSelectedButton')) $('mailboxDeleteSelectedButton').disabled = mailboxBulkDeleting;
+      if ($('mailboxDeleteSelectedRemoteButton')) $('mailboxDeleteSelectedRemoteButton').disabled = mailboxBulkDeleting;
       renderMailboxSelectionBindOptions();
       if (rows.length === 0) {
         $('mailboxes').innerHTML = '<tr><td colspan="7" class="muted">没有匹配的邮箱</td></tr>';
@@ -3126,7 +3148,9 @@
               ${row.api_active
                 ? `<button onclick="disableMailbox(${jsArg(row.id)})">停用 API</button>`
                 : `<button onclick="enableMailbox(${jsArg(row.id)})">启用 API</button>`}
-              <button class="danger" onclick="deleteMailbox(${jsArg(row.id)})">删除 API</button>
+              ${deletingMailboxIDs.has(String(row.id))
+                ? `<button class="danger" disabled>删除中</button>`
+                : `<button class="danger" onclick="deleteMailbox(${jsArg(row.id)})">删除 API</button>`}
             </div>
             </td>
           </tr>`;
@@ -3776,19 +3800,31 @@
     async function deleteSelectedMailboxes(deleteRemote) {
       const ids = selectedMailboxIDsList();
       if (ids.length === 0) {
+        setMailboxActionStatus('请先选择要删除的邮箱');
         log('请先选择要删除的邮箱');
         return;
       }
       const confirmText = deleteRemote
         ? `确认删除 ${ids.length} 个选中邮箱，并同步删除 iCloud 远端隐私邮箱？远端待核对的记录需要单独确认后重试。`
         : `确认删除 ${ids.length} 个选中邮箱的本地记录？`;
-      if (!confirm(confirmText)) return;
-      log(`开始批量删除邮箱：${ids.length} 个${deleteRemote ? '（含远端）' : ''}`);
+      if (!confirm(confirmText)) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
       const hasUnknown = selectedMailboxHasRemoteDeleteStatus('unknown');
       const hasFailed = selectedMailboxHasRemoteDeleteStatus('failed');
       if (!deleteRemote && (hasFailed || hasUnknown) && !confirm('选中邮箱包含远端删除失败或待核对的记录，确认已核对 iCloud 后再清理这些本地记录？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
         return;
       }
+      const progress = `开始批量删除邮箱：${ids.length} 个${deleteRemote ? '（含远端）' : ''}`;
+      setMailboxActionStatus(progress);
+      log(progress);
+      mailboxBulkDeleting = true;
+      if ($('mailboxDeleteSelectedButton')) $('mailboxDeleteSelectedButton').disabled = true;
+      if ($('mailboxDeleteSelectedRemoteButton')) $('mailboxDeleteSelectedRemoteButton').disabled = true;
       try {
         const data = await api('/api/mailboxes/bulk-delete', {
           method: 'POST',
@@ -3800,13 +3836,16 @@
             scope: mailboxSelectionScope()
           })
         });
-        log(`批量删除完成：本地删除 ${data.deleted || 0}，远端删除 ${data.remote_deleted || 0}，失败 ${data.failed || 0}`);
+        const summary = `批量删除完成：本地删除 ${data.deleted || 0}，远端删除 ${data.remote_deleted || 0}，失败 ${data.failed || 0}`;
+        setMailboxActionStatus(summary, Number(data.failed || 0) > 0 ? 'error' : 'ok');
+        log(summary);
         (data.failures || []).forEach(item => {
           log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
         });
         invalidateMailboxSelection();
         await refresh();
       } catch (err) {
+        setMailboxActionStatus('批量删除失败：' + err.message, 'error');
         log('批量删除失败：' + err.message);
         const data = err.data || {};
         invalidateMailboxSelection();
@@ -3817,6 +3856,10 @@
         (data.failures || []).forEach(item => {
           log(`删除失败：${item.email || item.id || '-'}：${item.message || '未知错误'}`);
         });
+      } finally {
+        mailboxBulkDeleting = false;
+        if ($('mailboxDeleteSelectedButton')) $('mailboxDeleteSelectedButton').disabled = false;
+        if ($('mailboxDeleteSelectedRemoteButton')) $('mailboxDeleteSelectedRemoteButton').disabled = false;
       }
     }
 
@@ -3983,21 +4026,39 @@
 
     async function deleteMailbox(id) {
       const row = lastMailboxes.find(x => x.id === id);
-      if (!confirm('确认删除这个 API 绑定？')) return;
+      if (!confirm('确认删除这个 API 绑定？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
       const deleteRemote = confirm('是否同时删除 iCloud 创建的远端隐私邮箱？点击“取消”只删除本地记录。');
       const remoteStatus = mailboxRemoteDeleteStatusOf(id) || (row && row.remote_delete_status) || '';
       const confirmUnknown = remoteStatus === 'unknown';
       const confirmFailed = !deleteRemote && remoteStatus === 'failed';
-      if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
-      log(`正在删除${deleteRemote ? '（含远端）' : '本地记录'}：` + (row ? row.email : id));
+      if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
+      const progress = `正在删除${deleteRemote ? '（含远端）' : '本地记录'}：` + (row ? row.email : id);
+      setMailboxActionStatus(progress);
+      log(progress);
+      deletingMailboxIDs.add(String(id));
+      renderMailboxes();
       try {
         await api(`/api/mailboxes/${encodeURIComponent(id)}?delete_remote=${deleteRemote ? '1' : '0'}&confirm_unknown=${confirmUnknown ? '1' : '0'}&confirm_failed=${confirmFailed ? '1' : '0'}`, {method:'DELETE'});
+        setMailboxActionStatus('已删除：' + (row ? row.email : id), 'ok');
         log('已删除：' + (row ? row.email : id));
         selectedMailboxIDs.delete(id);
-        await refresh();
       } catch (err) {
+        setMailboxActionStatus('删除邮箱失败：' + err.message, 'error');
         log('删除邮箱失败：' + err.message);
-        await refresh().catch(refreshErr => log('删除失败后刷新列表失败：' + refreshErr.message));
+      } finally {
+        deletingMailboxIDs.delete(String(id));
+        await refresh().catch(refreshErr => {
+          log('删除失败后刷新列表失败：' + refreshErr.message);
+          renderMailboxes();
+        });
       }
     }
 
