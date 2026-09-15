@@ -1692,6 +1692,8 @@ func TestAppleAccountRemoteDeletePersistsRefreshedStateWhenDeleteFails(t *testin
 			w.Header().Set("scnt", "refreshed-scnt")
 			http.SetCookie(w, &http.Cookie{Name: "refreshed-cookie", Value: "1", Path: "/"})
 			_, _ = w.Write([]byte(`{"apiKey":"refreshed-api-key"}`))
+		case "DELETE /account/manage/email/private/delete-refresh/stop":
+			_, _ = w.Write([]byte(`{}`))
 		case "DELETE /account/manage/email/private/delete-refresh/remove":
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"temporary provider failure"}`))
@@ -1762,6 +1764,16 @@ func TestAppleAccountRemoteDeletePersistsRefreshedStateWhenDeleteFails(t *testin
 	}
 	if !hasRefreshedCookie {
 		t.Fatalf("saved cookies = %+v, want refreshed-cookie", state.Cookies)
+	}
+	updated, ok := store.FindMailboxByID(mailbox.ID)
+	if !ok {
+		t.Fatal("local mailbox disappeared after failed Apple Account remote delete")
+	}
+	if updated.ICloudActive {
+		t.Fatal("icloud_active should be false after Apple Account stop succeeded and remove failed")
+	}
+	if updated.Status != StatusDisabled {
+		t.Fatalf("status = %q, want disabled after Apple Account stop succeeded", updated.Status)
 	}
 }
 
@@ -6048,9 +6060,13 @@ func TestAppleAccount2FAPersistenceFailureKeepsPendingLogin(t *testing.T) {
 func TestDeletePrivacyMailboxWithAppleAccountUsesRemoveEndpoint(t *testing.T) {
 	oldBaseURL := appleAccountManageBaseURL
 	defer func() { appleAccountManageBaseURL = oldBaseURL }()
-	var gotMethod, gotPath, gotAPIKey string
+	var requests []string
+	var contentTypes []string
+	var gotAPIKey string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod, gotPath, gotAPIKey = r.Method, r.URL.Path, r.Header.Get("X-Apple-Api-Key")
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		contentTypes = append(contentTypes, r.Header.Get("Content-Type"))
+		gotAPIKey = r.Header.Get("X-Apple-Api-Key")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))
@@ -6073,8 +6089,20 @@ func TestDeletePrivacyMailboxWithAppleAccountUsesRemoveEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotMethod != http.MethodDelete || gotPath != "/account/manage/email/private/anonymous-123/remove" || gotAPIKey != "api-key" {
-		t.Fatalf("request = %s %s api=%q", gotMethod, gotPath, gotAPIKey)
+	want := []string{
+		"DELETE /account/manage/email/private/anonymous-123/stop",
+		"DELETE /account/manage/email/private/anonymous-123/remove",
+	}
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("requests = %#v, want %#v", requests, want)
+	}
+	for i, contentType := range contentTypes {
+		if contentType != "" {
+			t.Fatalf("request %d Content-Type = %q, want empty", i, contentType)
+		}
+	}
+	if gotAPIKey != "api-key" {
+		t.Fatalf("api key = %q, want api-key", gotAPIKey)
 	}
 	if _, ok := appleAccountLoginState(updated); !ok {
 		t.Fatal("updated session lost Apple Account state")
@@ -6679,7 +6707,7 @@ func TestAppleAccountMailboxCreateUsesAnonymousIDForRemoteIdentity(t *testing.T)
 		case "GET /account/manage/email/private/opaque-id.em",
 			"GET /account/manage/email/private/anonymous-id.em":
 			detailPath = r.URL.Path
-			_, _ = w.Write([]byte(`{"emailAddress":"created@icloud.com","id":"detail-id","anonymousId":"anonymous-id","active":true}`))
+			_, _ = w.Write([]byte(`{"emailAddress":"created@icloud.com","id":"opaque-id","anonymousId":"anonymous-id","active":true}`))
 		default:
 			t.Fatalf("unexpected Apple Account create request %s %s", r.Method, r.URL.Path)
 		}
@@ -6703,11 +6731,11 @@ func TestAppleAccountMailboxCreateUsesAnonymousIDForRemoteIdentity(t *testing.T)
 	if err != nil {
 		t.Fatalf("createPrivacyMailboxWithAppleAccountState error = %v", err)
 	}
-	if remote.AnonymousID != "anonymous-id" {
-		t.Fatalf("remote anonymous ID = %q, want anonymous-id", remote.AnonymousID)
+	if remote.AnonymousID != "opaque-id" {
+		t.Fatalf("remote anonymous ID = %q, want official id", remote.AnonymousID)
 	}
-	if detailPath != "/account/manage/email/private/anonymous-id.em" {
-		t.Fatalf("detail path = %q, want anonymous-id path", detailPath)
+	if detailPath != "/account/manage/email/private/opaque-id.em" {
+		t.Fatalf("detail path = %q, want official id path", detailPath)
 	}
 }
 
@@ -9225,6 +9253,12 @@ func TestDeleteMailboxRouteKeepsLocalRecordWhenOldICloudRemoteDeleteFails(t *tes
 	if updated.RemoteDeleteStatus != "unknown" || !strings.Contains(updated.RemoteDeleteError, "HTTP 502") {
 		t.Fatalf("transient remote failure state = %+v", updated)
 	}
+	if updated.ICloudActive {
+		t.Fatal("icloud_active should be false after deactivate succeeded and delete failed")
+	}
+	if updated.Status != StatusDisabled {
+		t.Fatalf("status = %q, want disabled after deactivate succeeded", updated.Status)
+	}
 }
 
 func TestDeleteMailboxRemoteReturnsBusyWhenAccountOperationHeld(t *testing.T) {
@@ -9398,9 +9432,10 @@ func TestDeleteMailboxRouteDeletesAppleAccountRemoteBeforeLocalRecord(t *testing
 	oldBaseURL := appleAccountManageBaseURL
 	defer func() { appleAccountManageBaseURL = oldBaseURL }()
 
-	var gotPath, gotAPIKey string
+	var paths []string
+	var gotAPIKey string
 	remoteServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.Method + " " + r.URL.Path
+		paths = append(paths, r.Method+" "+r.URL.Path)
 		gotAPIKey = r.Header.Get("X-Apple-Api-Key")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
@@ -9448,8 +9483,11 @@ func TestDeleteMailboxRouteDeletesAppleAccountRemoteBeforeLocalRecord(t *testing
 	if rr.Code != http.StatusOK {
 		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
 	}
-	if gotPath != "DELETE /account/manage/email/private/apple-remote-id/remove" || gotAPIKey != "api-key" {
-		t.Fatalf("Apple Account delete request = %q api=%q", gotPath, gotAPIKey)
+	if got, want := strings.Join(paths, "\n"), "DELETE /account/manage/email/private/apple-remote-id/stop\nDELETE /account/manage/email/private/apple-remote-id/remove"; got != want {
+		t.Fatalf("Apple Account delete requests = %q, want %q api=%q", got, want, gotAPIKey)
+	}
+	if gotAPIKey != "api-key" {
+		t.Fatalf("Apple Account delete api=%q, want api-key", gotAPIKey)
 	}
 	if _, ok := store.FindMailboxByID(mailbox.ID); ok {
 		t.Fatal("local mailbox record remains after Apple Account remote deletion")

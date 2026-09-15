@@ -565,4 +565,4 @@ curl -fsSI https://www.example.com/login
 - 2FA pending 状态只保存在进程内；服务重启后需要重新保存登录态。
 - iCloud 登录态可能过期；过期后需要重新保存登录态。
 - 邮件同步依赖当前 iCloud Mail 服务地址和 Cookie。
-- 账号代理当前支持 HTTP/HTTPS 和 SOCKS5；远端隐私邮箱删除依赖 iCloud Hide My Email 接口协议，建议先用真实账号做单个邮箱冒烟验证，再执行批量远端删除。
+- 账号代理当前支持 HTTP/HTTPS 和 SOCKS5；远端隐私邮箱删除按来源分流：旧 iCloud Web 走 Hide My Email 停用后再删除，Apple Account 新接口对齐官方 Hide My Email 先 `/stop` 再 `/remove`。Apple Account Hide My Email 列表/生成/确认/停用/删除/恢复/备注以 HTTP 200 为协议成功，列表/生成/确认创建在官方同样接受的 412 时使用响应体；官方列表字段优先于 `hmeEmails`。`/stop` 成功后再遇 401/403 会刷新管理态并只重试 `/remove`，删除前已刷新过也一样。本地已停用的持久化邮箱跨请求只打 `/remove`；创建回滚没有本地记录时仍先 `/stop`，停用成功但删除失败会再只打一次 `/remove`。停用成功但删除失败时本地会停用该邮箱；Web 返回仍在使用中时保持本地启用。远端删除未完成的记录不会被列表同步标成远端缺失。建议先用真实账号做单个邮箱冒烟验证，再执行批量远端删除。

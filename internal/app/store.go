@@ -932,11 +932,8 @@ func (s *FileStore) UpsertMailboxFromRemote(ownerID, accountID string, remote IC
 	if identityIndex >= 0 {
 		mailbox := &s.state.Mailboxes[identityIndex]
 		wasRemoteMissing := !mailbox.RemoteMissingAt.IsZero()
-		remoteDeleteStatus := strings.ToLower(strings.TrimSpace(mailbox.RemoteDeleteStatus))
-		wasRemoteDeleted := remoteDeleteStatus == "succeeded"
-		hasUnresolvedRemoteDelete := remoteDeleteStatus == "pending" ||
-			remoteDeleteStatus == "unknown" ||
-			remoteDeleteStatus == "failed"
+		wasRemoteDeleted := strings.EqualFold(strings.TrimSpace(mailbox.RemoteDeleteStatus), "succeeded")
+		hasUnresolvedRemoteDelete := mailboxHasUnresolvedRemoteDelete(*mailbox)
 		if strings.TrimSpace(remote.Label) != "" {
 			mailbox.Label = strings.TrimSpace(remote.Label)
 		}
@@ -957,12 +954,12 @@ func (s *FileStore) UpsertMailboxFromRemote(ownerID, accountID string, remote IC
 			mailbox.RemoteDeleteStatus = ""
 			mailbox.RemoteDeleteError = ""
 			mailbox.RemoteDeleteAt = time.Time{}
-		}
-		mailbox.ICloudActive = remote.IsActive
-		if !remote.IsActive {
-			mailbox.Status = StatusDisabled
-		} else if (wasRemoteMissing || wasRemoteDeleted) && mailbox.APIActive {
-			mailbox.Status = StatusAvailable
+			mailbox.ICloudActive = remote.IsActive
+			if !remote.IsActive {
+				mailbox.Status = StatusDisabled
+			} else if (wasRemoteMissing || wasRemoteDeleted) && mailbox.APIActive {
+				mailbox.Status = StatusAvailable
+			}
 		}
 		note := strings.TrimSpace(remote.Note)
 		if note == "" {
@@ -1064,6 +1061,9 @@ func (s *FileStore) markMailboxesRemoteMissingForOrigin(ownerID, accountID, remo
 		}
 		email := strings.ToLower(strings.TrimSpace(mailbox.Email))
 		if _, ok := seenEmails[email]; ok {
+			continue
+		}
+		if mailboxHasUnresolvedRemoteDelete(*mailbox) {
 			continue
 		}
 		if mailbox.RemoteMissingAt.Equal(checkedAt) && !mailbox.ICloudActive && mailbox.Status == StatusDisabled {
@@ -2069,6 +2069,15 @@ func (s *FileStore) BindMailboxToAccountForOwner(ownerID, mailboxID, accountID s
 		return Mailbox{}, errCode("mailbox_bind_persist_failed", "邮箱归属写入失败："+err.Error(), true)
 	}
 	return s.state.Mailboxes[mailboxIndex], nil
+}
+
+func mailboxHasUnresolvedRemoteDelete(mailbox Mailbox) bool {
+	switch strings.ToLower(strings.TrimSpace(mailbox.RemoteDeleteStatus)) {
+	case "pending", "unknown", "failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func mailboxStatusWouldReactivate(mailbox Mailbox, icloudActive *bool, status string) bool {

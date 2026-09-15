@@ -876,7 +876,7 @@
           <td>${esc(m.owner || '-')}</td>
           <td>${esc(m.label || '-')}</td>
           <td><span class="email">${esc(m.email || '-')}</span></td>
-          <td>${statusPill(m.status)} ${m.remote_missing_at ? pill('远端不存在', 'red') : ''} ${m.remote_delete_status === 'pending' ? `<span title="远端删除正在进行中，请稍后刷新">${pill('远端删除中', 'gray')}</span>` : ''} ${m.remote_delete_status === 'unknown' ? `<span title="上次远端删除结果未知；再次勾选远端删除会重试">${pill('远端待核对', 'red')}</span>` : ''} ${m.remote_delete_status === 'failed' ? `<span title="${esc(m.remote_delete_error || '')}">${pill('远端删除失败', 'red')}</span>` : ''}</td>
+          <td>${statusPill(m.status)} ${m.remote_missing_at ? pill('远端不存在', 'red') : ''} ${m.remote_delete_status === 'pending' ? `<span title="远端删除正在进行中，请稍后刷新">${pill('远端删除中', 'gray')}</span>` : ''} ${m.remote_delete_status === 'unknown' ? `<span title="${esc(m.remote_delete_error || '上次远端删除结果未知；再次勾选远端删除会重试')}">${pill('远端待核对', 'red')}</span>${m.remote_delete_error ? `<div class="muted">${esc(m.remote_delete_error)}</div>` : ''}` : ''} ${m.remote_delete_status === 'failed' ? `<span title="${esc(m.remote_delete_error || '')}">${pill('远端删除失败', 'red')}</span>${m.remote_delete_error ? `<div class="muted">${esc(m.remote_delete_error)}</div>` : ''}` : ''}</td>
           <td>${m.api_exported ? pill('已导出') + (m.api_exported_at ? `<div class="muted">${esc(m.api_exported_at)}</div>` : '') : pill('未导出', 'gray')}</td>
           <td>${m.receive_count || 0}</td>
           <td>${esc(m.created_at || '-')}</td>
@@ -1006,6 +1006,12 @@
       if (!deleteRemote && (hasFailed || hasUnknown) && !confirm('选中邮箱包含远端删除失败或待核对的记录，确认已核对 iCloud 后再清理这些本地记录？')) {
         return;
       }
+      if (deleteRemote && hasUnknown && !confirm('选中邮箱包含远端删除结果未知的记录，确认已核对 iCloud 后再重试远端删除？')) {
+        return;
+      }
+      if (deleteRemote && hasFailed && !confirm('选中邮箱包含远端删除失败的记录，确认后将再次请求 iCloud 删除？')) {
+        return;
+      }
       try {
         const data = await api('/api/mailboxes/bulk-delete', {
           method: 'POST',
@@ -1045,6 +1051,8 @@
         const confirmUnknown = row && row.remote_delete_status === 'unknown';
         const confirmFailed = !deleteRemote && row && row.remote_delete_status === 'failed';
         if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) return;
+        if (deleteRemote && row && row.remote_delete_status === 'unknown' && !confirm('上次远端删除结果未知，确认已核对 iCloud 后再重试远端删除？')) return;
+        if (deleteRemote && row && row.remote_delete_status === 'failed' && !confirm('上次远端删除失败，确认后将再次请求 iCloud 删除？')) return;
         await api(`/api/mailboxes/${encodeURIComponent(id)}?delete_remote=${deleteRemote ? '1' : '0'}&confirm_unknown=${confirmUnknown ? '1' : '0'}&confirm_failed=${confirmFailed ? '1' : '0'}`, {method: 'DELETE'});
         selectedMailboxIDs.delete(String(id));
         await refresh();

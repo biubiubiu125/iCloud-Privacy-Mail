@@ -201,6 +201,9 @@ func TestAppleTransientNetworkErrorDetection(t *testing.T) {
 	if !isAppleTransientNetworkError(fmt.Errorf("net/http: timeout awaiting response headers")) {
 		t.Fatal("timeout should be transient")
 	}
+	if !isAppleTransientNetworkError(errCode("icloud_http_error", "iCloud HTTP 502；阶段：删除隐私邮箱", true)) {
+		t.Fatal("HTTP 502 with stage suffix should stay a transient remote-delete outcome")
+	}
 	if isAppleTransientNetworkError(errCode("apple_protocol_http_error", "Apple 协议 HTTP 401", true)) {
 		t.Fatal("HTTP business error should not be transient")
 	}
@@ -2121,6 +2124,43 @@ func TestAppleAccountAPIErrorIncludesStageHTTPWithoutRawBody(t *testing.T) {
 	}
 }
 
+func TestAppleAccountAPIErrorIncludesSafeErrorCodeWithoutRawBody(t *testing.T) {
+	raw := []byte(`{"secret":"provider-token","errorCode":"-41000","message":"cannot delete"}`)
+	err := appleAccountAPIError(http.StatusConflict, raw, "停用隐私邮箱")
+	coded, ok := err.(codedError)
+	if !ok {
+		t.Fatalf("error type = %T, want codedError", err)
+	}
+	if coded.code != "apple_account_api_failed" {
+		t.Fatalf("coded error = %+v, want apple_account_api_failed", coded)
+	}
+	message := err.Error()
+	for _, want := range []string{"阶段：停用隐私邮箱", "HTTP 409", "错误码：-41000"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, want %q", message, want)
+		}
+	}
+	if strings.Contains(message, "provider-token") || strings.Contains(message, "cannot delete") {
+		t.Fatalf("error leaked provider response: %q", message)
+	}
+}
+
+func TestICloudAPIErrorMapsStillActiveCode(t *testing.T) {
+	err := iCloudAPIErrorAt("删除隐私邮箱", "-41000", "cannot delete an active address")
+	if !isCodedError(err, "icloud_hme_still_active") {
+		t.Fatalf("error = %#v, want icloud_hme_still_active", err)
+	}
+	message := err.Error()
+	for _, want := range []string{"仍在使用中，需要先停用", "阶段：删除隐私邮箱", "错误码：-41000"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error = %q, want %q", message, want)
+		}
+	}
+	if strings.Contains(message, "cannot delete") {
+		t.Fatalf("error leaked provider response: %q", message)
+	}
+}
+
 func TestICloudClientAppleAccountGenerateEmptyOmitsRawBody(t *testing.T) {
 	oldBaseURL := appleAccountManageBaseURL
 	defer func() { appleAccountManageBaseURL = oldBaseURL }()
@@ -3191,6 +3231,8 @@ func TestICloudClientDeletePrivacyMailboxWithAppleAccountKeepsKeepAliveFailureAf
 		case "GET /account/manage":
 			w.Header().Set("scnt", "manage-scnt")
 			_, _ = w.Write([]byte(`{"apiKey":"fresh-key"}`))
+		case "DELETE /account/manage/email/private/anon-1/stop":
+			_, _ = w.Write([]byte(`{}`))
 		case "DELETE /account/manage/email/private/anon-1/remove":
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"service_errors":[{"message":"authentication_failed"}]}`))

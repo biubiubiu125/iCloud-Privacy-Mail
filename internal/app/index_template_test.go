@@ -719,6 +719,40 @@ func TestIndexTemplateShowsPendingRemoteDeleteState(t *testing.T) {
 	}
 }
 
+func TestIndexTemplateShowsFailedRemoteDeleteError(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		"remote_delete_status === 'failed'",
+		"远端删除失败",
+		`<div class="muted">${esc(row.remote_delete_error)}</div>`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing failed remote delete marker %q", marker)
+		}
+	}
+}
+
+func TestIndexTemplateShowsUnknownRemoteDeleteError(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	for _, marker := range []string{
+		"remote_delete_status === 'unknown'",
+		"远端待核对",
+		`row.remote_delete_error || '上次远端删除结果未知；再次勾选远端删除会重试'`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("index template missing unknown remote delete marker %q", marker)
+		}
+	}
+}
+
 func TestIndexTemplateMailboxStatusActionsLogFailures(t *testing.T) {
 	data, err := webFS.ReadFile("templates/index.html")
 	if err != nil {
@@ -1127,5 +1161,35 @@ func TestIndexTemplateSetMailboxStatusReenablesAPIWhenLeavingDisabled(t *testing
 	}
 	if !strings.Contains(block, "payload.api_active = apiActive;") {
 		t.Fatalf("setMailboxStatus must always send api_active, block=%s", block)
+	}
+}
+
+func TestIndexTemplateRemoteDeleteConfirmsUnknownAndFailedRetry(t *testing.T) {
+	data, err := webFS.ReadFile("templates/index.html")
+	if err != nil {
+		t.Fatalf("read index template: %v", err)
+	}
+	html := string(data)
+	bulk := scriptFunctionBlock(t, html, "async function deleteSelectedMailboxes", "async function cleanAllRemoteCodes")
+	single := scriptFunctionBlock(t, html, "async function deleteMailbox", "async function copyMailboxValue")
+	for _, marker := range []string{
+		"if (deleteRemote && hasUnknown && !confirm('",
+		"if (deleteRemote && hasFailed && !confirm('",
+		"确认已核对 iCloud 后再重试远端删除",
+		"确认后将再次请求 iCloud 删除",
+	} {
+		if !strings.Contains(bulk, marker) {
+			t.Errorf("bulk remote delete missing extra confirm %q in %s", marker, bulk)
+		}
+	}
+	for _, marker := range []string{
+		"if (deleteRemote && remoteStatus === 'unknown' && !confirm('",
+		"if (deleteRemote && remoteStatus === 'failed' && !confirm('",
+		"确认已核对 iCloud 后再重试远端删除",
+		"确认后将再次请求 iCloud 删除",
+	} {
+		if !strings.Contains(single, marker) {
+			t.Errorf("single remote delete missing extra confirm %q in %s", marker, single)
+		}
 	}
 }

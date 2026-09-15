@@ -35,7 +35,15 @@ type ICloudRemoteMailbox struct {
 }
 
 func appleAccountRemoteAnonymousID(id, anonymousID string) string {
+	return strings.TrimSpace(firstNonEmpty(id, anonymousID))
+}
+
+func iCloudWebRemoteAnonymousID(id, anonymousID string) string {
 	return strings.TrimSpace(firstNonEmpty(anonymousID, id))
+}
+
+type privacyMailboxDeleteOutcome struct {
+	Deactivated bool
 }
 
 type ICloudSyncedMessage struct {
@@ -413,17 +421,22 @@ func (c *ICloudClient) CreatePrivacyMailboxWithAppleAccount(ctx context.Context,
 }
 
 func (c *ICloudClient) DeletePrivacyMailboxWithAppleAccount(ctx context.Context, session ICloudSession, fallbackAPIKey, anonymousID string) (ICloudSession, error) {
+	session, _, err := c.deletePrivacyMailboxWithAppleAccountDetailed(ctx, session, fallbackAPIKey, anonymousID, false)
+	return session, err
+}
+
+func (c *ICloudClient) deletePrivacyMailboxWithAppleAccountDetailed(ctx context.Context, session ICloudSession, fallbackAPIKey, anonymousID string, skipStop bool) (ICloudSession, privacyMailboxDeleteOutcome, error) {
 	anonymousID = strings.TrimSpace(anonymousID)
 	if anonymousID == "" {
-		return session, errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
+		return session, privacyMailboxDeleteOutcome{}, errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
 	}
 	loginState, ok := appleAccountLoginState(session)
 	if !ok {
-		return session, errCode("apple_account_session_missing", "当前登录态缺少 Apple Account 管理态，请重新协议登录", true)
+		return session, privacyMailboxDeleteOutcome{}, errCode("apple_account_session_missing", "当前登录态缺少 Apple Account 管理态，请重新协议登录", true)
 	}
 	release, err := acquireAppleAccountOperationGate(ctx, appleAccountOperationKey(session, loginState))
 	if err != nil {
-		return session, err
+		return session, privacyMailboxDeleteOutcome{}, err
 	}
 	defer release()
 
@@ -433,13 +446,16 @@ func (c *ICloudClient) DeletePrivacyMailboxWithAppleAccount(ctx context.Context,
 		refreshedBeforeDelete = true
 		loginState, session, err = c.refreshAppleAccountManageStateForOperation(ctx, session, loginState, fallbackAPIKey)
 		if err != nil {
-			return session, err
+			return session, privacyMailboxDeleteOutcome{}, err
 		}
 	}
 
-	updatedSession, err := c.deletePrivacyMailboxWithAppleAccountState(ctx, session, loginState, fallbackAPIKey, anonymousID)
-	if err == nil || !appleAccountKeepAliveShouldRescue(err) || refreshedBeforeDelete {
-		return updatedSession, err
+	updatedSession, outcome, err := c.deletePrivacyMailboxWithAppleAccountState(ctx, session, loginState, fallbackAPIKey, anonymousID, skipStop)
+	if err == nil || !appleAccountKeepAliveShouldRescue(err) {
+		return updatedSession, outcome, err
+	}
+	if refreshedBeforeDelete && !outcome.Deactivated {
+		return updatedSession, outcome, err
 	}
 
 	retryState, ok := appleAccountLoginState(updatedSession)
@@ -448,27 +464,39 @@ func (c *ICloudClient) DeletePrivacyMailboxWithAppleAccount(ctx context.Context,
 	}
 	retryState, updatedSession, refreshErr := c.refreshAppleAccountManageStateForOperation(ctx, updatedSession, retryState, fallbackAPIKey)
 	if refreshErr != nil {
-		return updatedSession, refreshErr
+		return updatedSession, outcome, refreshErr
 	}
-	return c.deletePrivacyMailboxWithAppleAccountState(ctx, updatedSession, retryState, fallbackAPIKey, anonymousID)
+	retriedSession, retriedOutcome, retriedErr := c.deletePrivacyMailboxWithAppleAccountState(ctx, updatedSession, retryState, fallbackAPIKey, anonymousID, outcome.Deactivated)
+	retriedOutcome.Deactivated = retriedOutcome.Deactivated || outcome.Deactivated
+	return retriedSession, retriedOutcome, retriedErr
 }
 
-func (c *ICloudClient) deletePrivacyMailboxWithAppleAccountState(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey, anonymousID string) (ICloudSession, error) {
+func (c *ICloudClient) deletePrivacyMailboxWithAppleAccountState(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey, anonymousID string, skipStop bool) (ICloudSession, privacyMailboxDeleteOutcome, error) {
+	outcome := privacyMailboxDeleteOutcome{}
 	apiKey := strings.TrimSpace(firstNonEmpty(loginState.APIKey, fallbackAPIKey))
 	if apiKey == "" {
-		return session, errCode("apple_account_api_key_missing", "Apple Account 管理态缺少 api_key，请重新完成 Apple Account 登录流程", true)
+		return session, outcome, errCode("apple_account_api_key_missing", "Apple Account 管理态缺少 api_key，请重新完成 Apple Account 登录流程", true)
 	}
 	loginState.APIKey = apiKey
 	session = withAppleAccountLoginState(session, loginState)
-	path := "/account/manage/email/private/" + url.PathEscape(strings.TrimSpace(anonymousID)) + "/remove"
-	raw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodDelete, path, nil, nil)
-	if err != nil {
-		if !isAppleAccountRemoveGone(raw, err) {
-			return withAppleAccountLoginState(session, loginState), err
+	remoteID := url.PathEscape(strings.TrimSpace(anonymousID))
+	if skipStop {
+		outcome.Deactivated = true
+	} else {
+		stopPath := "/account/manage/email/private/" + remoteID + "/stop"
+		stopRaw, stopErr := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodDelete, stopPath, nil, nil)
+		if !isAppleAccountStopContinue(stopRaw, stopErr) {
+			return withAppleAccountLoginState(session, loginState), outcome, stopErr
 		}
+		outcome.Deactivated = true
+	}
+	removePath := "/account/manage/email/private/" + remoteID + "/remove"
+	raw, err := c.callAppleAccountRaw(ctx, &loginState, apiKey, http.MethodDelete, removePath, nil, nil)
+	if err != nil && !isAppleAccountRemoveGone(raw, err) {
+		return withAppleAccountLoginState(session, loginState), outcome, err
 	}
 	markAppleAccountManageOK(&loginState)
-	return withAppleAccountLoginState(session, loginState), nil
+	return withAppleAccountLoginState(session, loginState), outcome, nil
 }
 
 func (c *ICloudClient) refreshAppleAccountManageStateForOperation(ctx context.Context, session ICloudSession, loginState LoginState, fallbackAPIKey string) (LoginState, ICloudSession, error) {
@@ -989,7 +1017,7 @@ func (c *ICloudClient) listICloudWebPrivacyMailboxes(ctx context.Context, sessio
 			if email == "" {
 				return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表包含缺少邮箱地址的记录，未执行本地远端缺失标记", true)
 			}
-			anonymousID := appleAccountRemoteAnonymousID(item.ID, item.AnonymousID)
+			anonymousID := iCloudWebRemoteAnonymousID(item.ID, item.AnonymousID)
 			if anonymousID == "" {
 				return nil, errCode("icloud_mailbox_list_incomplete", "iCloud 隐私邮箱列表包含缺少远端匿名 ID 的记录，未执行本地远端缺失标记", true)
 			}
@@ -1049,20 +1077,24 @@ func (c *ICloudClient) listICloudWebPrivacyMailboxes(ctx context.Context, sessio
 }
 
 type appleAccountMailboxListPage struct {
-	HMEEmails         json.RawMessage `json:"hmeEmails"`
-	HasMore           *bool           `json:"hasMore"`
-	HasMoreSnake      *bool           `json:"has_more"`
-	NextCursor        string          `json:"nextCursor"`
-	NextCursorSnake   string          `json:"next_cursor"`
-	NextPageToken     string          `json:"nextPageToken"`
-	ContinuationToken string          `json:"continuationToken"`
+	HMEEmails                json.RawMessage `json:"hmeEmails"`
+	PrivateEmailList         json.RawMessage `json:"privateEmailList"`
+	InactivePrivateEmailList json.RawMessage `json:"inactivePrivateEmailList"`
+	HasMore                  *bool           `json:"hasMore"`
+	HasMoreSnake             *bool           `json:"has_more"`
+	NextCursor               string          `json:"nextCursor"`
+	NextCursorSnake          string          `json:"next_cursor"`
+	NextPageToken            string          `json:"nextPageToken"`
+	ContinuationToken        string          `json:"continuationToken"`
 }
 
 type appleAccountMailboxListResponse struct {
 	appleAccountMailboxListPage
-	Result  appleAccountMailboxListPage `json:"result"`
-	Data    appleAccountMailboxListPage `json:"data"`
-	Success *bool                       `json:"success"`
+	Result              appleAccountMailboxListPage `json:"result"`
+	Data                appleAccountMailboxListPage `json:"data"`
+	HideMyEmail         appleAccountMailboxListPage `json:"hideMyEmail"`
+	HideMyEmailBootData appleAccountMailboxListPage `json:"hideMyEmailBootData"`
+	Success             *bool                       `json:"success"`
 }
 
 type appleAccountMailboxListItem struct {
@@ -1315,13 +1347,15 @@ func parseAppleAccountMailboxListPage(raw appleAccountRawResponse) (parsedAppleA
 	}
 	page := mergeAppleAccountMailboxListPage(response.appleAccountMailboxListPage, response.Result)
 	page = mergeAppleAccountMailboxListPage(page, response.Data)
-	if len(page.HMEEmails) == 0 {
+	page = mergeAppleAccountMailboxListPage(page, response.HideMyEmail)
+	page = mergeAppleAccountMailboxListPage(page, response.HideMyEmailBootData)
+	if !appleAccountMailboxListHasCollection(page) {
 		if response.Success != nil && !*response.Success {
 			return parsedAppleAccountMailboxList{}, errCode("apple_account_api_failed", "Apple Account 隐私邮箱列表接口返回失败；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
 		}
-		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表响应缺少 hmeEmails，未执行本地远端缺失标记；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
+		return parsedAppleAccountMailboxList{}, errCode("apple_account_mailbox_list_incomplete", "Apple Account 隐私邮箱列表响应缺少 hmeEmails / privateEmailList，未执行本地远端缺失标记；"+appleAccountRawResponseDetail("读取隐私邮箱列表", raw), true)
 	}
-	items, err := parseAppleAccountMailboxListItems(page.HMEEmails)
+	items, err := collectAppleAccountMailboxListItems(page)
 	if err != nil {
 		return parsedAppleAccountMailboxList{}, err
 	}
@@ -1350,8 +1384,14 @@ func parseAppleAccountMailboxListPage(raw appleAccountRawResponse) (parsedAppleA
 }
 
 func mergeAppleAccountMailboxListPage(primary, nested appleAccountMailboxListPage) appleAccountMailboxListPage {
-	if len(primary.HMEEmails) == 0 {
+	if !appleAccountJSONFieldPresent(primary.HMEEmails) {
 		primary.HMEEmails = nested.HMEEmails
+	}
+	if !appleAccountJSONFieldPresent(primary.PrivateEmailList) {
+		primary.PrivateEmailList = nested.PrivateEmailList
+	}
+	if !appleAccountJSONFieldPresent(primary.InactivePrivateEmailList) {
+		primary.InactivePrivateEmailList = nested.InactivePrivateEmailList
 	}
 	if primary.HasMore == nil {
 		primary.HasMore = nested.HasMore
@@ -1374,6 +1414,17 @@ func mergeAppleAccountMailboxListPage(primary, nested appleAccountMailboxListPag
 	return primary
 }
 
+func appleAccountJSONFieldPresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func appleAccountMailboxListHasCollection(page appleAccountMailboxListPage) bool {
+	return appleAccountJSONFieldPresent(page.HMEEmails) ||
+		appleAccountJSONFieldPresent(page.PrivateEmailList) ||
+		appleAccountJSONFieldPresent(page.InactivePrivateEmailList)
+}
+
 func parseAppleAccountMailboxListItems(raw json.RawMessage) ([]appleAccountMailboxListItem, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1382,6 +1433,44 @@ func parseAppleAccountMailboxListItems(raw json.RawMessage) ([]appleAccountMailb
 	var items []appleAccountMailboxListItem
 	if err := json.Unmarshal(trimmed, &items); err != nil {
 		return nil, errCode("apple_account_mailbox_list_bad_response", "Apple Account 隐私邮箱列表返回无法解析", true)
+	}
+	return items, nil
+}
+
+func collectAppleAccountMailboxListItems(page appleAccountMailboxListPage) ([]appleAccountMailboxListItem, error) {
+	var items []appleAccountMailboxListItem
+	appendGroup := func(raw json.RawMessage, defaultActive bool) error {
+		if !appleAccountJSONFieldPresent(raw) {
+			return nil
+		}
+		group, err := parseAppleAccountMailboxListItems(raw)
+		if err != nil {
+			return err
+		}
+		for i := range group {
+			if group[i].Active == nil && group[i].IsActive == nil {
+				value := defaultActive
+				group[i].IsActive = &value
+			}
+		}
+		items = append(items, group...)
+		return nil
+	}
+	official := appleAccountJSONFieldPresent(page.PrivateEmailList) || appleAccountJSONFieldPresent(page.InactivePrivateEmailList)
+	if official {
+		if err := appendGroup(page.PrivateEmailList, true); err != nil {
+			return nil, err
+		}
+		if err := appendGroup(page.InactivePrivateEmailList, false); err != nil {
+			return nil, err
+		}
+		if len(items) > 0 || !appleAccountJSONFieldPresent(page.HMEEmails) {
+			return items, nil
+		}
+		items = items[:0]
+	}
+	if err := appendGroup(page.HMEEmails, true); err != nil {
+		return nil, err
 	}
 	return items, nil
 }
@@ -1436,21 +1525,31 @@ func (c *ICloudClient) DeactivatePrivacyMailbox(ctx context.Context, session ICl
 }
 
 func (c *ICloudClient) DeletePrivacyMailbox(ctx context.Context, session ICloudSession, anonymousID string) error {
+	_, err := c.deletePrivacyMailboxWeb(ctx, session, anonymousID)
+	return err
+}
+
+func (c *ICloudClient) deletePrivacyMailboxWeb(ctx context.Context, session ICloudSession, anonymousID string) (privacyMailboxDeleteOutcome, error) {
 	anonymousID = strings.TrimSpace(anonymousID)
+	outcome := privacyMailboxDeleteOutcome{}
 	if anonymousID == "" {
-		return errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
+		return outcome, errCode("icloud_mailbox_anonymous_id_missing", "隐私邮箱匿名 ID 为空", false)
 	}
 	if err := c.call(ctx, session, http.MethodPost, "/v1/hme/deactivate", map[string]string{
 		"anonymousId": anonymousID,
 	}, nil); err != nil && !isRemoteMailboxAlreadyInactive(err) && !isICloudHMEDeleteGone(err) {
-		return err
+		return outcome, err
 	}
+	outcome.Deactivated = true
 	if err := c.call(ctx, session, http.MethodPost, "/v1/hme/delete", map[string]string{
 		"anonymousId": anonymousID,
 	}, nil); err != nil && !isICloudHMEDeleteGone(err) {
-		return err
+		if isCodedError(err, "icloud_hme_still_active") {
+			outcome.Deactivated = false
+		}
+		return outcome, err
 	}
-	return nil
+	return outcome, nil
 }
 
 func isAppleAccountRemoveGone(raw appleAccountRawResponse, err error) bool {
@@ -1461,6 +1560,13 @@ func isAppleAccountRemoveGone(raw appleAccountRawResponse, err error) bool {
 		return false
 	}
 	return err != nil
+}
+
+func isAppleAccountStopContinue(raw appleAccountRawResponse, err error) bool {
+	if err == nil {
+		return true
+	}
+	return isAppleAccountRemoveGone(raw, err) || isRemoteMailboxAlreadyInactive(err)
 }
 
 func isICloudHMEDeleteGone(err error) bool {
@@ -1499,12 +1605,19 @@ func isRemoteMailboxAlreadyInactive(err error) bool {
 		return false
 	}
 	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	var coded codedError
+	if errors.As(err, &coded) {
+		text = strings.ToLower(strings.TrimSpace(coded.code + " " + coded.message))
+	}
 	if strings.Contains(text, "http 404") || strings.Contains(text, "http 410") || strings.Contains(text, "<html") {
 		return false
 	}
 	for _, token := range []string{
 		"already inactive",
+		"already_inactive",
+		"already-inactive",
 		"already deactivated",
+		"already_deactivated",
 		"hme_already_inactive",
 	} {
 		if strings.Contains(text, token) {
@@ -1616,7 +1729,6 @@ func (c *ICloudClient) fetchAppleAccountManageTokenScntOnce(ctx context.Context,
 	origin := strings.TrimRight(firstNonEmpty(loginState.Origin, appleAccountManageOriginForHost(loginState.Host), appleAccountManageOrigin), "/")
 	userAgent := firstNonEmpty(loginState.UserAgent, appleAccountManageUserAgent)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", userAgent)
@@ -1699,7 +1811,9 @@ func (c *ICloudClient) callAppleAccountRawOnce(ctx context.Context, loginState *
 		return appleAccountRawResponse{}, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json")
+	if appleAccountShouldSetJSONContentType(method, body) {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	origin := strings.TrimRight(firstNonEmpty(loginState.Origin, appleAccountManageOriginForHost(loginState.Host), appleAccountManageOrigin), "/")
 	userAgent := firstNonEmpty(loginState.UserAgent, appleAccountManageUserAgent)
 	req.Header.Set("Origin", origin)
@@ -1752,7 +1866,7 @@ func (c *ICloudClient) callAppleAccountRawOnce(ctx context.Context, loginState *
 			appleDebugBody(data),
 		)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if !appleAccountHTTPStatusIsSuccess(method, path, resp.StatusCode) {
 		if os.Getenv("IPM_DEBUG_APPLE_ACCOUNT") == "1" {
 			fmt.Fprintf(os.Stderr, "APPLE_ACCOUNT_DEBUG method=%s path=%s status=%d body=%q\n", method, path, resp.StatusCode, appleDebugBody(data))
 		}
@@ -2018,31 +2132,179 @@ func appleAccountBodyLooksAuthExpired(lower string) bool {
 	return strings.Contains(lower, "authentication") && (strings.Contains(lower, "failed") || strings.Contains(lower, "expired"))
 }
 
-func appleAccountErrorDetail(status int, _ []byte, stage string) string {
-	stage = strings.TrimSpace(stage)
-	if stage == "" {
-		stage = "未知阶段"
+func appleAccountShouldSetJSONContentType(method string, body any) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodDelete:
+		return false
+	default:
+		return body != nil
 	}
-	return fmt.Sprintf("阶段：%s；HTTP %d", stage, status)
 }
 
-func appleAccountResponseDetail(stage string, _ []byte) string {
+func appleAccountHTTPStatusIsSuccess(method, path string, status int) bool {
+	if appleAccountHMERequiresOK(method, path) {
+		if status == http.StatusOK {
+			return true
+		}
+		return status == http.StatusPreconditionFailed && appleAccountAllowsPreconditionFailed(method, path)
+	}
+	return status >= 200 && status < 300
+}
+
+func appleAccountManagePath(path string) string {
+	parsed, err := url.Parse(strings.TrimSpace(path))
+	if err != nil {
+		return ""
+	}
+	clean := strings.TrimRight(parsed.Path, "/")
+	if clean == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	return clean
+}
+
+func appleAccountHMERequiresOK(method, path string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	clean := appleAccountManagePath(path)
+	switch {
+	case method == http.MethodGet && clean == "/account/manage/email/private":
+		return true
+	case method == http.MethodGet && strings.HasPrefix(clean, "/account/manage/email/private/") && strings.HasSuffix(clean, ".em"):
+		return true
+	case method == http.MethodPost && clean == "/account/manage/email/private/add":
+		return true
+	case method == http.MethodPut && clean == "/account/manage/email/private/add/complete":
+		return true
+	case method == http.MethodDelete && strings.HasPrefix(clean, "/account/manage/email/private/") && (strings.HasSuffix(clean, "/stop") || strings.HasSuffix(clean, "/remove")):
+		return true
+	case method == http.MethodPost && strings.HasPrefix(clean, "/account/manage/email/private/") && (strings.HasSuffix(clean, "/reactivate") || strings.HasSuffix(clean, "/note")):
+		return true
+	default:
+		return false
+	}
+}
+
+func appleAccountAllowsPreconditionFailed(method, path string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	clean := appleAccountManagePath(path)
+	switch {
+	case method == http.MethodGet && clean == "/account/manage/email/private":
+		return true
+	case method == http.MethodPost && clean == "/account/manage/email/private/add":
+		return true
+	case method == http.MethodPut && clean == "/account/manage/email/private/add/complete":
+		return true
+	default:
+		return false
+	}
+}
+
+func appleAccountSanitizeErrorCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return ""
+	}
+	lower := strings.ToLower(code)
+	if strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.Contains(lower, "cookie") {
+		return ""
+	}
+	for _, r := range code {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return ""
+	}
+	return code
+}
+
+func appleAccountAnyErrorCode(value any) string {
+	switch v := value.(type) {
+	case string:
+		return appleAccountSanitizeErrorCode(v)
+	case float64:
+		if v == float64(int64(v)) {
+			return appleAccountSanitizeErrorCode(strconv.FormatInt(int64(v), 10))
+		}
+	case json.Number:
+		return appleAccountSanitizeErrorCode(v.String())
+	}
+	return ""
+}
+
+func appleAccountSafeErrorCode(data []byte) string {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || looksLikeHTML(trimmed) || trimmed[0] != '{' {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return ""
+	}
+	if code := appleAccountAnyErrorCode(payload["errorCode"]); code != "" {
+		return code
+	}
+	if code := appleAccountAnyErrorCode(payload["code"]); code != "" {
+		return code
+	}
+	if errObj, ok := payload["error"].(map[string]any); ok {
+		if code := appleAccountAnyErrorCode(errObj["errorCode"]); code != "" {
+			return code
+		}
+		if code := appleAccountAnyErrorCode(errObj["code"]); code != "" {
+			return code
+		}
+	}
+	for _, key := range []string{"serviceErrors", "service_errors", "errors"} {
+		list, ok := payload[key].([]any)
+		if !ok || len(list) == 0 {
+			continue
+		}
+		first, ok := list[0].(map[string]any)
+		if !ok {
+			continue
+		}
+		if code := appleAccountAnyErrorCode(first["code"]); code != "" {
+			return code
+		}
+		if code := appleAccountAnyErrorCode(first["errorCode"]); code != "" {
+			return code
+		}
+	}
+	return ""
+}
+
+func appleAccountErrorDetail(status int, data []byte, stage string) string {
 	stage = strings.TrimSpace(stage)
 	if stage == "" {
 		stage = "未知阶段"
 	}
-	return "阶段：" + stage
+	detail := fmt.Sprintf("阶段：%s；HTTP %d", stage, status)
+	if code := appleAccountSafeErrorCode(data); code != "" {
+		detail += "；错误码：" + code
+	}
+	return detail
+}
+
+func appleAccountResponseDetail(stage string, data []byte) string {
+	stage = strings.TrimSpace(stage)
+	if stage == "" {
+		stage = "未知阶段"
+	}
+	detail := "阶段：" + stage
+	if code := appleAccountSafeErrorCode(data); code != "" {
+		detail += "；错误码：" + code
+	}
+	return detail
 }
 
 func appleAccountRawResponseDetail(stage string, raw appleAccountRawResponse) string {
-	stage = strings.TrimSpace(stage)
-	if stage == "" {
-		stage = "未知阶段"
-	}
 	if raw.StatusCode > 0 {
-		return fmt.Sprintf("阶段：%s；HTTP %d", stage, raw.StatusCode)
+		return appleAccountErrorDetail(raw.StatusCode, raw.Body, stage)
 	}
-	return "阶段：" + stage
+	return appleAccountResponseDetail(stage, raw.Body)
 }
 
 func appleAccountRequestStage(method, path string) string {
@@ -2069,6 +2331,8 @@ func appleAccountRequestStage(method, path string) string {
 		return "确认创建隐私邮箱"
 	case method == http.MethodGet && strings.HasPrefix(path, "/account/manage/email/private/") && strings.HasSuffix(path, ".em"):
 		return "确认隐私邮箱详情"
+	case method == http.MethodDelete && strings.HasPrefix(path, "/account/manage/email/private/") && strings.HasSuffix(path, "/stop"):
+		return "停用隐私邮箱"
 	case method == http.MethodDelete && strings.HasPrefix(path, "/account/manage/email/private/") && strings.HasSuffix(path, "/remove"):
 		return "删除隐私邮箱"
 	default:
@@ -2129,10 +2393,11 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		stage := iCloudHMERequestStage(rawURL)
 		if looksLikeHTML(data) {
-			return errCode("icloud_html_response", fmt.Sprintf("iCloud HTTP %d 返回了网页而不是接口结果", resp.StatusCode), true)
+			return errCode("icloud_html_response", fmt.Sprintf("iCloud HTTP %d 返回了网页而不是接口结果；阶段：%s", resp.StatusCode, stage), true)
 		}
-		return errCode("icloud_http_error", fmt.Sprintf("iCloud HTTP %d", resp.StatusCode), true)
+		return errCode("icloud_http_error", fmt.Sprintf("iCloud HTTP %d；阶段：%s", resp.StatusCode, stage), true)
 	}
 	var envelope struct {
 		Success bool            `json:"success"`
@@ -2147,11 +2412,15 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 		return errCode("icloud_bad_response", "iCloud 返回无法解析", true)
 	}
 	if !envelope.Success {
+		code := ""
 		msg := "iCloud 接口返回失败"
-		if envelope.Error != nil && strings.TrimSpace(envelope.Error.Message) != "" {
-			msg = envelope.Error.Message
+		if envelope.Error != nil {
+			code = strings.TrimSpace(envelope.Error.Code)
+			if strings.TrimSpace(envelope.Error.Message) != "" {
+				msg = envelope.Error.Message
+			}
 		}
-		return iCloudAPIError(msg)
+		return iCloudAPIErrorAt(iCloudHMERequestStage(rawURL), code, msg)
 	}
 	if result != nil {
 		if err := json.Unmarshal(envelope.Result, result); err != nil {
@@ -2162,6 +2431,10 @@ func (c *ICloudClient) callEnvelope(ctx context.Context, session ICloudSession, 
 }
 
 func iCloudAPIError(message string) error {
+	return iCloudAPIErrorAt("", "", message)
+}
+
+func iCloudAPIErrorAt(stage, code, message string) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		message = "iCloud 接口返回失败"
@@ -2172,7 +2445,71 @@ func iCloudAPIError(message string) error {
 	if isRemoteMailboxAlreadyInactive(errors.New(message)) || isICloudHMEAlreadyGoneMessage(message) {
 		return errCode("icloud_api_failed", "iCloud 接口返回失败："+message, true)
 	}
-	return errCode("icloud_api_failed", "iCloud 接口返回失败", true)
+	safeCode := appleAccountSanitizeErrorCode(code)
+	if isICloudHMEStillActive(safeCode, message) {
+		detail := "iCloud 隐私邮箱仍在使用中，需要先停用"
+		if strings.TrimSpace(stage) != "" {
+			detail += "；阶段：" + strings.TrimSpace(stage)
+		}
+		if safeCode != "" {
+			detail += "；错误码：" + safeCode
+		}
+		return errCode("icloud_hme_still_active", detail, true)
+	}
+	detail := "iCloud 接口返回失败"
+	if strings.TrimSpace(stage) != "" {
+		detail += "；阶段：" + strings.TrimSpace(stage)
+	}
+	if safeCode != "" {
+		detail += "；错误码：" + safeCode
+	}
+	return errCode("icloud_api_failed", detail, true)
+}
+
+func isICloudHMEStillActive(code, message string) bool {
+	compact := strings.TrimSpace(code)
+	if compact == "-41000" || compact == "41000" {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if strings.Contains(lower, "-41000") {
+		return true
+	}
+	for _, token := range []string{
+		"still active",
+		"still in use",
+		"must deactivate",
+		"deactivate first",
+		"deactivate before",
+		"cannot delete an active",
+		"cannot delete active",
+		"needs to be deactivated",
+		"need to deactivate",
+	} {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func iCloudHMERequestStage(rawURL string) string {
+	path := rawURL
+	if parsed, err := url.Parse(rawURL); err == nil {
+		path = parsed.Path
+	}
+	switch {
+	case strings.HasSuffix(path, "/v1/hme/deactivate"):
+		return "停用隐私邮箱"
+	case strings.HasSuffix(path, "/v1/hme/delete"):
+		return "删除隐私邮箱"
+	case strings.HasSuffix(path, "/v1/hme/reactivate"):
+		return "重新启用隐私邮箱"
+	case strings.HasSuffix(path, "/v2/hme/list"), strings.HasSuffix(path, "/v1/hme/list"):
+		return "读取隐私邮箱列表"
+	default:
+		return "调用 iCloud 接口"
+	}
 }
 
 func isICloudHMELimitMessage(message string) bool {

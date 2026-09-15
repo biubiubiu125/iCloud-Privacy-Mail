@@ -3124,8 +3124,8 @@
               <br><span class="pill ${statusClass(row.status)}">${statusText(row.status)}</span>
               ${row.remote_missing_at ? '<span class="pill off">远端不存在</span>' : ''}
               ${row.remote_delete_status === 'pending' ? '<span class="pill off" title="远端删除正在进行中，请稍后刷新">远端删除中</span>' : ''}
-              ${row.remote_delete_status === 'unknown' ? `<span class="pill off" title="上次远端删除结果未知；再次勾选远端删除会重试">远端待核对</span>` : ''}
-              ${row.remote_delete_status === 'failed' ? `<span class="pill off" title="${esc(row.remote_delete_error || '')}">远端删除失败</span>` : ''}
+              ${row.remote_delete_status === 'unknown' ? `<span class="pill off" title="${esc(row.remote_delete_error || '上次远端删除结果未知；再次勾选远端删除会重试')}">远端待核对</span>${row.remote_delete_error ? `<div class="muted">${esc(row.remote_delete_error)}</div>` : ''}` : ''}
+              ${row.remote_delete_status === 'failed' ? `<span class="pill off" title="${esc(row.remote_delete_error || '')}">远端删除失败</span>${row.remote_delete_error ? `<div class="muted">${esc(row.remote_delete_error)}</div>` : ''}` : ''}
             </td>
             <td>${row.receive_count || 0}</td>
             <td class="mailbox-code-cell">${renderMailboxCodeCell(row.id)}</td>
@@ -3819,6 +3819,16 @@
         log('已取消删除');
         return;
       }
+      if (deleteRemote && hasUnknown && !confirm('选中邮箱包含远端删除结果未知的记录，确认已核对 iCloud 后再重试远端删除？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
+      if (deleteRemote && hasFailed && !confirm('选中邮箱包含远端删除失败的记录，确认后将再次请求 iCloud 删除？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
       const progress = `开始批量删除邮箱：${ids.length} 个${deleteRemote ? '（含远端）' : ''}`;
       setMailboxActionStatus(progress);
       log(progress);
@@ -4036,6 +4046,16 @@
       const confirmUnknown = remoteStatus === 'unknown';
       const confirmFailed = !deleteRemote && remoteStatus === 'failed';
       if (!deleteRemote && (confirmFailed || confirmUnknown) && !confirm('上次远端删除失败或结果未知，确认已核对 iCloud 后再清理本地记录？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
+      if (deleteRemote && remoteStatus === 'unknown' && !confirm('上次远端删除结果未知，确认已核对 iCloud 后再重试远端删除？')) {
+        setMailboxActionStatus('已取消删除');
+        log('已取消删除');
+        return;
+      }
+      if (deleteRemote && remoteStatus === 'failed' && !confirm('上次远端删除失败，确认后将再次请求 iCloud 删除？')) {
         setMailboxActionStatus('已取消删除');
         log('已取消删除');
         return;

@@ -1171,6 +1171,31 @@ func retryAppleTransient(ctx context.Context, fn func() error) error {
 	return last
 }
 
+func httpStatusFromErrorMessage(message string) (int, bool) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	marker := strings.Index(lower, "http ")
+	if marker < 0 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(lower[marker+len("http "):])
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	status, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0, false
+	}
+	return status, true
+}
+
+func isAppleTransientHTTPStatus(status int) bool {
+	return status >= http.StatusInternalServerError && status <= 599
+}
+
 func isAppleTransientNetworkError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
@@ -1178,15 +1203,8 @@ func isAppleTransientNetworkError(err error) bool {
 	var coded codedError
 	if errors.As(err, &coded) {
 		if coded.code == "icloud_http_error" || coded.code == "icloud_mail_http_error" {
-			text := strings.ToLower(coded.message)
-			if marker := strings.Index(text, "http "); marker >= 0 {
-				fields := strings.Fields(text[marker+len("http "):])
-				if len(fields) > 0 {
-					if status, parseErr := strconv.Atoi(strings.TrimSuffix(fields[0], ":")); parseErr == nil &&
-						status >= http.StatusInternalServerError && status <= 599 {
-						return true
-					}
-				}
+			if status, ok := httpStatusFromErrorMessage(coded.message); ok && isAppleTransientHTTPStatus(status) {
+				return true
 			}
 		}
 		return false
@@ -1199,12 +1217,8 @@ func isAppleTransientNetworkError(err error) bool {
 		return true
 	}
 	text := strings.ToLower(err.Error())
-	if fields := strings.Fields(text); len(fields) >= 3 &&
-		fields[0] == "icloud" && fields[1] == "http" {
-		if status, parseErr := strconv.Atoi(strings.TrimSuffix(fields[2], ":")); parseErr == nil &&
-			status >= http.StatusInternalServerError && status <= 599 {
-			return true
-		}
+	if status, ok := httpStatusFromErrorMessage(text); ok && isAppleTransientHTTPStatus(status) {
+		return true
 	}
 	for _, marker := range []string{
 		"eof",

@@ -22,6 +22,9 @@ func TestManageTemplateIncludesMailboxPoolBatchControls(t *testing.T) {
 		`confirm_unknown`,
 		`remote_delete_status === 'pending'`,
 		`remote_delete_status === 'unknown'`,
+		`remote_delete_status === 'failed'`,
+		`<div class="muted">${esc(m.remote_delete_error)}</div>`,
+		`m.remote_delete_error || '上次远端删除结果未知；再次勾选远端删除会重试'`,
 	} {
 		if !strings.Contains(html, marker) {
 			t.Errorf("manage template missing mailbox pool marker %q", marker)
@@ -359,5 +362,35 @@ func TestManageTemplatePrefillsFullAccountProxy(t *testing.T) {
 	}
 	if strings.Contains(block, "出于安全原因不会回显") {
 		t.Fatal("manage proxy editor still hides the saved proxy")
+	}
+}
+
+func TestManageTemplateRemoteDeleteConfirmsUnknownAndFailedRetry(t *testing.T) {
+	data, err := webFS.ReadFile("templates/manage.html")
+	if err != nil {
+		t.Fatalf("read manage template: %v", err)
+	}
+	html := string(data)
+	bulk := scriptFunctionBlock(t, html, "async function deleteSelectedMailboxes", "async function deleteMailboxFromManage")
+	single := scriptFunctionBlock(t, html, "async function deleteMailboxFromManage", "async function exportData")
+	for _, marker := range []string{
+		"if (deleteRemote && hasUnknown && !confirm('",
+		"if (deleteRemote && hasFailed && !confirm('",
+		"确认已核对 iCloud 后再重试远端删除",
+		"确认后将再次请求 iCloud 删除",
+	} {
+		if !strings.Contains(bulk, marker) {
+			t.Errorf("bulk remote delete missing extra confirm %q in %s", marker, bulk)
+		}
+	}
+	for _, marker := range []string{
+		"if (deleteRemote && row && row.remote_delete_status === 'unknown' && !confirm('",
+		"if (deleteRemote && row && row.remote_delete_status === 'failed' && !confirm('",
+		"确认已核对 iCloud 后再重试远端删除",
+		"确认后将再次请求 iCloud 删除",
+	} {
+		if !strings.Contains(single, marker) {
+			t.Errorf("single remote delete missing extra confirm %q in %s", marker, single)
+		}
 	}
 }

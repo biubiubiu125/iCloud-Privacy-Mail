@@ -97,7 +97,7 @@
 - 只删本地记录
 - 同步删除 iCloud 创建的隐私邮箱本体
 
-当前实现策略按远端协议区分：旧 iCloud Web 登录态先调用 Hide My Email 停用接口，再调用删除接口；Apple Account 新接口登录态直接调用对应隐私邮箱的 `DELETE /account/manage/email/private/{anonymousId}/remove` 接口。远端调用失败时不删除本地记录，并把失败邮箱返回给前端。
+当前实现策略按远端协议区分，并对齐官方 Hide My Email 两步操作：旧 iCloud Web 登录态先调用 `POST /v1/hme/deactivate`，再调用 `POST /v1/hme/delete`；Apple Account 新接口登录态先调用 `DELETE /account/manage/email/private/{id}/stop`，再调用 `DELETE /account/manage/email/private/{id}/remove`。Apple Account Hide My Email 列表、生成、确认、停用和删除以 HTTP 200 为协议成功；官方列表、生成候选和确认创建在 412 时仍使用响应体。`/v2/jslogs` 等非 HME 管理请求仍接受 2xx。`/stop` 成功、已停用或 JSON 404/410 时继续删除；`/remove` 的 JSON 404/410 视为已删除，HTML 404 不当成功。列表有官方 `privateEmailList` / `inactivePrivateEmailList` 时不再合并 `hmeEmails`。新写入优先保存官方 `id`，iCloud Web 列表优先 `anonymousId`，已有邮箱继续使用当前 `remote_anonymous_id`。远端调用失败时不删除本地记录。若停用已成功但删除失败，本地 `icloud_active` 落成 false、`status` 落成 disabled，并把失败邮箱返回给前端；Web 删除返回仍在使用中时保持本地启用。Apple Account 在 `/stop` 成功后遇到 401/403 时刷新管理态并只重试 `/remove`，即使这次删除前已经刷新过管理态，也保留已停用结果。本地已持久化且 `icloud_active=false` 的邮箱跨请求重试只打 `/remove`；创建回滚没有本地 ID，仍先 `/stop`，停用成功但删除失败时再只打一次 `/remove`。前端对远端删除失败或结果未知的记录会再确认后才重试。远端删除仍是 pending/unknown/failed 时，列表同步可以刷新标签，但不会清掉删除状态，也不会把本地已停用的邮箱重新标成启用，更不会把这些记录标成远端缺失。
 
 ### 4.4 账号级代理
 
@@ -134,6 +134,7 @@
 - [x] Apple Account 列表分页合并顶层与嵌套元数据，避免漏读后续页面
 - [x] 创建结果不确定时持久化账号级待核对状态，阻止手动/定时创建跨接口重复尝试；成功同步 Apple Account 列表后自动解除
 - [x] Apple Account 远端删除失败时保存此前已成功刷新的登录态
+- [x] Apple Account 远端删除对齐官方 Hide My Email：先 `/stop` 再 `/remove`；HME 列表/生成/确认/停用/删除/恢复/备注以 HTTP 200 为协议成功，列表/生成/确认创建接受官方 412 响应体；官方列表字段优先于 `hmeEmails`；DELETE 不带 Content-Type；停用成功但删除失败时本地落 `icloud_active=false` 且 `status=disabled`；401 刷新后已 stop 则只重试 `/remove`，预刷新后同样只重试 `/remove`；本地已停用记录跨请求只打 `/remove`；创建回滚 stop 成功后 remove 失败会再只打一次 `/remove`；Web `still-active` 不把本地写成未启用；Web 列表优先 `anonymousId`；远端删除失败或未知时前端再确认后才重试；unresolved 删除记录不会被列表缺失标记改写
 - [x] GitHub Release 和自定义 manifest 更新资产均强制 SHA-256 校验
 - [x] 完整状态导出和邮箱 API 导出设置 `no-store`，避免敏感下载被浏览器或中间缓存复用
 - [x] 状态文件写入采用私有临时文件、`fsync` 和原子替换，降低进程崩溃导致半写文件的风险
@@ -178,7 +179,7 @@
 
 ## 8. 验证边界与风险点
 
-- 远程删除 iCloud 隐私邮箱本体依赖当前 iCloud Hide My Email 接口协议；代码已隔离失败项，但仍建议先真实账号单条验证。
+- 远程删除 iCloud 隐私邮箱本体按来源分流：旧 iCloud Web 走 Hide My Email 停用后再删除，Apple Account 新接口对齐官方 Hide My Email 先 `/stop` 再 `/remove`。代码已隔离失败项，但仍建议先真实账号单条验证。
 - 账号级代理当前只接受 HTTP/HTTPS，不接受 SOCKS5；代理认证信息随账号状态保存，公共接口只返回脱敏地址。
 - 批量操作按逐条处理，已完成项不会回滚；远端删除失败项不会删除本地记录，便于重试。
 - 导出的邮箱 API 和完整状态文件包含敏感信息，必须限制下载和服务器文件权限。
@@ -456,7 +457,7 @@ Dockerfile 虽然暴露并映射了 `8787` 端口，但程序默认监听 `127.0
 
 ### 20.1 Apple Account 列表同步边界
 
-Apple Account 账号级和全局同步都接入 `account/manage/email/private` 列表接口；旧 iCloud Web 仍使用 `/v2/hme/list`。列表完整时只对当前远端来源做缺失标记，不能跨 Provider 误禁用邮箱；列表不完整时会中止缺失标记。Apple Account 创建返回的远端匿名 ID、单删/批删、结果不确定锁定和同步解锁链路仍然有效。
+Apple Account 账号级和全局同步都接入 `account/manage/email/private` 列表接口；旧 iCloud Web 仍使用 `/v2/hme/list`。列表完整时只对当前远端来源做缺失标记，不能跨 Provider 误禁用邮箱；列表不完整时会中止缺失标记。Apple Account 创建返回的远端 ID 优先使用官方 `id`，已有邮箱继续沿用当前 `remote_anonymous_id`。单删/批删按官方两步 `/stop` + `/remove` 执行，结果不确定锁定和同步解锁链路仍然有效。
 
 ## 21. 2026-09-06 全真实链路闭环修复
 

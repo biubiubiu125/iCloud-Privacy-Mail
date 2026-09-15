@@ -5479,7 +5479,14 @@ func (s *Server) deleteICloudMailboxRemote(ctx context.Context, mailbox Mailbox)
 	if remoteOrigin == mailboxRemoteOriginAppleAccount {
 		opCtx, cancel := context.WithTimeout(ctx, appleAccountManageOperationTimeout)
 		defer cancel()
-		updatedSession, err := newICloudKeepAliveClient().DeletePrivacyMailboxWithAppleAccount(opCtx, session, s.cfg.AppleAccountAPIKey, remoteID)
+		skipStop := mailboxShouldSkipAppleAccountStop(mailbox)
+		client := newICloudKeepAliveClient()
+		updatedSession, outcome, err := client.deletePrivacyMailboxWithAppleAccountDetailed(opCtx, session, s.cfg.AppleAccountAPIKey, remoteID, skipStop)
+		if err != nil && outcome.Deactivated && !skipStop && strings.TrimSpace(mailbox.ID) == "" {
+			var retryOutcome privacyMailboxDeleteOutcome
+			updatedSession, retryOutcome, err = client.deletePrivacyMailboxWithAppleAccountDetailed(opCtx, updatedSession, s.cfg.AppleAccountAPIKey, remoteID, true)
+			outcome.Deactivated = outcome.Deactivated || retryOutcome.Deactivated
+		}
 		if _, hasUpdatedState := appleAccountLoginState(updatedSession); hasUpdatedState {
 			if saveErr := s.store.SaveICloudSessionForOwner(session.OwnerID, updatedSession); saveErr != nil {
 				if s.logger != nil {
@@ -5494,9 +5501,37 @@ func (s *Server) deleteICloudMailboxRemote(ctx context.Context, mailbox Mailbox)
 				}
 			}
 		}
+		if remoteDeleteShouldPersistInactive(outcome, err) {
+			s.persistMailboxICloudInactive(mailbox)
+		}
 		return err
 	}
-	return NewICloudClient().DeletePrivacyMailbox(ctx, session, remoteID)
+	outcome, err := NewICloudClient().deletePrivacyMailboxWeb(ctx, session, remoteID)
+	if remoteDeleteShouldPersistInactive(outcome, err) {
+		s.persistMailboxICloudInactive(mailbox)
+	}
+	return err
+}
+
+func mailboxShouldSkipAppleAccountStop(mailbox Mailbox) bool {
+	if strings.TrimSpace(mailbox.ID) == "" {
+		return false
+	}
+	return !mailbox.ICloudActive
+}
+
+func remoteDeleteShouldPersistInactive(outcome privacyMailboxDeleteOutcome, err error) bool {
+	return err != nil && outcome.Deactivated && !isCodedError(err, "icloud_hme_still_active")
+}
+
+func (s *Server) persistMailboxICloudInactive(mailbox Mailbox) {
+	if !mailbox.ICloudActive && strings.EqualFold(strings.TrimSpace(mailbox.Status), StatusDisabled) {
+		return
+	}
+	inactive := false
+	if _, err := s.store.SetMailboxStatus(mailbox.ID, nil, &inactive, StatusDisabled, ""); err != nil && s.logger != nil {
+		s.logger.Warn("persist mailbox icloud inactive after remote deactivate succeeded", "mailbox_id", mailbox.ID, "err", err)
+	}
 }
 
 func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
